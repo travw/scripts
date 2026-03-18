@@ -582,7 +582,30 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                     segments.append(("bend", LineCurve(Line(pp_s, pp_e)), target))
                 continue
 
-        # perimeter edge (naked or no PP line for neighbor)
+        # check if naked edge is at a bend (close to a PP line)
+        if len(adj) != 2 and bend_map:
+            mid_nap = Point3d((s_nap.X + e_nap.X) / 2,
+                              (s_nap.Y + e_nap.Y) / 2,
+                              (s_nap.Z + e_nap.Z) / 2)
+            best_target = None
+            best_dist = float("inf")
+            for tgt, pp_line in bend_map.items():
+                t = pp_line.ClosestParameter(mid_nap)
+                d = mid_nap.DistanceTo(pp_line.PointAt(t))
+                if d < best_dist:
+                    best_dist = d
+                    best_target = tgt
+            if best_target is not None and best_dist < offset_dist * 2:
+                pp_line = bend_map[best_target]
+                t0 = pp_line.ClosestParameter(s_nap)
+                t1 = pp_line.ClosestParameter(e_nap)
+                pp_s = pp_line.PointAt(t0)
+                pp_e = pp_line.PointAt(t1)
+                if pp_s.DistanceTo(pp_e) > tol:
+                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), best_target))
+                continue
+
+        # perimeter edge (naked, not near any PP line, or no bend neighbors)
         if s_nap.DistanceTo(e_nap) > tol:
             segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
 
@@ -609,6 +632,32 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         else:
             merged.append(segments[i])
             i += 1
+
+    # second pass: collapse bend(X), short_perimeter, bend(X) → bend(X)
+    # handles tiny naked edges at transition zone gaps between skipped faces
+    thickness = offset_dist * 2
+    changed = True
+    while changed:
+        changed = False
+        new_merged = []
+        i = 0
+        while i < len(merged):
+            if (i + 2 < len(merged)
+                    and merged[i][0] == "bend"
+                    and merged[i + 1][0] == "perimeter"
+                    and merged[i + 2][0] == "bend"
+                    and merged[i][2] == merged[i + 2][2]
+                    and merged[i + 1][1].GetLength() < thickness * 2):
+                new_merged.append(("bend",
+                    LineCurve(Line(merged[i][1].PointAtStart,
+                                   merged[i + 2][1].PointAtEnd)),
+                    merged[i][2]))
+                i += 3
+                changed = True
+            else:
+                new_merged.append(merged[i])
+                i += 1
+        merged = new_merged
 
     if len(merged) < 3:
         projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
@@ -645,14 +694,8 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                 # 3D skew too large — use closest point on face plane
                 vertex = face_planes[fi].ClosestPoint(pt_a)
         else:
-            # parallel lines — project onto PP line at bend transitions
-            if curr_type == "bend" and next_type == "perimeter":
-                pp = bend_map[curr_target]
-                vertex = pp.PointAt(pp.ClosestParameter(next_crv.PointAtStart))
-            elif curr_type == "perimeter" and next_type == "bend":
-                pp = bend_map[next_target]
-                vertex = pp.PointAt(pp.ClosestParameter(curr_crv.PointAtEnd))
-            elif next_type in ("perimeter",):
+            # parallel lines — use shared endpoint
+            if next_type in ("perimeter",):
                 vertex = Point3d(next_crv.PointAtStart.X,
                                  next_crv.PointAtStart.Y,
                                  next_crv.PointAtStart.Z)
