@@ -728,7 +728,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     return PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in cleaned])
 
 
-def construct_neutral_axis(ref_side, thickness, original_brep=None):
+def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None):
     """construct the neutral axis surface from plane geometry.
     for each planar face in ref_side, computes the offset plane (t/2 inward),
     then builds each face's boundary from:
@@ -763,11 +763,18 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
         if face.OrientationIsReversed:
             normal = -normal
 
-        # verify offset direction: NAS point should be inside the original solid
-        if original_brep is not None:
+        # verify offset direction: NAS point should be between ref_side and other_side
+        if other_side is not None:
+            test_a = centroid - normal * offset_dist
+            test_b = centroid + normal * offset_dist
+            dist_a = test_a.DistanceTo(other_side.ClosestPoint(test_a))
+            dist_b = test_b.DistanceTo(other_side.ClosestPoint(test_b))
+            if dist_b < dist_a:
+                normal = -normal  # flip toward other_side
+        elif original_brep is not None:
             test_pt = centroid - normal * offset_dist
             if not original_brep.IsPointInside(test_pt, tol, False):
-                normal = -normal  # offset landed outside — flip
+                normal = -normal
 
         # offset plane inward (opposite to outward normal)
         offset_origin = plane.Origin - normal * offset_dist
@@ -1379,7 +1386,8 @@ def unfold_to_2d():
         ref_side.Faces.Count, other_side.Faces.Count))
 
     # step 6: construct neutral axis (prints its own === header ===)
-    neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep)
+    neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep,
+                                          other_side=other_side)
     if neutral_axis is None:
         return
     print("  neutral axis: {} faces".format(neutral_axis.Faces.Count))
