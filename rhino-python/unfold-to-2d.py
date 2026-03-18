@@ -31,6 +31,7 @@ from Rhino.Geometry import (
     Line,
     Plane,
     Point3d,
+    PolylineCurve,
     TextEntity,
     Transform,
     Unroller,
@@ -330,50 +331,69 @@ def construct_neutral_axis(ref_side, thickness):
         print("error: no planar faces found in ref_side")
         return None
 
-    # step 2: build boundary curves for each neutral axis face
+    # step 2: build boundary vertices for each neutral axis face
+    # compute vertices by intersecting adjacent neutral-axis edge lines
     neutral_faces = []
     for fi in face_planes:
         normal = face_normals[fi]
         face = ref_side.Faces[fi]
-        boundary = []
 
-        for ei in face.AdjacentEdges():
-            edge = ref_side.Edges[ei]
+        # get edges in boundary order from the outer loop
+        loop = face.OuterLoop
+        if loop is None:
+            continue
+
+        edge_lines = []
+        for trim in loop.Trims:
+            if trim.Edge is None:
+                continue
+            edge = trim.Edge
             adj = edge.AdjacentFaces()
 
             if len(adj) == 2:
-                # internal edge (bend): use plane-plane intersection
+                # bend edge: plane-plane intersection (infinite line)
                 other = adj[0] if adj[1] == fi else adj[1]
                 if other not in face_planes:
                     continue
                 rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
-                if not rc:
-                    continue
-                # trim infinite line to the edge's extent
-                t0 = int_line.ClosestParameter(edge.PointAtStart)
-                t1 = int_line.ClosestParameter(edge.PointAtEnd)
-                p0 = int_line.PointAt(t0)
-                p1 = int_line.PointAt(t1)
-                boundary.append(LineCurve(Line(p0, p1)))
+                if rc:
+                    edge_lines.append(int_line)
             else:
-                # naked edge (perimeter): translate to offset plane
-                dup = edge.DuplicateCurve()
-                dup.Transform(Transform.Translation(-normal * offset_dist))
-                boundary.append(dup)
+                # perimeter edge: translate to offset plane
+                p0 = edge.PointAtStart + Vector3d(-normal.X * offset_dist,
+                                                   -normal.Y * offset_dist,
+                                                   -normal.Z * offset_dist)
+                p1 = edge.PointAtEnd + Vector3d(-normal.X * offset_dist,
+                                                 -normal.Y * offset_dist,
+                                                 -normal.Z * offset_dist)
+                edge_lines.append(Line(p0, p1))
 
-        if len(boundary) < 3:
-            print("warning: face {} has only {} boundary curves".format(fi, len(boundary)))
+        if len(edge_lines) < 3:
+            print("warning: face {} has only {} edge lines".format(fi, len(edge_lines)))
             continue
 
-        # step 3: join boundary curves and create planar face
-        joined = Curve.JoinCurves(boundary, tol)
-        if joined is None or len(joined) == 0:
-            print("warning: could not join boundary curves for face {}".format(fi))
+        # compute vertices by intersecting adjacent edge lines
+        n = len(edge_lines)
+        vertices = []
+        for i in range(n):
+            line_a = edge_lines[i]
+            line_b = edge_lines[(i + 1) % n]
+            rc, ta, tb = Intersection.LineLine(line_a, line_b)
+            if rc:
+                vertices.append(Point3d(line_a.PointAt(ta)))
+
+        if len(vertices) < 3:
+            print("warning: face {} has only {} vertices".format(fi, len(vertices)))
             continue
 
-        face_breps = Brep.CreatePlanarBreps(joined, tol)
+        # close the polyline and create planar face
+        vertices.append(vertices[0])
+        boundary = PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in vertices])
+        face_breps = Brep.CreatePlanarBreps([boundary], tol)
         if face_breps and len(face_breps) > 0:
             neutral_faces.append(face_breps[0])
+        else:
+            print("warning: CreatePlanarBreps failed for face {}".format(fi))
 
     if not neutral_faces:
         print("error: could not create any neutral axis faces")

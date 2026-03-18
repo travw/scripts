@@ -145,3 +145,12 @@ key geometric concepts:
   use it for toggle state, cached values, etc. keys should be namespaced.
 - when working with layers, always check `rs.IsLayer()` before creating
 - System.Drawing.Color, not python tuples, for layer colors
+- `BrepFace.DuplicateFace(False)`: creates a standalone Brep from a face.
+  use this when `AreaMassProperties.Compute` or `ClosestPoint` on a BrepFace
+  gives wrong results — the Brep overloads are more reliable in CPython 3.
+- `rs.LayerIndex()` does not exist. use `sc.doc.Layers.FindByFullPath(name, -1)`
+  for integer layer table index.
+- `Brep.CreateOffsetBrep` on a polysurface adds fillet faces at bends.
+  for sharp corners, build offset geometry from plane math instead.
+- `Intersection.PlanePlane` returns `(bool, Line)` — an infinite Line.
+  `Line.ClosestParameter` returns a double, not a tuple.
