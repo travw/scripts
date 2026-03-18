@@ -26,17 +26,13 @@ from Rhino.Geometry import (
     AreaMassProperties,
     Brep,
     Curve,
-    Mesh,
-    MeshingParameters,
     Plane,
     Point3d,
-    Ray3d,
     TextEntity,
     Transform,
     Unroller,
     Vector3d,
 )
-from Rhino.Geometry.Intersect import Intersection
 from Rhino.Input.Custom import GetObject, GetString
 from Rhino.DocObjects import ObjectType
 
@@ -107,37 +103,17 @@ def get_face_outward_normal(brep, face_index):
 
 
 def detect_thickness(brep, face_index):
-    """detect material thickness by measuring from the picked face to its opposite.
-    returns thickness as float, or None on failure."""
-    centroid, normal = get_face_outward_normal(brep, face_index)
-    if centroid is None:
-        return None
-
-    # shoot a ray inward from the face centroid
-    inward = -normal
-    ray_start = centroid + inward * 0.001  # nudge off surface
-    ray = Ray3d(ray_start, inward)
-
-    # mesh the brep for ray intersection
-    meshes = Mesh.CreateFromBrep(brep, MeshingParameters.FastRenderMesh)
-    if meshes and len(meshes) > 0:
-        # join all meshes for ray test
-        joined_mesh = Mesh()
-        for m in meshes:
-            joined_mesh.Append(m)
-        t = Intersection.MeshRay(joined_mesh, ray)
-        if t >= 0:
-            hit_pt = ray.PointAt(t)
-            dist = ray_start.DistanceTo(hit_pt)
-            if dist > 0.01:  # sanity: at least 0.01"
-                return round(dist, 4)
-
-    # fallback: use brep bounding box minimum dimension
-    bb = brep.GetBoundingBox(True)
-    dims = sorted([bb.Max.X - bb.Min.X, bb.Max.Y - bb.Min.Y, bb.Max.Z - bb.Min.Z])
-    if dims[0] > 0.01:
-        return round(dims[0], 4)
-
+    """detect material thickness from the shortest edge of the picked face.
+    for a sheet face, the shortest edges are the thickness edges connecting
+    the outer face to the inner face through perimeter edge faces."""
+    face = brep.Faces[face_index]
+    edge_lengths = []
+    for ei in face.AdjacentEdges():
+        edge_lengths.append(brep.Edges[ei].GetLength())
+    edge_lengths.sort()
+    # shortest edge of a sheet face = material thickness
+    if edge_lengths and edge_lengths[0] > 0.01:
+        return round(edge_lengths[0], 4)
     return None
 
 
@@ -175,27 +151,36 @@ def prompt_thickness(auto_thickness):
 
 def classify_faces(brep, thickness, picked_face_index):
     """classify brep faces into sheet faces and edge faces.
-    edge faces have at least one edge whose length ≈ thickness.
+    edge faces are narrow strips whose width ≈ thickness (area / longest edge).
     returns (outer_sheet_indices, inner_sheet_indices, edge_face_indices)."""
-    thick_tol = thickness * 0.3  # 30% tolerance for matching thickness dimension
+    thick_tol = thickness * 0.4  # 40% tolerance for matching thickness dimension
 
     edge_faces = []
     sheet_faces = []
 
     for i in range(brep.Faces.Count):
         face = brep.Faces[i]
-        # check if any edge of this face has length ≈ thickness
-        is_edge_face = False
-        edge_indices = face.AdjacentEdges()
-        for ei in edge_indices:
-            edge = brep.Edges[ei]
-            edge_len = edge.GetLength()
-            if abs(edge_len - thickness) < thick_tol:
-                is_edge_face = True
-                break
+        amp = AreaMassProperties.Compute(face)
+        if amp is None:
+            sheet_faces.append(i)
+            continue
 
-        if is_edge_face:
-            edge_faces.append(i)
+        area = amp.Area
+        edge_indices = face.AdjacentEdges()
+        max_edge_len = 0
+        for ei in edge_indices:
+            el = brep.Edges[ei].GetLength()
+            if el > max_edge_len:
+                max_edge_len = el
+
+        if max_edge_len > 0:
+            # approximate face width = area / longest edge
+            # edge faces (thin strips) have width ≈ thickness
+            approx_width = area / max_edge_len
+            if abs(approx_width - thickness) < thick_tol:
+                edge_faces.append(i)
+            else:
+                sheet_faces.append(i)
         else:
             sheet_faces.append(i)
 
@@ -210,14 +195,10 @@ def classify_faces(brep, thickness, picked_face_index):
 def _flood_fill_outer_faces(brep, sheet_faces, edge_faces, picked_face_index, thickness):
     """flood fill from the picked face through edge faces to find all outer sheet faces.
     key insight: from an edge face, we reach two sheet faces — one outer, one inner.
-    we pick the one whose normal has a positive dot with the picked face normal."""
+    we reject candidates that are antiparallel to a known outer face adjacent to the
+    same edge face (that's the inner counterpart)."""
     sheet_set = set(sheet_faces)
     edge_set = set(edge_faces)
-
-    # get picked face outward normal for reference
-    _, picked_normal = get_face_outward_normal(brep, picked_face_index)
-    if picked_normal is None:
-        return sheet_faces, []
 
     # build face adjacency via shared edges
     adjacency = {}
@@ -251,25 +232,28 @@ def _flood_fill_outer_faces(brep, sheet_faces, edge_faces, picked_face_index, th
                 if neighbor in edge_set and neighbor not in visited:
                     queue.append(neighbor)
         elif current in edge_set:
-            # from an edge face, traverse to adjacent sheet faces
-            # but only pick sheet faces whose normal agrees with picked_normal
-            # (same side of the part = outer)
+            # from an edge face, find which adjacent sheet faces are outer vs inner.
+            # check against the known outer face(s) that also border this edge face:
+            # if the candidate is antiparallel to a sibling outer → it's the inner counterpart.
+            sibling_outers = [f for f in adjacency[current] if f in outer]
+
             for neighbor in adjacency[current]:
                 if neighbor in sheet_set and neighbor not in visited:
                     _, fn = get_face_outward_normal(brep, neighbor)
-                    if fn is not None:
-                        # outer faces have normals on the same side as picked face
-                        # for a closed solid, opposite faces have opposite normals
-                        # but bent faces have different normals too
-                        # use: if the face is "reachable" from the picked face
-                        # through edge faces without crossing through another sheet face
-                        # AND its normal isn't pointing opposite to picked_normal
-                        dot = Vector3d.Multiply(fn, picked_normal)
-                        # for a 90° bend, dot = 0; for flat, dot = 1; for opposite, dot = -1
-                        # inner faces will have dot ≈ -1 (opposite normal)
-                        # outer faces: dot > -0.5 (allows up to ~120° bends)
-                        if dot > -0.5:
-                            queue.append(neighbor)
+                    if fn is None:
+                        continue
+
+                    is_inner = False
+                    for so in sibling_outers:
+                        _, so_n = get_face_outward_normal(brep, so)
+                        if so_n is not None:
+                            dot = Vector3d.Multiply(fn, so_n)
+                            if dot < -0.7:
+                                is_inner = True
+                                break
+
+                    if not is_inner:
+                        queue.append(neighbor)
 
     inner = set(sheet_set) - outer
     return list(outer), list(inner)
@@ -706,9 +690,9 @@ def place_2d_output(brep_3d, unrolled_breps, outside_curves, inside_curves,
     xform = Transform.Translation(offset_x, offset_y, offset_z)
 
     count = 0
-    outside_layer = rs.LayerIndex(sublayers["outside"])
-    inside_layer = rs.LayerIndex(sublayers["inside"])
-    mark_layer = rs.LayerIndex(sublayers["mark"])
+    outside_layer = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
+    inside_layer = sc.doc.Layers.FindByFullPath(sublayers["inside"], -1)
+    mark_layer = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
 
     attr_outside = Rhino.DocObjects.ObjectAttributes()
     attr_outside.LayerIndex = outside_layer
