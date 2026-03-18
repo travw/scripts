@@ -55,6 +55,19 @@ TEXT_HEIGHT = 0.25  # inches
 # helpers
 # ---------------------------------------------------------------------------
 
+def _doc_translate(curve, dx, dy, dz):
+    """translate a curve using doc round-trip (CPython 3 workaround).
+    in-memory Curve.Translate() doesn't work reliably in CPython 3."""
+    xf = Transform.Translation(dx, dy, dz)
+    temp_id = sc.doc.Objects.AddCurve(curve)
+    new_id = sc.doc.Objects.Transform(temp_id, xf, True)
+    obj = sc.doc.Objects.FindId(new_id)
+    if obj is not None:
+        curve = obj.Geometry.DuplicateCurve()
+    sc.doc.Objects.Delete(new_id, True)
+    return curve
+
+
 def pick_part_and_face():
     """select a closed polysurface and pick a sheet face. returns (brep, face_index, obj_id) or None."""
     go = GetObject()
@@ -257,7 +270,8 @@ def classify_faces(brep, thickness):
     """classify brep faces into sheet faces and edge faces.
     a sheet face has a parallel partner: shoot rays BOTH directions from its centroid
     and check if either hits another face at ~thickness distance.
-    returns (sheet_face_indices, edge_face_indices)."""
+    returns (sheet_face_indices, edge_face_indices, partners_dict).
+    partners_dict maps each sheet face to its first-found partner."""
     tol = sc.doc.ModelAbsoluteTolerance
     thick_tol = thickness * 0.2  # 20% tolerance for partner distance matching
 
@@ -273,6 +287,7 @@ def classify_faces(brep, thickness):
 
     # track which faces have a partner (symmetric: if i→j hits, both are sheet)
     sheet_set = set()
+    partners = {}  # face_i -> face_j (first-found partner)
 
     for i in range(brep.Faces.Count):
         if i in sheet_set:
@@ -321,6 +336,10 @@ def classify_faces(brep, thickness):
                                 continue
                         sheet_set.add(i)
                         sheet_set.add(j)
+                        if i not in partners:
+                            partners[i] = j
+                        if j not in partners:
+                            partners[j] = i
                         print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
                         found = True
                         break
@@ -342,30 +361,79 @@ def classify_faces(brep, thickness):
 
     sheet_faces = sorted(sheet_set)
     edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
-    return sheet_faces, edge_faces
+    return sheet_faces, edge_faces, partners
 
 
-def join_sheet_faces(brep, sheet_faces):
+def join_sheet_faces(brep, sheet_faces, partners):
     """join all sheet faces into two polysurfaces representing both sides
-    of the aluminum sheet. returns (side_a, side_b) or (None, None) on failure."""
+    of the aluminum sheet. uses partner pairs for graph-coloring to assign
+    faces to sides. returns (side_a, side_b) or (None, None) on failure."""
     tol = sc.doc.ModelAbsoluteTolerance
-    face_breps = []
+
+    # graph coloring: assign each face to side A (0) or side B (1)
+    color = {}  # face_index -> 0 or 1
     for fi in sheet_faces:
-        dup = brep.Faces[fi].DuplicateFace(False)
-        if dup is not None:
-            face_breps.append(dup)
+        if fi in color:
+            continue
+        # BFS from this face
+        color[fi] = 0
+        queue = [fi]
+        while queue:
+            current = queue.pop(0)
+            if current not in partners:
+                continue
+            partner = partners[current]
+            if partner in color:
+                if color[partner] == color[current]:
+                    print("warning: conflict coloring face {} and {} (both side {})".format(
+                        current, partner, color[current]))
+                continue
+            color[partner] = 1 - color[current]
+            queue.append(partner)
 
-    if len(face_breps) < 2:
-        print("error: not enough sheet faces to join ({})".format(len(face_breps)))
+    side_a_indices = [fi for fi in sheet_faces if color.get(fi, 0) == 0]
+    side_b_indices = [fi for fi in sheet_faces if color.get(fi, 0) == 1]
+
+    if not side_a_indices or not side_b_indices:
+        print("error: could not split sheet faces into 2 sides (A={}, B={})".format(
+            len(side_a_indices), len(side_b_indices)))
         return None, None
 
-    joined = Brep.JoinBreps(face_breps, tol)
-    if joined is None or len(joined) != 2:
-        count = len(joined) if joined else 0
-        print("error: expected 2 joined surfaces (both sides of sheet), got {}".format(count))
+    # join each side separately
+    def _join_side(indices):
+        face_breps = []
+        for fi in indices:
+            dup = brep.Faces[fi].DuplicateFace(False)
+            if dup is not None:
+                face_breps.append(dup)
+        if not face_breps:
+            return None
+        if len(face_breps) == 1:
+            return face_breps[0]
+        joined = Brep.JoinBreps(face_breps, tol)
+        if joined and len(joined) == 1:
+            return joined[0]
+        elif joined and len(joined) > 1:
+            # try looser tolerance
+            joined2 = Brep.JoinBreps(list(joined), tol * 10)
+            if joined2 and len(joined2) == 1:
+                return joined2[0]
+            # force merge
+            pieces = list(joined2) if joined2 else list(joined)
+            result = pieces[0]
+            for pi in range(1, len(pieces)):
+                result.Join(pieces[pi], tol * 10, True)
+            return result
+        return face_breps[0]
+
+    side_a = _join_side(side_a_indices)
+    side_b = _join_side(side_b_indices)
+
+    if side_a is None or side_b is None:
+        print("error: failed to join sheet faces into sides")
         return None, None
 
-    return joined[0], joined[1]
+    return side_a, side_b
 
 
 def identify_reference_side(side_a, side_b, brep, picked_face_index):
@@ -382,6 +450,178 @@ def identify_reference_side(side_a, side_b, brep, picked_face_index):
         return side_a, side_b
     else:
         return side_b, side_a
+
+
+def _segments_cross_2d(a0, a1, b0, b1):
+    """test if 2D line segments a0-a1 and b0-b1 cross each other.
+    a0,a1,b0,b1 are (x,y) tuples. returns True if segments properly cross."""
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    d1 = cross(a0, a1, b0)
+    d2 = cross(a0, a1, b1)
+    d3 = cross(b0, b1, a0)
+    d4 = cross(b0, b1, a1)
+    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+       ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        return True
+    return False
+
+
+def _compute_vertex(line_a, type_a, line_b, type_b, face_plane):
+    """compute the vertex where two adjacent edge lines meet.
+    uses a cascade of strategies for robustness.
+    returns Point3d or None."""
+    tol = sc.doc.ModelAbsoluteTolerance
+
+    # strategy 1: direct LineLine intersection
+    rc, ta, tb = Intersection.LineLine(line_a, line_b)
+    if rc:
+        pt_a = line_a.PointAt(ta)
+        pt_b = line_b.PointAt(tb)
+        gap = pt_a.DistanceTo(pt_b)
+        if gap < tol * 100:  # generous for 3D skew
+            return Point3d((pt_a.X + pt_b.X) / 2,
+                           (pt_a.Y + pt_b.Y) / 2,
+                           (pt_a.Z + pt_b.Z) / 2)
+
+    # strategy 2: project to offset plane, intersect in 2D
+    origin = face_plane.Origin
+    x_axis = face_plane.XAxis
+    y_axis = face_plane.YAxis
+
+    def to_2d(pt):
+        v = pt - origin
+        return (Vector3d.Multiply(v, x_axis), Vector3d.Multiply(v, y_axis))
+
+    def from_2d(u, v):
+        return origin + x_axis * u + y_axis * v
+
+    a0_2d = to_2d(line_a.From)
+    a1_2d = to_2d(line_a.To)
+    b0_2d = to_2d(line_b.From)
+    b1_2d = to_2d(line_b.To)
+
+    dax = a1_2d[0] - a0_2d[0]
+    day = a1_2d[1] - a0_2d[1]
+    dbx = b1_2d[0] - b0_2d[0]
+    dby = b1_2d[1] - b0_2d[1]
+    denom = dax * dby - day * dbx
+
+    if abs(denom) > 1e-10:
+        dx = b0_2d[0] - a0_2d[0]
+        dy = b0_2d[1] - a0_2d[1]
+        t = (dx * dby - dy * dbx) / denom
+        u = a0_2d[0] + t * dax
+        v = a0_2d[1] + t * day
+        return from_2d(u, v)
+
+    # strategy 3: parallel lines — use shared endpoint
+    if type_b in ("perimeter", "perimeter_fallback"):
+        return Point3d(line_b.From.X, line_b.From.Y, line_b.From.Z)
+    if type_a in ("perimeter", "perimeter_fallback"):
+        return Point3d(line_a.To.X, line_a.To.Y, line_a.To.Z)
+
+    return None
+
+
+def _validate_polygon(vertices, face_plane, tol):
+    """validate and repair a polygon: remove duplicates, collinear points,
+    project to plane, check self-intersection. returns cleaned list or None."""
+    if len(vertices) < 3:
+        return None
+
+    # remove consecutive duplicates
+    cleaned = [vertices[0]]
+    for i in range(1, len(vertices)):
+        if vertices[i].DistanceTo(cleaned[-1]) > tol:
+            cleaned.append(vertices[i])
+    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
+        cleaned.pop()
+    if len(cleaned) < 3:
+        return None
+
+    # remove collinear interior points
+    simplified = []
+    n = len(cleaned)
+    for i in range(n):
+        prev_pt = cleaned[(i - 1) % n]
+        curr = cleaned[i]
+        next_pt = cleaned[(i + 1) % n]
+        seg = Line(prev_pt, next_pt)
+        t = seg.ClosestParameter(curr)
+        closest = seg.PointAt(t)
+        if curr.DistanceTo(closest) > tol * 10:
+            simplified.append(curr)
+    if len(simplified) < 3:
+        return None
+
+    # project to face plane for exact planarity
+    projected = []
+    for pt in simplified:
+        projected.append(face_plane.ClosestPoint(pt))
+
+    # 2D self-intersection check
+    origin = face_plane.Origin
+    x_axis = face_plane.XAxis
+    y_axis = face_plane.YAxis
+    pts_2d = []
+    for pt in projected:
+        v = pt - origin
+        pts_2d.append((Vector3d.Multiply(v, x_axis),
+                        Vector3d.Multiply(v, y_axis)))
+
+    m = len(pts_2d)
+    for i in range(m):
+        for j in range(i + 2, m):
+            if i == 0 and j == m - 1:
+                continue  # adjacent segments
+            if _segments_cross_2d(pts_2d[i], pts_2d[(i + 1) % m],
+                                   pts_2d[j], pts_2d[(j + 1) % m]):
+                return None  # self-intersecting
+
+    return projected
+
+
+def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist):
+    """build edge lines for a face's outer loop. every trim produces exactly
+    one (type, Line) entry. bend edges use PlanePlane with translated fallback.
+    respects trim.IsReversed() for consistent winding."""
+    normal = face_normals[fi]
+    offset_vec = Vector3d(-normal.X * offset_dist,
+                           -normal.Y * offset_dist,
+                           -normal.Z * offset_dist)
+    edge_lines = []
+    for trim in face.OuterLoop.Trims:
+        edge = trim.Edge
+        if edge is None:
+            continue
+
+        # edge direction respecting trim winding
+        if trim.IsReversed():
+            e_start = edge.PointAtEnd
+            e_end = edge.PointAtStart
+        else:
+            e_start = edge.PointAtStart
+            e_end = edge.PointAtEnd
+
+        adj = list(edge.AdjacentFaces())
+        if len(adj) == 2:
+            other = adj[0] if adj[1] == fi else adj[1]
+            if other in face_planes:
+                rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
+                if rc:
+                    edge_lines.append(("bend", int_line))
+                    continue
+            # PlanePlane failed or other not in face_planes: fallback to translated
+            p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
+            p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
+            edge_lines.append(("perimeter_fallback", Line(p0, p1)))
+        else:
+            p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
+            p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
+            edge_lines.append(("perimeter", Line(p0, p1)))
+
+    return edge_lines
 
 
 def construct_neutral_axis(ref_side, thickness):
@@ -428,70 +668,48 @@ def construct_neutral_axis(ref_side, thickness):
         print("error: no planar faces found in ref_side")
         return None
 
-    # step 2: build boundary vertices for each neutral axis face
-    # compute vertices by intersecting adjacent neutral-axis edge lines
+    # step 2: build each neutral axis face using robust helpers
     neutral_faces = []
     for fi in face_planes:
         normal = face_normals[fi]
         face = ref_side.Faces[fi]
-
-        # get edges in boundary order from the outer loop
-        loop = face.OuterLoop
-        if loop is None:
+        if face.OuterLoop is None:
             continue
 
-        edge_lines = []
-        for trim in loop.Trims:
-            if trim.Edge is None:
-                continue
-            edge = trim.Edge
-            adj = edge.AdjacentFaces()
-
-            offset_vec = Vector3d(-normal.X * offset_dist,
-                                   -normal.Y * offset_dist,
-                                   -normal.Z * offset_dist)
-
-            if len(adj) == 2:
-                other = adj[0] if adj[1] == fi else adj[1]
-                if other in face_planes:
-                    # bend edge: plane-plane intersection (infinite line)
-                    rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
-                    if rc:
-                        edge_lines.append(int_line)
-                else:
-                    # edge adjacent to non-sheet face (bend radius): translate like perimeter
-                    p0 = edge.PointAtStart + offset_vec
-                    p1 = edge.PointAtEnd + offset_vec
-                    edge_lines.append(Line(p0, p1))
-            else:
-                # perimeter edge: translate to offset plane
-                p0 = edge.PointAtStart + offset_vec
-                p1 = edge.PointAtEnd + offset_vec
-                edge_lines.append(Line(p0, p1))
-
+        # build edge lines (guaranteed 1:1 with trims, no silent skipping)
+        edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist)
         if len(edge_lines) < 3:
             print("warning: face {} has only {} edge lines".format(fi, len(edge_lines)))
             continue
 
-        # compute vertices by intersecting adjacent edge lines
+        # compute vertices with multi-strategy intersection
         n = len(edge_lines)
         vertices = []
         for i in range(n):
-            line_a = edge_lines[i]
-            line_b = edge_lines[(i + 1) % n]
-            rc, ta, tb = Intersection.LineLine(line_a, line_b)
-            if rc:
-                vertices.append(Point3d(line_a.PointAt(ta)))
+            type_a, line_a = edge_lines[i]
+            type_b, line_b = edge_lines[(i + 1) % n]
+            pt = _compute_vertex(line_a, type_a, line_b, type_b, face_planes[fi])
+            if pt is not None:
+                vertices.append(pt)
 
         if len(vertices) < 3:
             print("warning: face {} has only {} vertices".format(fi, len(vertices)))
             continue
 
-        # close the polyline and create planar face
-        vertices.append(vertices[0])
-        boundary = PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in vertices])
+        # validate and repair polygon
+        validated = _validate_polygon(vertices, face_planes[fi], tol)
+        if validated is None:
+            print("warning: face {} polygon invalid, skipping".format(fi))
+            continue
+
+        # close polyline and create planar face
+        validated.append(validated[0])
+        boundary = PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in validated])
 
         # collect inner loops (window openings) translated to offset plane
+        offset_vec = Vector3d(-normal.X * offset_dist,
+                               -normal.Y * offset_dist,
+                               -normal.Z * offset_dist)
         all_curves = [boundary]
         inner_count = 0
         for li in range(face.Loops.Count):
@@ -501,25 +719,20 @@ def construct_neutral_axis(ref_side, thickness):
             inner_3d = lp.To3dCurve()
             if inner_3d is None:
                 continue
-            # CPython 3 workaround: doc round-trip for translate
-            xf = Transform.Translation(offset_vec.X, offset_vec.Y, offset_vec.Z)
-            temp_id = sc.doc.Objects.AddCurve(inner_3d)
-            new_id = sc.doc.Objects.Transform(temp_id, xf, True)
-            obj = sc.doc.Objects.FindId(new_id)
-            if obj is not None:
-                inner_3d = obj.Geometry.DuplicateCurve()
-            sc.doc.Objects.Delete(new_id, True)
+            inner_3d = _doc_translate(inner_3d, offset_vec.X, offset_vec.Y, offset_vec.Z)
             all_curves.append(inner_3d)
             inner_count += 1
         if inner_count > 0:
             print("  face {}: {} inner loops found".format(fi, inner_count))
 
         face_breps = Brep.CreatePlanarBreps(all_curves, tol)
+        if not face_breps or len(face_breps) == 0:
+            face_breps = Brep.CreatePlanarBreps(all_curves, tol * 100)
         if face_breps and len(face_breps) > 0:
             neutral_faces.append(face_breps[0])
         else:
-            # retry without inner loops if holes cause failure
-            face_breps = Brep.CreatePlanarBreps([boundary], tol)
+            # last resort: try without inner loops
+            face_breps = Brep.CreatePlanarBreps([boundary], tol * 100)
             if face_breps and len(face_breps) > 0:
                 print("warning: face {} inner loops failed, using solid face".format(fi))
                 neutral_faces.append(face_breps[0])
@@ -544,10 +757,10 @@ def construct_neutral_axis(ref_side, thickness):
                 result = joined2[0]
             else:
                 # merge into one brep
-                pieces = joined2 if joined2 else joined
+                pieces = list(joined2) if joined2 else list(joined)
                 result = pieces[0]
-                for extra in pieces[1:]:
-                    result.Join(extra, tol * 10, True)
+                for pi in range(1, len(pieces)):
+                    result.Join(pieces[pi], tol * 10, True)
                 print("warning: neutral axis joined with loose tolerance ({} pieces)".format(
                     len(pieces)))
         else:
@@ -963,15 +1176,15 @@ def unfold_to_2d():
     print("thickness: {}".format(thickness))
 
     # step 3: classify faces
-    sheet_faces, edge_faces = classify_faces(brep, thickness)
+    sheet_faces, edge_faces, partners = classify_faces(brep, thickness)
     print("faces: {} sheet, {} edge".format(len(sheet_faces), len(edge_faces)))
 
     if len(sheet_faces) < 2:
         print("error: need at least 2 sheet faces")
         return
 
-    # step 4: join sheet faces -> 2 polysurfaces
-    side_a, side_b = join_sheet_faces(brep, sheet_faces)
+    # step 4: join sheet faces -> 2 polysurfaces (graph-colored by partner pairs)
+    side_a, side_b = join_sheet_faces(brep, sheet_faces, partners)
     if side_a is None:
         return
     print("joined sheet faces: side A ({} faces), side B ({} faces)".format(
