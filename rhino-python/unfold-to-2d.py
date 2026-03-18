@@ -235,7 +235,7 @@ def classify_faces(brep, thickness):
     and check if either hits another face at ~thickness distance.
     returns (sheet_face_indices, edge_face_indices)."""
     tol = sc.doc.ModelAbsoluteTolerance
-    thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
+    thick_tol = thickness * 0.3  # 30% tolerance for partner distance matching
 
     # precompute centroids, normals, and untrimmed face breps
     # untrimming removes holes so rays don't pass through cutouts
@@ -278,6 +278,13 @@ def classify_faces(brep, thickness):
                 for pt in intersection_points:
                     dist = ci.DistanceTo(pt)
                     if abs(dist - thickness) < thick_tol:
+                        # verify normals are antiparallel (true partners face opposite)
+                        # edge faces have perpendicular normals (dot ≈ 0) → rejected
+                        _, nj = face_data[j]
+                        if nj is not None:
+                            dot = Vector3d.Multiply(ni, nj)
+                            if dot > -0.5:
+                                continue
                         sheet_set.add(i)
                         sheet_set.add(j)
                         print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
