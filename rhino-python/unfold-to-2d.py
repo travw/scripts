@@ -610,6 +610,32 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             merged.append(segments[i])
             i += 1
 
+    # second pass: collapse bend(X), short_perimeter, bend(X) → bend(X)
+    # handles tiny naked edges at transition zone gaps between skipped faces
+    thickness = offset_dist * 2
+    changed = True
+    while changed:
+        changed = False
+        new_merged = []
+        i = 0
+        while i < len(merged):
+            if (i + 2 < len(merged)
+                    and merged[i][0] == "bend"
+                    and merged[i + 1][0] == "perimeter"
+                    and merged[i + 2][0] == "bend"
+                    and merged[i][2] == merged[i + 2][2]
+                    and merged[i + 1][1].GetLength() < thickness * 2):
+                new_merged.append(("bend",
+                    LineCurve(Line(merged[i][1].PointAtStart,
+                                   merged[i + 2][1].PointAtEnd)),
+                    merged[i][2]))
+                i += 3
+                changed = True
+            else:
+                new_merged.append(merged[i])
+                i += 1
+        merged = new_merged
+
     if len(merged) < 3:
         projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
         return projected if projected.IsClosed else None
@@ -1197,7 +1223,7 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
         unrolled_face = unrolled_breps[0].Faces[uf_idx]
         uf_brep = unrolled_face.DuplicateFace(False)
         amp_uf = AreaMassProperties.Compute(uf_brep)
-        # target: matching NA face
+        # target: use picked face plane (stable orientation) at NA centroid
         na_face = neutral_axis.Faces[best_na_idx]
         na_brep = na_face.DuplicateFace(False)
         amp_na = AreaMassProperties.Compute(na_brep)
@@ -1207,7 +1233,9 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
             na_centroid = amp_na.Centroid
             plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
             rc_uf_plane, uf_plane = unrolled_face.TryGetPlane(plane_tol)
-            rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
+            # use picked face plane for stable axis orientation
+            picked_face = brep.Faces[picked_face_index]
+            rc_na_plane, na_plane = picked_face.TryGetPlane(plane_tol)
             if rc_uf_plane and rc_na_plane:
                 uf_plane.Origin = uf_centroid
                 na_plane.Origin = na_centroid
