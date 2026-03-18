@@ -207,6 +207,7 @@ def classify_faces(brep, thickness):
 
     # track which faces have a partner (symmetric: if i→j hits, both are sheet)
     sheet_set = set()
+    pairs = []  # list of (face_i, face_j) partner pairs
 
     for i in range(brep.Faces.Count):
         if i in sheet_set:
@@ -239,6 +240,7 @@ def classify_faces(brep, thickness):
                     if abs(dist - thickness) < thick_tol:
                         sheet_set.add(i)
                         sheet_set.add(j)
+                        pairs.append((i, j))
                         print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
                         found = True
                         break
@@ -247,7 +249,7 @@ def classify_faces(brep, thickness):
 
     sheet_faces = sorted(sheet_set)
     edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
-    return sheet_faces, edge_faces
+    return sheet_faces, edge_faces, pairs
 
 
 def join_sheet_faces(brep, sheet_faces):
@@ -289,46 +291,42 @@ def identify_reference_side(side_a, side_b, brep, picked_face_index):
         return side_b, side_a
 
 
-def construct_neutral_axis(ref_side, thickness):
-    """construct the neutral axis surface by offsetting the reference side
-    inward by half the sheet thickness. returns a brep or None."""
+def construct_neutral_axis(brep, pairs, thickness):
+    """construct the neutral axis surface by offsetting the larger face from
+    each paired set individually, then joining. per-face offset avoids the
+    fillet faces that CreateOffsetBrep adds at bends on a polysurface.
+    returns a brep or None."""
     tol = sc.doc.ModelAbsoluteTolerance
     offset_dist = thickness / 2.0
 
-    # offset in the direction opposite to face normals (inward toward other side).
-    # for an open polysurface extracted from a closed solid, face normals point
-    # outward from the solid, so negative offset = toward the interior = toward other side.
-    try:
-        result = Brep.CreateOffsetBrep(ref_side, -offset_dist, False, False, tol)
-        if result and result[0] and len(result[0]) > 0:
-            return result[0][0]
-    except Exception as e:
-        print("warning: CreateOffsetBrep failed: {}".format(e))
-
-    # fallback: offset each face individually and join
-    print("warning: falling back to per-face offset")
     offset_faces = []
-    for fi in range(ref_side.Faces.Count):
-        face = ref_side.Faces[fi]
-        srf = face.UnderlyingSurface()
-        # determine offset direction: toward interior
-        # face normal from the joined polysurface points outward
-        amp = AreaMassProperties.Compute(face)
-        if amp is None:
+    for fi_a, fi_b in pairs:
+        # pick the larger face from each pair
+        brep_a = brep.Faces[fi_a].DuplicateFace(False)
+        brep_b = brep.Faces[fi_b].DuplicateFace(False)
+        if brep_a is None or brep_b is None:
             continue
-        fc = amp.Centroid
-        rc, u, v = face.ClosestPoint(fc)
-        if not rc:
-            continue
-        fn = face.NormalAt(u, v)
-        if face.OrientationIsReversed:
-            fn = -fn
-        # offset opposite to outward normal
-        offset_srf = srf.Offset(-offset_dist if not face.OrientationIsReversed else offset_dist, tol)
-        if offset_srf is not None:
-            ob = offset_srf.ToBrep()
-            if ob is not None:
-                offset_faces.append(ob)
+
+        area_a = brep_a.GetArea()
+        area_b = brep_b.GetArea()
+
+        if area_a >= area_b:
+            source = brep_a
+            # outer face: offset inward (negative = toward interior)
+            dist = -offset_dist
+        else:
+            source = brep_b
+            # inner face: offset outward (positive = toward exterior)
+            dist = offset_dist
+
+        try:
+            result = Brep.CreateOffsetBrep(source, dist, False, False, tol)
+            if result and result[0] and len(result[0]) > 0:
+                offset_faces.append(result[0][0])
+                continue
+        except Exception:
+            pass
+        print("warning: could not offset face pair ({}, {})".format(fi_a, fi_b))
 
     if not offset_faces:
         print("error: could not offset any faces")
@@ -339,7 +337,11 @@ def construct_neutral_axis(ref_side, thickness):
 
     joined = Brep.JoinBreps(offset_faces, tol)
     if joined and len(joined) > 0:
-        return sorted(joined, key=lambda b: b.GetArea(), reverse=True)[0]
+        result = sorted(joined, key=lambda b: b.GetArea(), reverse=True)[0]
+        # debug: bake neutral axis for inspection
+        sc.doc.Objects.AddBrep(result)
+        sc.doc.Views.Redraw()
+        return result
 
     return offset_faces[0]
 
@@ -713,7 +715,7 @@ def unfold_to_2d():
     print("thickness: {}".format(thickness))
 
     # step 4: classify faces
-    sheet_faces, edge_faces = classify_faces(brep, thickness)
+    sheet_faces, edge_faces, pairs = classify_faces(brep, thickness)
     print("faces: {} sheet, {} edge".format(len(sheet_faces), len(edge_faces)))
 
     if len(sheet_faces) < 2:
@@ -730,8 +732,8 @@ def unfold_to_2d():
     # step 6: identify reference side (contains picked face)
     ref_side, other_side = identify_reference_side(side_a, side_b, brep, face_index)
 
-    # step 7: construct neutral axis (offset reference side by t/2)
-    neutral_axis = construct_neutral_axis(ref_side, thickness)
+    # step 7: construct neutral axis (per-face offset for sharp corners)
+    neutral_axis = construct_neutral_axis(brep, pairs, thickness)
     if neutral_axis is None:
         return
     print("neutral axis: {} faces".format(neutral_axis.Faces.Count))
