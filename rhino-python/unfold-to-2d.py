@@ -488,14 +488,41 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     if outer_crv is None:
         return None
 
-    # build bend_map: all pairwise PP axes between this face and other non-skipped faces
+    # build bend_map: PP axes for adjacent faces only (via trim adjacency)
     bend_map = {}  # target_fi -> Line (infinite PlanePlane line)
-    for other_fi in face_planes:
-        if other_fi == fi or other_fi in skipped_faces:
+    for trim_obj in face.OuterLoop.Trims:
+        edge = trim_obj.Edge
+        if edge is None:
             continue
-        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[other_fi])
+        adj = list(edge.AdjacentFaces())
+        if len(adj) != 2:
+            continue
+        other = adj[0] if adj[1] == fi else adj[1]
+        target = other
+        # resolve skipped (transition) faces to nearest real face
+        if skipped_faces and other in skipped_faces:
+            edge_mid = edge.PointAt(edge.Domain.Mid)
+            best_fi = None
+            best_d = float("inf")
+            for cfi in face_planes:
+                if cfi == fi or cfi in skipped_faces:
+                    continue
+                cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
+                cf_amp = AreaMassProperties.Compute(cf_brep)
+                if cf_amp is not None:
+                    d = edge_mid.DistanceTo(cf_amp.Centroid)
+                    if d < best_d:
+                        best_d = d
+                        best_fi = cfi
+            if best_fi is not None:
+                target = best_fi
+        if target == fi or target not in face_planes or target in (skipped_faces or set()):
+            continue
+        if target in bend_map:
+            continue
+        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[target])
         if rc:
-            bend_map[other_fi] = pp_line
+            bend_map[target] = pp_line
 
     # walk trims in winding order, building segments
     # purely geometric classification: an edge is a bend if it's parallel to
@@ -1330,48 +1357,42 @@ def unfold_to_2d():
     print("  NAS debug: {} individual faces baked (cyan)".format(len(nas_dot_ids)))
     sc.doc.Views.Redraw()
 
-    # step 7: identify bends
-    print("=== bends ===")
-    bend_infos = identify_bends(ref_side)
-    print("  {} bends found".format(len(bend_infos)))
-
-    # step 8: project bend lines to neutral axis
-    project_bends_to_neutral_axis(bend_infos, neutral_axis)
-
-    # step 9: compute bend directions
-    determine_bend_directions(bend_infos, picked_normal)
-    for info in bend_infos:
-        print("  bend: {:.1f} {}".format(info["angle"], info["direction"]))
-
-    # step 10: find ink curves
-    ink_curves = find_ink_curves(brep)
-    print("ink curves: {}".format(len(ink_curves)))
-
-    # step 11: unroll
-    print("=== unroll ===")
-    unroll_result = unroll_neutral_axis(neutral_axis, ink_curves, bend_infos)
-    if unroll_result is None:
-        return
-    unrolled_breps, unrolled_ink, unrolled_bend = unroll_result
-    print("  {} brep(s), {} ink, {} bend lines".format(
-        len(unrolled_breps), len(unrolled_ink), len(unrolled_bend)))
-
-    # step 12: classify unrolled boundary curves
-    outside_curves, inside_curves = classify_unrolled_curves(unrolled_breps)
-    print("  cuts: {} outside, {} inside".format(len(outside_curves), len(inside_curves)))
-
-    # step 13: create bend angle text
-    text_curves = create_bend_text_curves(bend_infos, unrolled_bend)
-
-    # step 14: add curves to sublayers
-    sublayers = ensure_sublayers()
-    count = add_output(neutral_axis, unrolled_breps, outside_curves,
-                       inside_curves, unrolled_bend, unrolled_ink,
-                       text_curves, sublayers,
-                       brep=brep, picked_face_index=face_index)
+    # --- curve output commented out while NAS is being debugged ---
+    # # step 7: identify bends
+    # print("=== bends ===")
+    # bend_infos = identify_bends(ref_side)
+    # print("  {} bends found".format(len(bend_infos)))
+    # # step 8: project bend lines to neutral axis
+    # project_bends_to_neutral_axis(bend_infos, neutral_axis)
+    # # step 9: compute bend directions
+    # determine_bend_directions(bend_infos, picked_normal)
+    # for info in bend_infos:
+    #     print("  bend: {:.1f} {}".format(info["angle"], info["direction"]))
+    # # step 10: find ink curves
+    # ink_curves = find_ink_curves(brep)
+    # print("ink curves: {}".format(len(ink_curves)))
+    # # step 11: unroll
+    # print("=== unroll ===")
+    # unroll_result = unroll_neutral_axis(neutral_axis, ink_curves, bend_infos)
+    # if unroll_result is None:
+    #     return
+    # unrolled_breps, unrolled_ink, unrolled_bend = unroll_result
+    # print("  {} brep(s), {} ink, {} bend lines".format(
+    #     len(unrolled_breps), len(unrolled_ink), len(unrolled_bend)))
+    # # step 12: classify unrolled boundary curves
+    # outside_curves, inside_curves = classify_unrolled_curves(unrolled_breps)
+    # print("  cuts: {} outside, {} inside".format(len(outside_curves), len(inside_curves)))
+    # # step 13: create bend angle text
+    # text_curves = create_bend_text_curves(bend_infos, unrolled_bend)
+    # # step 14: add curves to sublayers
+    # sublayers = ensure_sublayers()
+    # count = add_output(neutral_axis, unrolled_breps, outside_curves,
+    #                    inside_curves, unrolled_bend, unrolled_ink,
+    #                    text_curves, sublayers,
+    #                    brep=brep, picked_face_index=face_index)
 
     sc.doc.Views.Redraw()
-    print("unfold complete: {} curves placed".format(count))
+    print("NAS construction complete (curve output disabled)")
 
 
 if __name__ == "__main__":
