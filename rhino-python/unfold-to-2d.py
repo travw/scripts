@@ -364,10 +364,11 @@ def classify_faces(brep, thickness):
     return sheet_faces, edge_faces, partners
 
 
-def join_sheet_faces(brep, sheet_faces, partners):
+def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
     """join all sheet faces into two polysurfaces representing both sides
     of the aluminum sheet. uses partner pairs for graph-coloring to assign
-    faces to sides. returns (side_a, side_b) or (None, None) on failure."""
+    faces to sides. returns (ref_side, other_side) where ref_side contains
+    the picked face, or (None, None) on failure."""
     tol = sc.doc.ModelAbsoluteTolerance
 
     # graph coloring: assign each face to side A (0) or side B (1)
@@ -391,8 +392,10 @@ def join_sheet_faces(brep, sheet_faces, partners):
             color[partner] = 1 - color[current]
             queue.append(partner)
 
-    side_a_indices = [fi for fi in sheet_faces if color.get(fi, 0) == 0]
-    side_b_indices = [fi for fi in sheet_faces if color.get(fi, 0) == 1]
+    # determine which color the picked face got (ref side)
+    ref_color = color.get(picked_face_index, 0)
+    side_a_indices = [fi for fi in sheet_faces if color.get(fi, 0) == ref_color]
+    side_b_indices = [fi for fi in sheet_faces if color.get(fi, 0) != ref_color]
 
     if not side_a_indices or not side_b_indices:
         print("error: could not split sheet faces into 2 sides (A={}, B={})".format(
@@ -1057,7 +1060,8 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves):
 
 
 def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
-               unrolled_bend, unrolled_ink, text_curves, sublayers):
+               unrolled_bend, unrolled_ink, text_curves, sublayers,
+               brep=None, picked_face_index=0):
     """add 2D curves to fabrication sublayers, aligned to the neutral axis
     face plane. the Unroller flattens to an arbitrary plane — we rotate
     the output normal onto the NA face normal (preserving in-plane layout),
@@ -1066,38 +1070,40 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
     # compute alignment: rotation + translation from unrolled to neutral axis
     align_xform = None
     if unrolled_breps and len(unrolled_breps) > 0:
-        # unrolled face centroid + normal
-        unrolled_face = unrolled_breps[0].Faces[0]
-        uf_brep = unrolled_face.DuplicateFace(False)
-        amp_uf = AreaMassProperties.Compute(uf_brep)
-        # neutral axis face centroid + normal
-        na_face = neutral_axis.Faces[0]
+        # neutral axis face closest to picked face (not always face 0)
+        picked_centroid, picked_normal = get_face_outward_normal(brep, picked_face_index)
+        best_na_idx = 0
+        best_na_dist = float("inf")
+        if picked_centroid is not None:
+            for nfi in range(neutral_axis.Faces.Count):
+                nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
+                nf_amp = AreaMassProperties.Compute(nf_brep)
+                if nf_amp is not None:
+                    d = picked_centroid.DistanceTo(nf_amp.Centroid)
+                    if d < best_na_dist:
+                        best_na_dist = d
+                        best_na_idx = nfi
+        na_face = neutral_axis.Faces[best_na_idx]
         na_brep = na_face.DuplicateFace(False)
         amp_na = AreaMassProperties.Compute(na_brep)
+        # use same face index in unrolled brep (Unroller preserves face order)
+        uf_idx = min(best_na_idx, unrolled_breps[0].Faces.Count - 1)
+        unrolled_face = unrolled_breps[0].Faces[uf_idx]
+        uf_brep = unrolled_face.DuplicateFace(False)
+        amp_uf = AreaMassProperties.Compute(uf_brep)
         if amp_uf and amp_na:
-            rc_uf, u_uf, v_uf = unrolled_face.ClosestPoint(amp_uf.Centroid)
-            n_uf = unrolled_face.NormalAt(u_uf, v_uf)
-            if unrolled_face.OrientationIsReversed:
-                n_uf = -n_uf
-
-            rc_na, u_na, v_na = na_face.ClosestPoint(amp_na.Centroid)
-            n_na = na_face.NormalAt(u_na, v_na)
-            if na_face.OrientationIsReversed:
-                n_na = -n_na
-
+            # build full planes from face parameterization (captures in-plane orientation)
+            # TryGetPlane gives consistent axes from the face's UV directions
             uf_centroid = amp_uf.Centroid
             na_centroid = amp_na.Centroid
-
-            # step 1: rotate unrolled normal to NA normal (around unrolled centroid)
-            rotation = Transform.Rotation(n_uf, n_na, uf_centroid)
-            # step 2: translate rotated centroid to NA centroid
-            # (rotation pivots around uf_centroid, so it stays put — just translate)
-            translation = Transform.Translation(
-                na_centroid.X - uf_centroid.X,
-                na_centroid.Y - uf_centroid.Y,
-                na_centroid.Z - uf_centroid.Z,
-            )
-            align_xform = translation * rotation
+            plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
+            rc_uf_plane, uf_plane = unrolled_face.TryGetPlane(plane_tol)
+            rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
+            if rc_uf_plane and rc_na_plane:
+                # set origins to centroids for proper alignment
+                uf_plane.Origin = uf_centroid
+                na_plane.Origin = na_centroid
+                align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
 
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
@@ -1184,14 +1190,12 @@ def unfold_to_2d():
         return
 
     # step 4: join sheet faces -> 2 polysurfaces (graph-colored by partner pairs)
-    side_a, side_b = join_sheet_faces(brep, sheet_faces, partners)
-    if side_a is None:
+    # ref_side contains the picked face, other_side is the opposite
+    ref_side, other_side = join_sheet_faces(brep, sheet_faces, partners, face_index)
+    if ref_side is None:
         return
-    print("joined sheet faces: side A ({} faces), side B ({} faces)".format(
-        side_a.Faces.Count, side_b.Faces.Count))
-
-    # step 5: identify reference side (contains picked face)
-    ref_side, other_side = identify_reference_side(side_a, side_b, brep, face_index)
+    print("joined sheet faces: ref ({} faces), other ({} faces)".format(
+        ref_side.Faces.Count, other_side.Faces.Count))
 
     # step 6: construct neutral axis
     neutral_axis = construct_neutral_axis(ref_side, thickness)
@@ -1234,7 +1238,8 @@ def unfold_to_2d():
     sublayers = ensure_sublayers()
     count = add_output(neutral_axis, unrolled_breps, outside_curves,
                        inside_curves, unrolled_bend, unrolled_ink,
-                       text_curves, sublayers)
+                       text_curves, sublayers,
+                       brep=brep, picked_face_index=face_index)
 
     sc.doc.Views.Redraw()
     print("unfold complete: {} curves placed".format(count))
