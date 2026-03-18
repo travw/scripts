@@ -493,6 +493,7 @@ def construct_neutral_axis(ref_side, thickness):
 
         # collect inner loops (window openings) translated to offset plane
         all_curves = [boundary]
+        inner_count = 0
         for li in range(face.Loops.Count):
             lp = face.Loops[li]
             if lp.LoopType == BrepLoopType.Outer:
@@ -500,8 +501,18 @@ def construct_neutral_axis(ref_side, thickness):
             inner_3d = lp.To3dCurve()
             if inner_3d is None:
                 continue
-            inner_3d.Translate(offset_vec)
+            # CPython 3 workaround: doc round-trip for translate
+            xf = Transform.Translation(offset_vec.X, offset_vec.Y, offset_vec.Z)
+            temp_id = sc.doc.Objects.AddCurve(inner_3d)
+            new_id = sc.doc.Objects.Transform(temp_id, xf, True)
+            obj = sc.doc.Objects.FindId(new_id)
+            if obj is not None:
+                inner_3d = obj.Geometry.DuplicateCurve()
+            sc.doc.Objects.Delete(new_id, True)
             all_curves.append(inner_3d)
+            inner_count += 1
+        if inner_count > 0:
+            print("  face {}: {} inner loops found".format(fi, inner_count))
 
         face_breps = Brep.CreatePlanarBreps(all_curves, tol)
         if face_breps and len(face_breps) > 0:
@@ -756,7 +767,7 @@ def classify_unrolled_curves(unrolled_breps):
     inside = []
 
     for brp in unrolled_breps:
-        naked = brp.DuplicateNakedEdgeCurves(True, False)
+        naked = brp.DuplicateNakedEdgeCurves(True, True)
         if naked is None or len(naked) == 0:
             continue
 
@@ -819,6 +830,11 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves):
             continue
 
         te.TextHeight = TEXT_HEIGHT
+        # use Mecsoft_Font-1 (CNC single-stroke font)
+        mecsoft = Rhino.DocObjects.Font.FromQuartetProperties(
+            "Mecsoft_Font-1", False, False)
+        if mecsoft is not None:
+            te.Font = mecsoft
 
         curves = te.CreateCurves(ds, False)
         if curves and len(curves) > 0:
@@ -884,11 +900,17 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
     attr_mark = Rhino.DocObjects.ObjectAttributes()
     attr_mark.LayerIndex = mark_idx
 
+    guids = []
+
     def _add(crv, attr):
         guid = sc.doc.Objects.AddCurve(crv, attr)
         if guid != System.Guid.Empty:
             if align_xform is not None:
-                sc.doc.Objects.Transform(guid, align_xform, True)
+                # Transform returns new guid (deletes old)
+                new_guid = sc.doc.Objects.Transform(guid, align_xform, True)
+                guids.append(new_guid)
+            else:
+                guids.append(guid)
             return 1
         return 0
 
@@ -906,6 +928,12 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
 
     for crv in text_curves:
         count += _add(crv, attr_mark)
+
+    # group all output
+    if guids:
+        group_idx = sc.doc.Groups.Add()
+        for g in guids:
+            sc.doc.Groups.AddToGroup(group_idx, g)
 
     return count
 
