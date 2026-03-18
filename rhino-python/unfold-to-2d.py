@@ -582,17 +582,32 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                     segments.append(("bend", LineCurve(Line(pp_s, pp_e)), target))
                 continue
 
-        # perimeter edge (naked or no PP line for neighbor)
+        # check if naked edge is at a bend (close to a PP line)
+        if len(adj) != 2 and bend_map:
+            mid_nap = Point3d((s_nap.X + e_nap.X) / 2,
+                              (s_nap.Y + e_nap.Y) / 2,
+                              (s_nap.Z + e_nap.Z) / 2)
+            best_target = None
+            best_dist = float("inf")
+            for tgt, pp_line in bend_map.items():
+                t = pp_line.ClosestParameter(mid_nap)
+                d = mid_nap.DistanceTo(pp_line.PointAt(t))
+                if d < best_dist:
+                    best_dist = d
+                    best_target = tgt
+            if best_target is not None and best_dist < offset_dist * 2:
+                pp_line = bend_map[best_target]
+                t0 = pp_line.ClosestParameter(s_nap)
+                t1 = pp_line.ClosestParameter(e_nap)
+                pp_s = pp_line.PointAt(t0)
+                pp_e = pp_line.PointAt(t1)
+                if pp_s.DistanceTo(pp_e) > tol:
+                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), best_target))
+                continue
+
+        # perimeter edge (naked, not near any PP line, or no bend neighbors)
         if s_nap.DistanceTo(e_nap) > tol:
             segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
-
-    # debug: print segment summary
-    bend_count = sum(1 for s in segments if s[0] == "bend")
-    perim_count = sum(1 for s in segments if s[0] == "perimeter")
-    print("    segments: {} bend, {} perimeter".format(bend_count, perim_count))
-    for si, (st, sc_crv, stgt) in enumerate(segments):
-        length = sc_crv.GetLength()
-        print("      [{}] {} tgt={} len={:.4f}".format(si, st, stgt, length))
 
     if len(segments) < 3:
         # not enough segments — fallback to projected outline
@@ -643,12 +658,6 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                 new_merged.append(merged[i])
                 i += 1
         merged = new_merged
-
-    # debug: print merged summary
-    print("    after merge: {} segments".format(len(merged)))
-    for mi, (mt, mc_crv, mtgt) in enumerate(merged):
-        length = mc_crv.GetLength()
-        print("      [{}] {} tgt={} len={:.4f}".format(mi, mt, mtgt, length))
 
     if len(merged) < 3:
         projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
@@ -1252,16 +1261,11 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
             rc_na_plane, na_plane = picked_face.TryGetPlane(plane_tol)
             if rc_uf_plane and rc_na_plane:
                 uf_plane.Origin = uf_centroid
-                na_plane.Origin = na_centroid
+                # 180° in-plane rotation: flip both axes, keeps Normal the same
+                na_plane = Plane(na_centroid, -na_plane.XAxis, -na_plane.YAxis)
                 align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
                 print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
                     picked_face_index, best_na_idx, best_na_dist))
-                print("  uf_plane N=({:.3f},{:.3f},{:.3f}) X=({:.3f},{:.3f},{:.3f})".format(
-                    uf_plane.Normal.X, uf_plane.Normal.Y, uf_plane.Normal.Z,
-                    uf_plane.XAxis.X, uf_plane.XAxis.Y, uf_plane.XAxis.Z))
-                print("  na_plane N=({:.3f},{:.3f},{:.3f}) X=({:.3f},{:.3f},{:.3f})".format(
-                    na_plane.Normal.X, na_plane.Normal.Y, na_plane.Normal.Z,
-                    na_plane.XAxis.X, na_plane.XAxis.Y, na_plane.XAxis.Z))
 
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
