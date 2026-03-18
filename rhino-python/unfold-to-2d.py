@@ -33,7 +33,6 @@ from Rhino.Geometry import (
     Plane,
     Point3d,
     PointFaceRelation,
-    PolylineCurve,
     TextEntity,
     Transform,
     Unroller,
@@ -457,228 +456,105 @@ def identify_reference_side(side_a, side_b, brep, picked_face_index):
         return side_b, side_a
 
 
-def _segments_cross_2d(a0, a1, b0, b1):
-    """test if 2D line segments a0-a1 and b0-b1 cross each other.
-    a0,a1,b0,b1 are (x,y) tuples. returns True if segments properly cross."""
-    def cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-    d1 = cross(a0, a1, b0)
-    d2 = cross(a0, a1, b1)
-    d3 = cross(b0, b1, a0)
-    d4 = cross(b0, b1, a1)
-    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
-       ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
-        return True
-    return False
-
-
-def _compute_vertex(line_a, type_a, line_b, type_b, face_plane):
-    """compute the vertex where two adjacent edge lines meet.
-    uses a cascade of strategies for robustness.
-    returns Point3d or None."""
-    tol = sc.doc.ModelAbsoluteTolerance
-
-    # strategy 1: direct LineLine intersection
-    rc, ta, tb = Intersection.LineLine(line_a, line_b)
-    if rc:
-        pt_a = line_a.PointAt(ta)
-        pt_b = line_b.PointAt(tb)
-        gap = pt_a.DistanceTo(pt_b)
-        if gap < tol * 100:  # generous for 3D skew
-            return Point3d((pt_a.X + pt_b.X) / 2,
-                           (pt_a.Y + pt_b.Y) / 2,
-                           (pt_a.Z + pt_b.Z) / 2)
-
-    # strategy 2: project to offset plane, intersect in 2D
-    origin = face_plane.Origin
-    x_axis = face_plane.XAxis
-    y_axis = face_plane.YAxis
-
-    def to_2d(pt):
-        v = pt - origin
-        return (Vector3d.Multiply(v, x_axis), Vector3d.Multiply(v, y_axis))
-
-    def from_2d(u, v):
-        return origin + x_axis * u + y_axis * v
-
-    a0_2d = to_2d(line_a.From)
-    a1_2d = to_2d(line_a.To)
-    b0_2d = to_2d(line_b.From)
-    b1_2d = to_2d(line_b.To)
-
-    dax = a1_2d[0] - a0_2d[0]
-    day = a1_2d[1] - a0_2d[1]
-    dbx = b1_2d[0] - b0_2d[0]
-    dby = b1_2d[1] - b0_2d[1]
-    denom = dax * dby - day * dbx
-
-    if abs(denom) > 1e-10:
-        dx = b0_2d[0] - a0_2d[0]
-        dy = b0_2d[1] - a0_2d[1]
-        t = (dx * dby - dy * dbx) / denom
-        u = a0_2d[0] + t * dax
-        v = a0_2d[1] + t * day
-        return from_2d(u, v)
-
-    # strategy 3: parallel lines — use shared endpoint
-    if type_b in ("perimeter", "perimeter_fallback"):
-        return Point3d(line_b.From.X, line_b.From.Y, line_b.From.Z)
-    if type_a in ("perimeter", "perimeter_fallback"):
-        return Point3d(line_a.To.X, line_a.To.Y, line_a.To.Z)
-
+def _make_planar(curves, tol):
+    """create planar brep from curves, trying normal then loose tolerance."""
+    result = Brep.CreatePlanarBreps(curves, tol)
+    if not result or len(result) == 0:
+        result = Brep.CreatePlanarBreps(curves, tol * 100)
+    if result and len(result) > 0:
+        return result[0]
     return None
 
 
-def _validate_polygon(vertices, face_plane, tol):
-    """validate and repair a polygon: remove duplicates, collinear points,
-    project to plane, check self-intersection. returns cleaned list or None."""
-    if len(vertices) < 3:
-        return None
+def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
+                        ref_side, skipped_faces, tol):
+    """build the boundary curve for a NAS face using edge-walk + PP projection.
 
-    # remove consecutive duplicates
-    cleaned = [vertices[0]]
-    for i in range(1, len(vertices)):
-        if vertices[i].DistanceTo(cleaned[-1]) > tol:
-            cleaned.append(vertices[i])
-    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
-        cleaned.pop()
-    if len(cleaned) < 3:
-        return None
+    walks each trim edge in winding order:
+    - perimeter edges: translate endpoints by offset_vec
+    - bend edges: project translated endpoints onto the PlanePlane line
+    merges consecutive same-target bends (transition zone case) into one
+    PP segment, connects sequential segments, and joins into a closed curve.
 
-    # remove collinear interior points
-    simplified = []
-    n = len(cleaned)
-    for i in range(n):
-        prev_pt = cleaned[(i - 1) % n]
-        curr = cleaned[i]
-        next_pt = cleaned[(i + 1) % n]
-        seg = Line(prev_pt, next_pt)
-        t = seg.ClosestParameter(curr)
-        closest = seg.PointAt(t)
-        if curr.DistanceTo(closest) > tol * 2:
-            simplified.append(curr)
-    if len(simplified) < 3:
-        return None
-
-    # project to face plane for exact planarity
-    projected = []
-    for pt in simplified:
-        projected.append(face_plane.ClosestPoint(pt))
-
-    # skip self-intersection check — let CreatePlanarBreps be the judge
-    # (the check had false positives on simple faces with near-collinear edges)
-    return projected
-
-
-def _find_through_face(ref_side, fi, edge, skipped_faces, face_planes):
-    """trace through a chain of skipped transition faces to find the next
-    real face. handles multi-level chains (e.g., 32 → 0 → 24 → 22)."""
-    visited = {fi}
-    current_fi = fi
-    current_edge = edge
-
-    for step in range(10):  # safety limit
-        adj = list(current_edge.AdjacentFaces())
-        if len(adj) != 2:
-            print("    look-through step {}: edge has {} adj faces, dead end".format(step, len(adj)))
-            return None
-        next_fi = adj[0] if adj[1] == current_fi else adj[1]
-        if next_fi in visited:
-            print("    look-through step {}: face {} already visited, loop".format(step, next_fi))
-            return None
-        visited.add(next_fi)
-
-        in_planes = next_fi in face_planes
-        in_skipped = next_fi in skipped_faces
-        print("    look-through step {}: face {} → face {} (planes={}, skipped={})".format(
-            step, current_fi, next_fi, in_planes, in_skipped))
-
-        # found a real (non-skipped) face with an offset plane
-        if in_planes and not in_skipped:
-            print("    look-through: found real face {}!".format(next_fi))
-            return next_fi
-
-        # hit a face that's not in face_planes at all (non-sheet edge face)
-        if not in_skipped:
-            print("    look-through: face {} not skipped and not in planes, dead end".format(next_fi))
-            return None
-
-        # it's a skipped face — try ALL other edges (not just the first)
-        skipped_face = ref_side.Faces[next_fi]
-        if skipped_face.OuterLoop is None:
-            return None
-        # first check: does any edge lead directly to a real face?
-        for trim in skipped_face.OuterLoop.Trims:
-            if trim.Edge is None:
-                continue
-            other_edge = trim.Edge
-            if other_edge.EdgeIndex == current_edge.EdgeIndex:
-                continue
-            other_adj = list(other_edge.AdjacentFaces())
-            if len(other_adj) != 2:
-                continue
-            far_fi = other_adj[0] if other_adj[1] == next_fi else other_adj[1]
-            if far_fi in face_planes and far_fi not in skipped_faces and far_fi not in visited:
-                return far_fi  # found real face directly
-        # second check: try edges leading to more skipped faces (continue walking)
-        found_next = False
-        for trim in skipped_face.OuterLoop.Trims:
-            if trim.Edge is None:
-                continue
-            other_edge = trim.Edge
-            if other_edge.EdgeIndex == current_edge.EdgeIndex:
-                continue
-            other_adj = list(other_edge.AdjacentFaces())
-            if len(other_adj) != 2:
-                continue
-            far_fi = other_adj[0] if other_adj[1] == next_fi else other_adj[1]
-            if far_fi in visited:
-                continue
-            if far_fi in skipped_faces:
-                current_fi = next_fi
-                current_edge = other_edge
-                found_next = True
-                break
-        if not found_next:
-            return None
-    return None
-
-
-def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
-                      ref_side=None, skipped_faces=None):
-    """build edge lines for a face's outer loop. every trim produces exactly
-    one (type, Line, target_fi) entry. bend edges use PlanePlane with translated
-    fallback. target_fi is the PlanePlane partner face index (or None for perimeter).
-    respects trim.IsReversed() for consistent winding."""
+    returns a closed Curve on the NAP, or None."""
     normal = face_normals[fi]
     offset_vec = Vector3d(-normal.X * offset_dist,
                            -normal.Y * offset_dist,
                            -normal.Z * offset_dist)
-    edge_lines = []
-    for trim in face.OuterLoop.Trims:
-        edge = trim.Edge
+
+    # projected outer loop (used as fallback only)
+    outer_crv = face.OuterLoop.To3dCurve()
+    if outer_crv is None:
+        return None
+
+    # build bend_map: target_fi -> pp_line
+    bend_map = {}  # target_fi -> Line (infinite PlanePlane line)
+    for trim_obj in face.OuterLoop.Trims:
+        edge = trim_obj.Edge
+        if edge is None:
+            continue
+        adj = list(edge.AdjacentFaces())
+        if len(adj) != 2:
+            continue
+        other = adj[0] if adj[1] == fi else adj[1]
+        target = other
+        # resolve skipped (transition) faces to nearest real face
+        if skipped_faces and other in skipped_faces:
+            edge_mid = edge.PointAt(edge.Domain.Mid)
+            best_fi = None
+            best_d = float("inf")
+            for cfi in face_planes:
+                if cfi == fi or cfi in skipped_faces:
+                    continue
+                cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
+                cf_amp = AreaMassProperties.Compute(cf_brep)
+                if cf_amp is not None:
+                    d = edge_mid.DistanceTo(cf_amp.Centroid)
+                    if d < best_d:
+                        best_d = d
+                        best_fi = cfi
+            if best_fi is not None:
+                target = best_fi
+        if target == fi or target not in face_planes or target in (skipped_faces or set()):
+            continue
+        if target in bend_map:
+            continue
+
+        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[target])
+        if rc:
+            bend_map[target] = pp_line
+
+    # walk trims in winding order, building segments
+    segments = []  # list of ("perimeter"|"bend", LineCurve, target_fi|None)
+    for trim_obj in face.OuterLoop.Trims:
+        edge = trim_obj.Edge
         if edge is None:
             continue
 
-        # edge direction respecting trim winding
-        if trim.IsReversed():
+        # directed edge respecting trim winding
+        if trim_obj.IsReversed():
             e_start = edge.PointAtEnd
             e_end = edge.PointAtStart
         else:
             e_start = edge.PointAtStart
             e_end = edge.PointAtEnd
 
+        # translate endpoints to NAP
+        s_nap = Point3d(e_start.X + offset_vec.X,
+                        e_start.Y + offset_vec.Y,
+                        e_start.Z + offset_vec.Z)
+        e_nap = Point3d(e_end.X + offset_vec.X,
+                        e_end.Y + offset_vec.Y,
+                        e_end.Z + offset_vec.Z)
+
+        # classify: perimeter or bend
         adj = list(edge.AdjacentFaces())
         if len(adj) == 2:
             other = adj[0] if adj[1] == fi else adj[1]
-            target_fi = other  # face to use for PlanePlane
-
-            # if adjacent face is skipped (transition face), find nearest real face
-            # by geometric proximity (topological walk fails on complex corner topology)
-            if skipped_faces and other in skipped_faces and ref_side is not None:
-                edge_mid = Point3d((e_start.X + e_end.X) / 2,
-                                   (e_start.Y + e_end.Y) / 2,
-                                   (e_start.Z + e_end.Z) / 2)
+            target = other
+            if skipped_faces and other in skipped_faces:
+                # resolve through skipped face to real target
+                edge_mid = edge.PointAt(edge.Domain.Mid)
                 best_fi = None
                 best_d = float("inf")
                 for cfi in face_planes:
@@ -692,49 +568,79 @@ def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
                             best_d = d
                             best_fi = cfi
                 if best_fi is not None:
-                    target_fi = best_fi
+                    target = best_fi
 
-            if target_fi in face_planes and target_fi not in (skipped_faces or set()):
-                rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[target_fi])
-                if rc:
-                    edge_lines.append(("bend", int_line, target_fi))
-                    continue
-            # PlanePlane failed or target not usable: fallback to translated
-            p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
-            p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
-            edge_lines.append(("perimeter_fallback", Line(p0, p1), None))
-        else:
-            p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
-            p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
-            edge_lines.append(("perimeter", Line(p0, p1), None))
+            if target in bend_map:
+                # bend edge: project translated endpoints onto PP line
+                pp_line = bend_map[target]
+                t0 = pp_line.ClosestParameter(s_nap)
+                t1 = pp_line.ClosestParameter(e_nap)
+                pp_s = pp_line.PointAt(t0)
+                pp_e = pp_line.PointAt(t1)
+                if pp_s.DistanceTo(pp_e) > tol:
+                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), target))
+                continue
 
-    return edge_lines
+        # perimeter edge (naked or no PP line for neighbor)
+        if s_nap.DistanceTo(e_nap) > tol:
+            segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
 
+    if len(segments) < 3:
+        # not enough segments — fallback to projected outline
+        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+        return projected if projected.IsClosed else None
 
-def _merge_same_target_runs(edge_lines):
-    """merge consecutive bend edges that share the same PlanePlane target.
-    when multiple edges adjacent to skipped transition faces all resolve to
-    the same target, they produce identical infinite lines that cause
-    degenerate vertices. collapsing them into a single bend entry fixes this."""
-    if len(edge_lines) < 3:
-        return edge_lines
+    # merge consecutive bend segments with same target
     merged = []
     i = 0
-    while i < len(edge_lines):
-        typ, line, target = edge_lines[i]
-        if target is not None:
-            # start of a potential run — find how far it extends
-            run_end = i + 1
-            while run_end < len(edge_lines) and edge_lines[run_end][2] == target:
-                run_end += 1
-            if run_end - i > 1:
-                # run of N entries with same target: keep just one bend entry
-                merged.append(("bend", line, target))
-                i = run_end
-                continue
-        merged.append((typ, line, target))
-        i += 1
-    return merged
+    while i < len(segments):
+        typ, crv, target = segments[i]
+        if typ == "bend" and target is not None:
+            # collect run of same target
+            run_start = crv.PointAtStart
+            run_end = crv.PointAtEnd
+            j = i + 1
+            while j < len(segments) and segments[j][2] == target:
+                run_end = segments[j][1].PointAtEnd
+                j += 1
+            merged.append(("bend", LineCurve(Line(run_start, run_end)), target))
+            i = j
+        else:
+            merged.append(segments[i])
+            i += 1
+
+    if len(merged) < 3:
+        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+        return projected if projected.IsClosed else None
+
+    # connect sequential segments and join into closed curve
+    curves = []
+    for i in range(len(merged)):
+        _, crv, _ = merged[i]
+        curves.append(crv)
+        next_crv = merged[(i + 1) % len(merged)][1]
+        gap = crv.PointAtEnd.DistanceTo(next_crv.PointAtStart)
+        if gap > tol:
+            curves.append(LineCurve(Line(crv.PointAtEnd, next_crv.PointAtStart)))
+
+    joined = Curve.JoinCurves(curves, tol * 10)
+    if joined:
+        # prefer closed curve
+        for j in joined:
+            if j.IsClosed:
+                return j
+        # try closing the longest piece
+        best = max(joined, key=lambda c: c.GetLength())
+        gap = best.PointAtStart.DistanceTo(best.PointAtEnd)
+        if gap < 1.0:
+            closing = LineCurve(Line(best.PointAtEnd, best.PointAtStart))
+            final = Curve.JoinCurves([best, closing], tol * 100)
+            if final and len(final) > 0 and final[0].IsClosed:
+                return final[0]
+
+    # fallback: projected outline
+    projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+    return projected if projected.IsClosed else None
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None):
@@ -848,82 +754,14 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
             nas_skip += 1
             continue
 
-        # build edge lines (look through skipped faces to find real neighbors)
-        edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
-                                        ref_side=ref_side, skipped_faces=skipped_faces)
-        pre_merge = len(edge_lines)
-        edge_lines = _merge_same_target_runs(edge_lines)
-        n_bend = sum(1 for t, _, _tgt in edge_lines if t == "bend")
-        n_perim = sum(1 for t, _, _tgt in edge_lines if t == "perimeter")
-        n_fallback = sum(1 for t, _, _tgt in edge_lines if t == "perimeter_fallback")
-        n_merged = pre_merge - len(edge_lines)
-        n_trims = face.OuterLoop.Trims.Count
+        # build NAS face boundary via project + trim at bends
+        boundary = _build_nas_boundary(face, fi, face_planes, face_normals,
+                                        offset_dist, ref_side, skipped_faces, tol)
 
-        if len(edge_lines) < 3:
-            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → SKIPPED (too few)".format(
-                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback))
+        if boundary is None:
+            print("  {}: boundary construction failed → SKIPPED".format(fl))
             nas_skip += 1
             continue
-
-        # compute vertices with multi-strategy intersection
-        n = len(edge_lines)
-        vertices = []
-        for i in range(n):
-            type_a, line_a, _tgt_a = edge_lines[i]
-            type_b, line_b, _tgt_b = edge_lines[(i + 1) % n]
-            pt = _compute_vertex(line_a, type_a, line_b, type_b, face_planes[fi])
-            if pt is not None:
-                vertices.append(pt)
-
-        if len(vertices) < 3:
-            # fallback: translate the face boundary curve to offset plane
-            outer_crv = face.OuterLoop.To3dCurve()
-            offset_vec = Vector3d(-normal.X * offset_dist,
-                                   -normal.Y * offset_dist,
-                                   -normal.Z * offset_dist)
-            if outer_crv is not None:
-                outer_translated = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-                fb = Brep.CreatePlanarBreps([outer_translated], tol)
-                if not fb or len(fb) == 0:
-                    fb = Brep.CreatePlanarBreps([outer_translated], tol * 100)
-                if fb and len(fb) > 0:
-                    neutral_faces.append(fb[0])
-                    print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → FALLBACK (boundary translate) → OK".format(
-                        fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-                    nas_ok += 1
-                    continue
-            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → SKIPPED".format(
-                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-            nas_skip += 1
-            continue
-
-        # validate and repair polygon
-        validated = _validate_polygon(vertices, face_planes[fi], tol)
-        if validated is None:
-            # fallback: translate the face boundary curve to offset plane
-            outer_crv = face.OuterLoop.To3dCurve()
-            offset_vec = Vector3d(-normal.X * offset_dist,
-                                   -normal.Y * offset_dist,
-                                   -normal.Z * offset_dist)
-            if outer_crv is not None:
-                outer_translated = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-                fb = Brep.CreatePlanarBreps([outer_translated], tol)
-                if not fb or len(fb) == 0:
-                    fb = Brep.CreatePlanarBreps([outer_translated], tol * 100)
-                if fb and len(fb) > 0:
-                    neutral_faces.append(fb[0])
-                    print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → INVALID → FALLBACK → OK".format(
-                        fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-                    nas_ok += 1
-                    continue
-            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → INVALID → SKIPPED".format(
-                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-            nas_skip += 1
-            continue
-
-        # close polyline and create planar face
-        validated.append(validated[0])
-        boundary = PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in validated])
 
         # collect inner loops (window openings) translated to offset plane
         offset_vec = Vector3d(-normal.X * offset_dist,
@@ -942,28 +780,23 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
             all_curves.append(inner_3d)
             inner_count += 1
 
-        face_breps = Brep.CreatePlanarBreps(all_curves, tol)
-        if not face_breps or len(face_breps) == 0:
-            face_breps = Brep.CreatePlanarBreps(all_curves, tol * 100)
-        if face_breps and len(face_breps) > 0:
-            neutral_faces.append(face_breps[0])
+        face_brep = _make_planar(all_curves, tol)
+        if face_brep is None and inner_count > 0:
+            # retry without inner loops
+            face_brep = _make_planar([boundary], tol)
+            if face_brep is not None:
+                inner_count = 0
+
+        if face_brep is not None:
+            neutral_faces.append(face_brep)
             inner_str = " +{} holes".format(inner_count) if inner_count > 0 else ""
-            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → {} validated{} → OK".format(
-                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback,
-                len(vertices), len(validated) - 1, inner_str))
+            print("  {}: {} trims{} → OK".format(
+                fl, face.OuterLoop.Trims.Count, inner_str))
             nas_ok += 1
         else:
-            # last resort: try without inner loops
-            face_breps = Brep.CreatePlanarBreps([boundary], tol * 100)
-            if face_breps and len(face_breps) > 0:
-                neutral_faces.append(face_breps[0])
-                print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → OK (no holes)".format(
-                    fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-                nas_ok += 1
-            else:
-                print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → CreatePlanarBreps FAILED".format(
-                    fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
-                nas_skip += 1
+            print("  {}: {} trims → CreatePlanarBreps FAILED".format(
+                fl, face.OuterLoop.Trims.Count))
+            nas_skip += 1
 
     print("  result: {} of {} faces OK".format(nas_ok, nas_ok + nas_skip))
 
