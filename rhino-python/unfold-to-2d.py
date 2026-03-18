@@ -488,44 +488,18 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     if outer_crv is None:
         return None
 
-    # build bend_map: target_fi -> pp_line
+    # build bend_map: all pairwise PP axes between this face and other non-skipped faces
     bend_map = {}  # target_fi -> Line (infinite PlanePlane line)
-    for trim_obj in face.OuterLoop.Trims:
-        edge = trim_obj.Edge
-        if edge is None:
+    for other_fi in face_planes:
+        if other_fi == fi or other_fi in skipped_faces:
             continue
-        adj = list(edge.AdjacentFaces())
-        if len(adj) != 2:
-            continue
-        other = adj[0] if adj[1] == fi else adj[1]
-        target = other
-        # resolve skipped (transition) faces to nearest real face
-        if skipped_faces and other in skipped_faces:
-            edge_mid = edge.PointAt(edge.Domain.Mid)
-            best_fi = None
-            best_d = float("inf")
-            for cfi in face_planes:
-                if cfi == fi or cfi in skipped_faces:
-                    continue
-                cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
-                cf_amp = AreaMassProperties.Compute(cf_brep)
-                if cf_amp is not None:
-                    d = edge_mid.DistanceTo(cf_amp.Centroid)
-                    if d < best_d:
-                        best_d = d
-                        best_fi = cfi
-            if best_fi is not None:
-                target = best_fi
-        if target == fi or target not in face_planes or target in (skipped_faces or set()):
-            continue
-        if target in bend_map:
-            continue
-
-        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[target])
+        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[other_fi])
         if rc:
-            bend_map[target] = pp_line
+            bend_map[other_fi] = pp_line
 
     # walk trims in winding order, building segments
+    # purely geometric classification: an edge is a bend if it's parallel to
+    # AND near a PP axis. everything else is perimeter.
     segments = []  # list of ("perimeter"|"bend", LineCurve, target_fi|None)
     for trim_obj in face.OuterLoop.Trims:
         edge = trim_obj.Edge
@@ -548,65 +522,39 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                         e_end.Y + offset_vec.Y,
                         e_end.Z + offset_vec.Z)
 
-        # classify: perimeter or bend
-        adj = list(edge.AdjacentFaces())
-        if len(adj) == 2:
-            other = adj[0] if adj[1] == fi else adj[1]
-            target = other
-            if skipped_faces and other in skipped_faces:
-                # resolve through skipped face to real target
-                edge_mid = edge.PointAt(edge.Domain.Mid)
-                best_fi = None
-                best_d = float("inf")
-                for cfi in face_planes:
-                    if cfi == fi or cfi in skipped_faces:
-                        continue
-                    cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
-                    cf_amp = AreaMassProperties.Compute(cf_brep)
-                    if cf_amp is not None:
-                        d = edge_mid.DistanceTo(cf_amp.Centroid)
-                        if d < best_d:
-                            best_d = d
-                            best_fi = cfi
-                if best_fi is not None:
-                    target = best_fi
-
-            if target in bend_map:
-                # bend edge: project translated endpoints onto PP line
-                pp_line = bend_map[target]
-                t0 = pp_line.ClosestParameter(s_nap)
-                t1 = pp_line.ClosestParameter(e_nap)
-                pp_s = pp_line.PointAt(t0)
-                pp_e = pp_line.PointAt(t1)
-                if pp_s.DistanceTo(pp_e) > tol:
-                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), target))
-                continue
-
-        # check if naked edge is at a bend (close to a PP line)
-        if len(adj) != 2 and bend_map:
+        # geometric bend classification: parallel to + near a PP axis
+        edge_dir = Vector3d(e_nap.X - s_nap.X, e_nap.Y - s_nap.Y,
+                            e_nap.Z - s_nap.Z)
+        edge_len = edge_dir.Length
+        classified = False
+        if edge_len > tol:
+            edge_dir.Unitize()
             mid_nap = Point3d((s_nap.X + e_nap.X) / 2,
                               (s_nap.Y + e_nap.Y) / 2,
                               (s_nap.Z + e_nap.Z) / 2)
-            best_target = None
-            best_dist = float("inf")
             for tgt, pp_line in bend_map.items():
+                # distance: midpoint within offset_dist * 2 of PP axis
                 t = pp_line.ClosestParameter(mid_nap)
-                d = mid_nap.DistanceTo(pp_line.PointAt(t))
-                if d < best_dist:
-                    best_dist = d
-                    best_target = tgt
-            if best_target is not None and best_dist < offset_dist * 2:
-                pp_line = bend_map[best_target]
+                dist = mid_nap.DistanceTo(pp_line.PointAt(t))
+                if dist > offset_dist * 2:
+                    continue
+                # direction: within ~2° of parallel
+                pp_dir = Vector3d(pp_line.Direction)
+                pp_dir.Unitize()
+                dot = abs(Vector3d.Multiply(edge_dir, pp_dir))
+                if dot < 0.999:
+                    continue
+                # bend edge: project onto PP axis
                 t0 = pp_line.ClosestParameter(s_nap)
                 t1 = pp_line.ClosestParameter(e_nap)
                 pp_s = pp_line.PointAt(t0)
                 pp_e = pp_line.PointAt(t1)
                 if pp_s.DistanceTo(pp_e) > tol:
-                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), best_target))
-                continue
+                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), tgt))
+                classified = True
+                break
 
-        # perimeter edge (naked, not near any PP line, or no bend neighbors)
-        if s_nap.DistanceTo(e_nap) > tol:
+        if not classified and edge_len > tol:
             segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
 
     if len(segments) < 3:
@@ -632,32 +580,6 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         else:
             merged.append(segments[i])
             i += 1
-
-    # second pass: collapse bend(X), short_perimeter, bend(X) → bend(X)
-    # handles tiny naked edges at transition zone gaps between skipped faces
-    thickness = offset_dist * 2
-    changed = True
-    while changed:
-        changed = False
-        new_merged = []
-        i = 0
-        while i < len(merged):
-            if (i + 2 < len(merged)
-                    and merged[i][0] == "bend"
-                    and merged[i + 1][0] == "perimeter"
-                    and merged[i + 2][0] == "bend"
-                    and merged[i][2] == merged[i + 2][2]
-                    and merged[i + 1][1].GetLength() < thickness * 2):
-                new_merged.append(("bend",
-                    LineCurve(Line(merged[i][1].PointAtStart,
-                                   merged[i + 2][1].PointAtEnd)),
-                    merged[i][2]))
-                i += 3
-                changed = True
-            else:
-                new_merged.append(merged[i])
-                i += 1
-        merged = new_merged
 
     if len(merged) < 3:
         projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
