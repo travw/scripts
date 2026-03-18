@@ -38,7 +38,7 @@ from Rhino.Geometry import (
     Vector3d,
 )
 from Rhino.Geometry.Intersect import Intersection
-from Rhino.Input.Custom import GetObject, GetString
+from Rhino.Input.Custom import GetObject, GetNumber
 from Rhino.DocObjects import ObjectType
 
 
@@ -111,29 +111,66 @@ def get_face_outward_normal(brep, face_index):
     return centroid, normal
 
 
+def _untrim_face(face):
+    """remove inner trim loops (holes) from a brep face.
+    returns a single-face brep with only the outer boundary, or the
+    original DuplicateFace if untrimming fails."""
+    face_brep = face.DuplicateFace(False)
+    if face_brep is None:
+        return None
+    # if there's only one loop (outer), nothing to untrim
+    if face.Loops.Count <= 1:
+        return face_brep
+    # get the outer loop 3D curve
+    outer_crv = face.OuterLoop.To3dCurve()
+    if outer_crv is None:
+        return face_brep
+    # try to create a planar brep from just the outer boundary
+    tol = sc.doc.ModelAbsoluteTolerance
+    planar = Brep.CreatePlanarBreps([outer_crv], tol)
+    if planar and len(planar) > 0:
+        return planar[0]
+    return face_brep
+
+
 def detect_thickness(brep, face_index):
     """detect material thickness by shooting a ray inward from the picked face
     and intersecting with each exploded face individually.
+    untrims holes first so the centroid doesn't land in a cutout.
     snaps to nearest standard aluminum gauge (0.100, 0.125, 0.160, 0.190).
-    returns the gauge thickness, or None if measurement is out of range."""
+    falls back to minimum edge length if the ray approach fails."""
     tol = sc.doc.ModelAbsoluteTolerance
-    centroid, normal = get_face_outward_normal(brep, face_index)
-    if centroid is None:
-        return None
 
-    # shoot a line inward from the face centroid
+    # untrim the picked face so centroid is on solid material
+    picked_untrimmed = _untrim_face(brep.Faces[face_index])
+    if picked_untrimmed is None:
+        return _detect_thickness_min_edge(brep, face_index)
+
+    amp = AreaMassProperties.Compute(picked_untrimmed)
+    if amp is None:
+        return _detect_thickness_min_edge(brep, face_index)
+    centroid = amp.Centroid
+
+    face = brep.Faces[face_index]
+    rc, u, v = face.ClosestPoint(centroid)
+    if not rc:
+        return _detect_thickness_min_edge(brep, face_index)
+    normal = face.NormalAt(u, v)
+    if face.OrientationIsReversed:
+        normal = -normal
+
+    # shoot a line inward from the untrimmed centroid
     inward = -normal
-    start = centroid + inward * 0.001  # small nudge off surface
+    start = centroid + inward * 0.001
     end = centroid + inward * 2.0
     ray = LineCurve(Line(start, end))
 
-    # intersect ray with each face individually (exploded approach)
-    # CurveBrep returns (bool, Curve[] overlapCurves, Point3d[] intersectionPoints)
+    # intersect ray with each other face (untrimmed to avoid holes)
     hits = []
     for fi in range(brep.Faces.Count):
         if fi == face_index:
             continue
-        face_brep = brep.Faces[fi].DuplicateFace(False)
+        face_brep = _untrim_face(brep.Faces[fi])
         if face_brep is None:
             continue
         rc, _, intersection_points = Intersection.CurveBrep(ray, face_brep, tol)
@@ -145,49 +182,51 @@ def detect_thickness(brep, face_index):
                 hits.append(dist)
 
     if not hits:
-        return None
+        return _detect_thickness_min_edge(brep, face_index)
 
     # pick hit closest to sensible aluminum gauge range (1/16" to 1/4")
     sensible = [d for d in hits if 0.0625 < d < 0.250]
     if not sensible:
-        print("warning: no hits in expected thickness range. closest: {:.4f}".format(min(hits)))
-        return None
+        return _detect_thickness_min_edge(brep, face_index)
 
     raw = min(sensible)
     closest_gauge = min(STANDARD_GAUGES, key=lambda g: abs(g - raw))
     return closest_gauge
 
 
+def _detect_thickness_min_edge(brep, face_index):
+    """fallback thickness detection: shortest edge of the picked face.
+    for a sheet face, the shortest edges are the thickness edges."""
+    face = brep.Faces[face_index]
+    edge_lengths = []
+    for ei in face.AdjacentEdges():
+        edge_lengths.append(brep.Edges[ei].GetLength())
+    if not edge_lengths:
+        return None
+    edge_lengths.sort()
+    raw = edge_lengths[0]
+    if raw < 0.01 or raw > 0.5:
+        return None
+    closest_gauge = min(STANDARD_GAUGES, key=lambda g: abs(g - raw))
+    return closest_gauge
+
+
 def prompt_thickness(auto_thickness):
     """prompt user to accept or override detected thickness. returns float."""
+    gn = GetNumber()
+    gn.SetLowerLimit(0.01, False)
+    gn.SetUpperLimit(1.0, False)
     if auto_thickness is not None:
-        default_str = "{:.3f}".format(auto_thickness)
-        gs = GetString()
-        gs.SetCommandPrompt("detected thickness: {}. enter to accept or type override".format(default_str))
-        gs.SetDefaultString(default_str)
-        gs.AcceptNothing(True)
-        gs.Get()
-        if gs.CommandResult() != Rhino.Commands.Result.Success:
-            return None
-        result = gs.StringResult()
-        if result is None or result.strip() == "":
-            return auto_thickness
-        try:
-            return float(result.strip())
-        except ValueError:
-            print("error: invalid thickness value")
-            return None
+        gn.SetCommandPrompt(
+            "detected thickness: {:.4f}. enter to accept or type override".format(auto_thickness))
+        gn.SetDefaultNumber(auto_thickness)
+        gn.AcceptNothing(True)
     else:
-        gs = GetString()
-        gs.SetCommandPrompt("could not auto-detect thickness. enter thickness")
-        gs.Get()
-        if gs.CommandResult() != Rhino.Commands.Result.Success:
-            return None
-        try:
-            return float(gs.StringResult().strip())
-        except (ValueError, AttributeError):
-            print("error: invalid thickness value")
-            return None
+        gn.SetCommandPrompt("could not auto-detect thickness. enter thickness")
+    gn.Get()
+    if gn.CommandResult() != Rhino.Commands.Result.Success:
+        return None
+    return gn.Number()
 
 
 def classify_faces(brep, thickness):
@@ -198,13 +237,14 @@ def classify_faces(brep, thickness):
     tol = sc.doc.ModelAbsoluteTolerance
     thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
 
-    # precompute centroids, normals, and duplicated face breps
+    # precompute centroids, normals, and untrimmed face breps
+    # untrimming removes holes so rays don't pass through cutouts
     face_data = []
     face_breps = []
     for i in range(brep.Faces.Count):
         centroid, normal = get_face_outward_normal(brep, i)
         face_data.append((centroid, normal))
-        face_breps.append(brep.Faces[i].DuplicateFace(False))
+        face_breps.append(_untrim_face(brep.Faces[i]))
 
     # track which faces have a partner (symmetric: if i→j hits, both are sheet)
     sheet_set = set()
@@ -305,7 +345,8 @@ def construct_neutral_axis(ref_side, thickness):
     face_normals = {}
     for fi in range(ref_side.Faces.Count):
         face = ref_side.Faces[fi]
-        rc, plane = face.TryGetPlane(tol)
+        plane_tol = max(tol * 10, 0.01)  # loosen for near-planar faces
+        rc, plane = face.TryGetPlane(plane_tol)
         if not rc:
             print("warning: face {} is not planar, skipping".format(fi))
             continue
