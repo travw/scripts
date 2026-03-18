@@ -6,9 +6,9 @@ constructs a neutral axis surface, unrolls it, and produces classified
 2D curves on fabrication sublayers ready for DXF export & CNC routing.
 
 output layers:
-  11 - 2D geo::Outside cut  (blue)     — perimeter boundary
-  11 - 2D geo::Inside cut   (magenta)  — holes / internal cutouts
-  11 - 2D geo::Mark          (dk green) — bend lines, placement marks, bend angle text
+11 - 2D geo::Outside cut  (blue)     — perimeter boundary
+11 - 2D geo::Inside cut   (magenta)  — holes / internal cutouts
+11 - 2D geo::Mark          (dk green) — bend lines, placement marks, bend angle text
 
 bend angle convention:
   "90 UP" = bent 90° toward the picked face side.
@@ -26,11 +26,13 @@ import math
 from Rhino.Geometry import (
     AreaMassProperties,
     Brep,
+    BrepLoopType,
     Curve,
     LineCurve,
     Line,
     Plane,
     Point3d,
+    PointFaceRelation,
     PolylineCurve,
     TextEntity,
     Transform,
@@ -38,7 +40,7 @@ from Rhino.Geometry import (
     Vector3d,
 )
 from Rhino.Geometry.Intersect import Intersection
-from Rhino.Input.Custom import GetObject, GetNumber
+from Rhino.Input.Custom import GetObject
 from Rhino.DocObjects import ObjectType
 
 
@@ -130,68 +132,99 @@ def _untrim_face(face):
     planar = Brep.CreatePlanarBreps([outer_crv], tol)
     if planar and len(planar) > 0:
         return planar[0]
+    # imperfect edges: retry with relaxed tolerance for slightly non-planar curves
+    planar = Brep.CreatePlanarBreps([outer_crv], tol * 100)
+    if planar and len(planar) > 0:
+        return planar[0]
     return face_brep
 
 
-def detect_thickness(brep, face_index):
-    """detect material thickness by shooting a ray inward from the picked face
-    and intersecting with each exploded face individually.
-    untrims holes first so the centroid doesn't land in a cutout.
-    snaps to nearest standard aluminum gauge (0.100, 0.125, 0.160, 0.190).
-    falls back to minimum edge length if the ray approach fails."""
-    tol = sc.doc.ModelAbsoluteTolerance
-
-    # untrim the picked face so centroid is on solid material
-    picked_untrimmed = _untrim_face(brep.Faces[face_index])
-    if picked_untrimmed is None:
-        return _detect_thickness_min_edge(brep, face_index)
-
-    amp = AreaMassProperties.Compute(picked_untrimmed)
-    if amp is None:
-        return _detect_thickness_min_edge(brep, face_index)
-    centroid = amp.Centroid
-
-    face = brep.Faces[face_index]
-    rc, u, v = face.ClosestPoint(centroid)
-    if not rc:
-        return _detect_thickness_min_edge(brep, face_index)
-    normal = face.NormalAt(u, v)
-    if face.OrientationIsReversed:
-        normal = -normal
-
-    # shoot a line inward from the untrimmed centroid
-    inward = -normal
-    start = centroid + inward * 0.001
-    end = centroid + inward * 2.0
-    ray = LineCurve(Line(start, end))
-
-    # intersect ray with each other face (untrimmed to avoid holes)
+def _shoot_thickness_ray(brep, face_index, origin, normal, tol):
+    """shoot rays BOTH directions from origin and collect hit distances.
+    uses _untrim_face for targets so rays don't pass through window holes.
+    both directions needed because face normals can be inconsistent on imperfect geometry."""
     hits = []
-    for fi in range(brep.Faces.Count):
-        if fi == face_index:
-            continue
-        face_brep = _untrim_face(brep.Faces[fi])
-        if face_brep is None:
-            continue
-        rc, _, intersection_points = Intersection.CurveBrep(ray, face_brep, tol)
-        if not rc or intersection_points is None:
-            continue
-        for pt in intersection_points:
-            dist = centroid.DistanceTo(pt)
-            if dist > 0.01:
-                hits.append(dist)
+    for direction in [normal, -normal]:
+        start = origin + direction * 0.001
+        end = origin + direction * 2.0
+        ray = LineCurve(Line(start, end))
+        for fi in range(brep.Faces.Count):
+            if fi == face_index:
+                continue
+            face_brep = _untrim_face(brep.Faces[fi])
+            if face_brep is None:
+                continue
+            rc, _, intersection_points = Intersection.CurveBrep(ray, face_brep, tol)
+            if not rc or intersection_points is None:
+                continue
+            for pt in intersection_points:
+                dist = origin.DistanceTo(pt)
+                if dist > 0.01:
+                    hits.append(dist)
+    return hits
 
-    if not hits:
-        return _detect_thickness_min_edge(brep, face_index)
 
-    # pick hit closest to sensible aluminum gauge range (1/16" to 1/4")
+def _snap_hits_to_gauge(hits):
+    """filter hits to sensible gauge range and snap to nearest standard gauge."""
     sensible = [d for d in hits if 0.0625 < d < 0.250]
     if not sensible:
-        return _detect_thickness_min_edge(brep, face_index)
-
+        return None
     raw = min(sensible)
-    closest_gauge = min(STANDARD_GAUGES, key=lambda g: abs(g - raw))
-    return closest_gauge
+    return min(STANDARD_GAUGES, key=lambda g: abs(g - raw))
+
+
+def detect_thickness(brep, face_index):
+    """detect material thickness by shooting rays inward from the picked face.
+    tries centroid first, then multi-point sampling across the face.
+    snaps to nearest standard aluminum gauge (0.100, 0.125, 0.160, 0.190).
+    falls back to minimum edge length if ray approaches fail."""
+    tol = sc.doc.ModelAbsoluteTolerance
+    face = brep.Faces[face_index]
+
+    # phase 1: try centroid ray (fast path)
+    face_brep = face.DuplicateFace(False)
+    amp = AreaMassProperties.Compute(face_brep) if face_brep else None
+    if amp is not None:
+        centroid = amp.Centroid
+        rc, u, v = face.ClosestPoint(centroid)
+        if rc:
+            normal = face.NormalAt(u, v)
+            if face.OrientationIsReversed:
+                normal = -normal
+            hits = _shoot_thickness_ray(brep, face_index, centroid, normal, tol)
+            print("  thickness phase 1: centroid hits={}".format(
+                ["{:.4f}".format(h) for h in hits]))
+            result = _snap_hits_to_gauge(hits)
+            if result is not None:
+                return result
+
+    # phase 2: multi-point sampling (handles faces with large holes)
+    u_dom = face.Domain(0)
+    v_dom = face.Domain(1)
+    interior_count = 0
+    for ui in range(5):
+        for vi in range(5):
+            u = u_dom.T0 + (u_dom.T1 - u_dom.T0) * (ui + 0.5) / 5
+            v = v_dom.T0 + (v_dom.T1 - v_dom.T0) * (vi + 0.5) / 5
+            # check if UV point is on trimmed face (not in a hole)
+            # use int comparison for CPython 3 enum safety
+            pfr = face.IsPointOnFace(u, v)
+            is_exterior = (pfr == PointFaceRelation.Exterior or int(pfr) == 2)
+            if is_exterior:
+                continue
+            interior_count += 1
+            pt = face.PointAt(u, v)
+            normal = face.NormalAt(u, v)
+            if face.OrientationIsReversed:
+                normal = -normal
+            hits = _shoot_thickness_ray(brep, face_index, pt, normal, tol)
+            result = _snap_hits_to_gauge(hits)
+            if result is not None:
+                print("  thickness phase 2: found at sample ({},{})".format(ui, vi))
+                return result
+    print("  thickness phase 2: {} interior samples, no gauge hits".format(interior_count))
+
+    return _detect_thickness_min_edge(brep, face_index)
 
 
 def _detect_thickness_min_edge(brep, face_index):
@@ -213,20 +246,12 @@ def _detect_thickness_min_edge(brep, face_index):
 
 def prompt_thickness(auto_thickness):
     """prompt user to accept or override detected thickness. returns float."""
-    gn = GetNumber()
-    gn.SetLowerLimit(0.01, False)
-    gn.SetUpperLimit(1.0, False)
     if auto_thickness is not None:
-        gn.SetCommandPrompt(
-            "detected thickness: {:.4f}. enter to accept or type override".format(auto_thickness))
-        gn.SetDefaultNumber(auto_thickness)
-        gn.AcceptNothing(True)
+        msg = "detected thickness: {:.4f}. enter to accept or type override".format(auto_thickness)
+        return rs.GetReal(msg, auto_thickness, 0.01, 1.0)
     else:
-        gn.SetCommandPrompt("could not auto-detect thickness. enter thickness")
-    gn.Get()
-    if gn.CommandResult() != Rhino.Commands.Result.Success:
-        return None
-    return gn.Number()
+        return rs.GetReal("could not auto-detect thickness. enter thickness",
+                          number=0.125, minimum=0.01, maximum=1.0)
 
 
 def classify_faces(brep, thickness):
@@ -235,10 +260,11 @@ def classify_faces(brep, thickness):
     and check if either hits another face at ~thickness distance.
     returns (sheet_face_indices, edge_face_indices)."""
     tol = sc.doc.ModelAbsoluteTolerance
-    thick_tol = thickness * 0.3  # 30% tolerance for partner distance matching
+    thick_tol = thickness * 0.2  # 20% tolerance for partner distance matching
 
     # precompute centroids, normals, and untrimmed face breps
-    # untrimming removes holes so rays don't pass through cutouts
+    # centroid from trimmed face (lands on material, not in holes)
+    # untrimmed faces used only as ray targets (no holes to pass through)
     face_data = []
     face_breps = []
     for i in range(brep.Faces.Count):
@@ -258,6 +284,9 @@ def classify_faces(brep, thickness):
             continue
 
         found = False
+        best_dist = None  # track closest hit for diagnostics
+        best_j = None
+        best_dot = None
         # shoot rays in BOTH directions from centroid
         for direction in [ni, -ni]:
             if found:
@@ -278,20 +307,39 @@ def classify_faces(brep, thickness):
                 for pt in intersection_points:
                     dist = ci.DistanceTo(pt)
                     if abs(dist - thickness) < thick_tol:
-                        # verify normals are antiparallel (true partners face opposite)
+                        # verify normals are parallel or antiparallel (sheet partners)
                         # edge faces have perpendicular normals (dot ≈ 0) → rejected
+                        # use abs(dot) to handle breps with inconsistent face orientation
                         _, nj = face_data[j]
                         if nj is not None:
                             dot = Vector3d.Multiply(ni, nj)
-                            if dot > -0.5:
+                            if abs(dot) < 0.5:
+                                # track best rejected candidate
+                                if best_dist is None or abs(dist - thickness) < abs(best_dist - thickness):
+                                    best_dist = dist
+                                    best_j = j
+                                    best_dot = dot
                                 continue
                         sheet_set.add(i)
                         sheet_set.add(j)
                         print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
                         found = True
                         break
+                    else:
+                        # track nearest miss for diagnostics
+                        if best_dist is None or abs(dist - thickness) < abs(best_dist - thickness):
+                            best_dist = dist
+                            best_j = j
+                            _, nj = face_data[j]
+                            best_dot = Vector3d.Multiply(ni, nj) if nj is not None else None
                 if found:
                     break
+        if not found and best_dist is not None:
+            print("  face {}: no partner (best: face {} dist={:.4f}\" dot={})".format(
+                i, best_j, best_dist,
+                "{:.2f}".format(best_dot) if best_dot is not None else "?"))
+        elif not found:
+            print("  face {}: no partner (no ray hits)".format(i))
 
     sheet_faces = sorted(sheet_set)
     edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
@@ -361,10 +409,12 @@ def construct_neutral_axis(ref_side, thickness):
         face_brep = face.DuplicateFace(False)
         amp = AreaMassProperties.Compute(face_brep)
         if amp is None:
+            print("warning: face {} AreaMassProperties failed, skipping".format(fi))
             continue
         centroid = amp.Centroid
         rc2, u, v = face.ClosestPoint(centroid)
         if not rc2:
+            print("warning: face {} ClosestPoint failed, skipping".format(fi))
             continue
         normal = face.NormalAt(u, v)
         if face.OrientationIsReversed:
@@ -398,22 +448,26 @@ def construct_neutral_axis(ref_side, thickness):
             edge = trim.Edge
             adj = edge.AdjacentFaces()
 
+            offset_vec = Vector3d(-normal.X * offset_dist,
+                                   -normal.Y * offset_dist,
+                                   -normal.Z * offset_dist)
+
             if len(adj) == 2:
-                # bend edge: plane-plane intersection (infinite line)
                 other = adj[0] if adj[1] == fi else adj[1]
-                if other not in face_planes:
-                    continue
-                rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
-                if rc:
-                    edge_lines.append(int_line)
+                if other in face_planes:
+                    # bend edge: plane-plane intersection (infinite line)
+                    rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
+                    if rc:
+                        edge_lines.append(int_line)
+                else:
+                    # edge adjacent to non-sheet face (bend radius): translate like perimeter
+                    p0 = edge.PointAtStart + offset_vec
+                    p1 = edge.PointAtEnd + offset_vec
+                    edge_lines.append(Line(p0, p1))
             else:
                 # perimeter edge: translate to offset plane
-                p0 = edge.PointAtStart + Vector3d(-normal.X * offset_dist,
-                                                   -normal.Y * offset_dist,
-                                                   -normal.Z * offset_dist)
-                p1 = edge.PointAtEnd + Vector3d(-normal.X * offset_dist,
-                                                 -normal.Y * offset_dist,
-                                                 -normal.Z * offset_dist)
+                p0 = edge.PointAtStart + offset_vec
+                p1 = edge.PointAtEnd + offset_vec
                 edge_lines.append(Line(p0, p1))
 
         if len(edge_lines) < 3:
@@ -437,11 +491,30 @@ def construct_neutral_axis(ref_side, thickness):
         # close the polyline and create planar face
         vertices.append(vertices[0])
         boundary = PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in vertices])
-        face_breps = Brep.CreatePlanarBreps([boundary], tol)
+
+        # collect inner loops (window openings) translated to offset plane
+        all_curves = [boundary]
+        for li in range(face.Loops.Count):
+            lp = face.Loops[li]
+            if lp.LoopType == BrepLoopType.Outer:
+                continue
+            inner_3d = lp.To3dCurve()
+            if inner_3d is None:
+                continue
+            inner_3d.Translate(offset_vec)
+            all_curves.append(inner_3d)
+
+        face_breps = Brep.CreatePlanarBreps(all_curves, tol)
         if face_breps and len(face_breps) > 0:
             neutral_faces.append(face_breps[0])
         else:
-            print("warning: CreatePlanarBreps failed for face {}".format(fi))
+            # retry without inner loops if holes cause failure
+            face_breps = Brep.CreatePlanarBreps([boundary], tol)
+            if face_breps and len(face_breps) > 0:
+                print("warning: face {} inner loops failed, using solid face".format(fi))
+                neutral_faces.append(face_breps[0])
+            else:
+                print("warning: CreatePlanarBreps failed for face {}".format(fi))
 
     if not neutral_faces:
         print("error: could not create any neutral axis faces")
@@ -452,15 +525,25 @@ def construct_neutral_axis(ref_side, thickness):
         result = neutral_faces[0]
     else:
         joined = Brep.JoinBreps(neutral_faces, tol)
-        if joined and len(joined) > 0:
-            result = sorted(joined, key=lambda b: b.GetArea(), reverse=True)[0]
+        if joined and len(joined) == 1:
+            result = joined[0]
+        elif joined and len(joined) > 1:
+            # faces didn't all join — try looser tolerance
+            joined2 = Brep.JoinBreps(joined, tol * 10)
+            if joined2 and len(joined2) == 1:
+                result = joined2[0]
+            else:
+                # merge into one brep
+                pieces = joined2 if joined2 else joined
+                result = pieces[0]
+                for extra in pieces[1:]:
+                    result.Join(extra, tol * 10, True)
+                print("warning: neutral axis joined with loose tolerance ({} pieces)".format(
+                    len(pieces)))
         else:
             print("warning: could not join neutral axis faces")
             result = neutral_faces[0]
 
-    # debug: bake neutral axis for inspection
-    sc.doc.Objects.AddBrep(result)
-    sc.doc.Views.Redraw()
     return result
 
 
