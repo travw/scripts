@@ -612,7 +612,7 @@ def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist):
     return edge_lines
 
 
-def construct_neutral_axis(ref_side, thickness, original_brep=None):
+def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None):
     """construct the neutral axis surface from plane geometry.
     for each planar face in ref_side, computes the offset plane (t/2 inward),
     then builds each face's boundary from:
@@ -646,6 +646,16 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
         normal = face.NormalAt(u, v)
         if face.OrientationIsReversed:
             normal = -normal
+
+        # verify normal points outward (away from other_side)
+        # if not, flip it — joined polysurface may have inconsistent normals
+        if other_side is not None:
+            test_out = centroid - normal * offset_dist  # should move toward other_side
+            test_in = centroid + normal * offset_dist   # should move away from other_side
+            d_out = other_side.ClosestPoint(test_out).DistanceTo(test_out)
+            d_in = other_side.ClosestPoint(test_in).DistanceTo(test_in)
+            if d_in < d_out:
+                normal = -normal  # was pointing inward, flip to outward
 
         # offset plane inward (opposite to outward normal)
         offset_origin = plane.Origin - normal * offset_dist
@@ -697,6 +707,17 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
             nas_skip += 1
             continue
 
+        # skip small transition faces (they're in the polysurface for connectivity
+        # but shouldn't generate their own NAS face)
+        min_area = thickness * 2.0
+        face_brep_area = face.DuplicateFace(False)
+        amp_area = AreaMassProperties.Compute(face_brep_area)
+        if amp_area is not None and amp_area.Area < min_area:
+            print("  {}: area {:.4f} < {:.4f} min → SKIPPED (transition face)".format(
+                fl, amp_area.Area, min_area))
+            nas_skip += 1
+            continue
+
         # build edge lines (guaranteed 1:1 with trims, no silent skipping)
         edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist)
         n_bend = sum(1 for t, _ in edge_lines if t == "bend")
@@ -745,6 +766,22 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
         # validate and repair polygon
         validated = _validate_polygon(vertices, face_planes[fi], tol)
         if validated is None:
+            # fallback: translate the face boundary curve to offset plane
+            outer_crv = face.OuterLoop.To3dCurve()
+            offset_vec = Vector3d(-normal.X * offset_dist,
+                                   -normal.Y * offset_dist,
+                                   -normal.Z * offset_dist)
+            if outer_crv is not None:
+                outer_translated = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+                fb = Brep.CreatePlanarBreps([outer_translated], tol)
+                if not fb or len(fb) == 0:
+                    fb = Brep.CreatePlanarBreps([outer_translated], tol * 100)
+                if fb and len(fb) > 0:
+                    neutral_faces.append(fb[0])
+                    print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → INVALID → FALLBACK → OK".format(
+                        fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+                    nas_ok += 1
+                    continue
             print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → INVALID → SKIPPED".format(
                 fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
             nas_skip += 1
@@ -1121,11 +1158,13 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
     the output normal onto the NA face normal (preserving in-plane layout),
     then translate to match centroids. applied via sc.doc.Objects.Transform
     (the only transform method that works reliably in CPython 3)."""
-    # compute alignment: rotation + translation from unrolled to neutral axis
+    # compute alignment: PlaneToPlane from unrolled face to matching NA face
+    # the Unroller preserves face order, so NA face[i] → unrolled face[i]
     align_xform = None
-    if unrolled_breps and len(unrolled_breps) > 0:
-        # neutral axis face closest to picked face (not always face 0)
-        picked_centroid, picked_normal = get_face_outward_normal(brep, picked_face_index)
+    if unrolled_breps and len(unrolled_breps) > 0 and brep is not None:
+        print("=== alignment ===")
+        # find NA face closest to picked face
+        picked_centroid, _ = get_face_outward_normal(brep, picked_face_index)
         best_na_idx = 0
         best_na_dist = float("inf")
         if picked_centroid is not None:
@@ -1137,30 +1176,29 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
                     if d < best_na_dist:
                         best_na_dist = d
                         best_na_idx = nfi
-        print("=== alignment ===")
-        print("  picked face {} → NA face {} (dist={:.4f}\")".format(
-            picked_face_index, best_na_idx, best_na_dist))
-        na_face = neutral_axis.Faces[best_na_idx]
-        na_brep = na_face.DuplicateFace(False)
-        amp_na = AreaMassProperties.Compute(na_brep)
-        # use same face index in unrolled brep (Unroller preserves face order)
+
+        # source: matching unrolled face
         uf_idx = min(best_na_idx, unrolled_breps[0].Faces.Count - 1)
         unrolled_face = unrolled_breps[0].Faces[uf_idx]
         uf_brep = unrolled_face.DuplicateFace(False)
         amp_uf = AreaMassProperties.Compute(uf_brep)
+        # target: matching NA face
+        na_face = neutral_axis.Faces[best_na_idx]
+        na_brep = na_face.DuplicateFace(False)
+        amp_na = AreaMassProperties.Compute(na_brep)
+
         if amp_uf and amp_na:
-            # build full planes from face parameterization (captures in-plane orientation)
-            # TryGetPlane gives consistent axes from the face's UV directions
             uf_centroid = amp_uf.Centroid
             na_centroid = amp_na.Centroid
             plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
             rc_uf_plane, uf_plane = unrolled_face.TryGetPlane(plane_tol)
             rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
             if rc_uf_plane and rc_na_plane:
-                # set origins to centroids for proper alignment
                 uf_plane.Origin = uf_centroid
                 na_plane.Origin = na_centroid
                 align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
+                print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
+                    picked_face_index, best_na_idx, best_na_dist))
 
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
@@ -1289,19 +1327,25 @@ def unfold_to_2d():
         ref_side.Faces.Count, other_side.Faces.Count))
 
     # step 6: construct neutral axis (prints its own === header ===)
-    neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep)
+    neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep, other_side=other_side)
     if neutral_axis is None:
         return
     print("  neutral axis: {} faces".format(neutral_axis.Faces.Count))
 
-    # debug: bake NAS to viewport for visual inspection
+    # debug: bake NAS individual faces for visual inspection
     nas_attr = Rhino.DocObjects.ObjectAttributes()
     nas_attr.ObjectColor = System.Drawing.Color.FromArgb(0, 200, 200)
     nas_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-    bake_layer = "03 - Bake"
-    if rs.IsLayer(bake_layer):
-        nas_attr.LayerIndex = sc.doc.Layers.FindByFullPath(bake_layer, -1)
-    nas_debug_id = sc.doc.Objects.AddBrep(neutral_axis, nas_attr)
+    nas_dot_ids = []
+    for nfi in range(neutral_axis.Faces.Count):
+        dup = neutral_axis.Faces[nfi].DuplicateFace(False)
+        if dup is not None:
+            nas_dot_ids.append(sc.doc.Objects.AddBrep(dup, nas_attr))
+    if nas_dot_ids:
+        grp = sc.doc.Groups.Add("unfold_nas_debug")
+        for nid in nas_dot_ids:
+            sc.doc.Groups.AddToGroup(grp, nid)
+    print("  NAS debug: {} individual faces baked (cyan)".format(len(nas_dot_ids)))
     sc.doc.Views.Redraw()
 
     # step 7: identify bends
