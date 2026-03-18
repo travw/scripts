@@ -33,6 +33,7 @@ from Rhino.Geometry import (
     Plane,
     Point3d,
     PointFaceRelation,
+    PolylineCurve,
     TextEntity,
     Transform,
     Unroller,
@@ -613,34 +614,69 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
         return projected if projected.IsClosed else None
 
-    # connect sequential segments and join into closed curve
-    curves = []
-    for i in range(len(merged)):
-        _, crv, _ = merged[i]
-        curves.append(crv)
-        next_crv = merged[(i + 1) % len(merged)][1]
-        gap = crv.PointAtEnd.DistanceTo(next_crv.PointAtStart)
-        if gap > tol:
-            curves.append(LineCurve(Line(crv.PointAtEnd, next_crv.PointAtStart)))
+    # compute vertices at each segment transition using LineLine intersection
+    n = len(merged)
+    vertices = []
+    for i in range(n):
+        curr_type, curr_crv, curr_target = merged[i]
+        next_type, next_crv, next_target = merged[(i + 1) % n]
 
-    joined = Curve.JoinCurves(curves, tol * 10)
-    if joined:
-        # prefer closed curve
-        for j in joined:
-            if j.IsClosed:
-                return j
-        # try closing the longest piece
-        best = max(joined, key=lambda c: c.GetLength())
-        gap = best.PointAtStart.DistanceTo(best.PointAtEnd)
-        if gap < 1.0:
-            closing = LineCurve(Line(best.PointAtEnd, best.PointAtStart))
-            final = Curve.JoinCurves([best, closing], tol * 100)
-            if final and len(final) > 0 and final[0].IsClosed:
-                return final[0]
+        # get lines for intersection
+        if curr_type == "bend":
+            line_a = bend_map[curr_target]  # infinite PP line
+        else:
+            line_a = Line(curr_crv.PointAtStart, curr_crv.PointAtEnd)
 
-    # fallback: projected outline
-    projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-    return projected if projected.IsClosed else None
+        if next_type == "bend":
+            line_b = bend_map[next_target]
+        else:
+            line_b = Line(next_crv.PointAtStart, next_crv.PointAtEnd)
+
+        rc, ta, tb = Intersection.LineLine(line_a, line_b)
+        if rc:
+            pt_a = line_a.PointAt(ta)
+            pt_b = line_b.PointAt(tb)
+            gap = pt_a.DistanceTo(pt_b)
+            if gap < tol * 100:
+                vertex = Point3d((pt_a.X + pt_b.X) / 2,
+                                 (pt_a.Y + pt_b.Y) / 2,
+                                 (pt_a.Z + pt_b.Z) / 2)
+            else:
+                # 3D skew too large — use closest point on face plane
+                vertex = face_planes[fi].ClosestPoint(pt_a)
+        else:
+            # parallel lines — use shared endpoint
+            if next_type in ("perimeter",):
+                vertex = Point3d(next_crv.PointAtStart.X,
+                                 next_crv.PointAtStart.Y,
+                                 next_crv.PointAtStart.Z)
+            else:
+                vertex = Point3d(curr_crv.PointAtEnd.X,
+                                 curr_crv.PointAtEnd.Y,
+                                 curr_crv.PointAtEnd.Z)
+
+        # project to face plane for exact planarity
+        vertices.append(face_planes[fi].ClosestPoint(vertex))
+
+    if len(vertices) < 3:
+        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+        return projected if projected.IsClosed else None
+
+    # remove consecutive duplicate vertices
+    cleaned = [vertices[0]]
+    for v in vertices[1:]:
+        if v.DistanceTo(cleaned[-1]) > tol:
+            cleaned.append(v)
+    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
+        cleaned.pop()
+
+    if len(cleaned) < 3:
+        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+        return projected if projected.IsClosed else None
+
+    # close and build polyline
+    cleaned.append(cleaned[0])
+    return PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in cleaned])
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None):
@@ -788,6 +824,18 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
                 inner_count = 0
 
         if face_brep is not None:
+            # ensure NAS face normal matches expected direction
+            fb_face = face_brep.Faces[0]
+            fb_amp = AreaMassProperties.Compute(face_brep)
+            if fb_amp is not None:
+                rc_cp, u_cp, v_cp = fb_face.ClosestPoint(fb_amp.Centroid)
+                if rc_cp:
+                    fb_normal = fb_face.NormalAt(u_cp, v_cp)
+                    if fb_face.OrientationIsReversed:
+                        fb_normal = -fb_normal
+                    if Vector3d.Multiply(fb_normal, normal) < 0:
+                        face_brep.Flip()
+
             neutral_faces.append(face_brep)
             inner_str = " +{} holes".format(inner_count) if inner_count > 0 else ""
             print("  {}: {} trims{} → OK".format(
