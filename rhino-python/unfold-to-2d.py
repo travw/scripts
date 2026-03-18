@@ -596,14 +596,24 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                     best_dist = d
                     best_target = tgt
             if best_target is not None and best_dist < offset_dist * 2:
+                # only classify as bend if edge runs roughly parallel to PP line
+                # perpendicular edges are notch/cutout geometry, not bend boundary
                 pp_line = bend_map[best_target]
-                t0 = pp_line.ClosestParameter(s_nap)
-                t1 = pp_line.ClosestParameter(e_nap)
-                pp_s = pp_line.PointAt(t0)
-                pp_e = pp_line.PointAt(t1)
-                if pp_s.DistanceTo(pp_e) > tol:
-                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), best_target))
-                continue
+                edge_dir = Vector3d(e_nap.X - s_nap.X, e_nap.Y - s_nap.Y,
+                                    e_nap.Z - s_nap.Z)
+                edge_dir.Unitize()
+                pp_dir = Vector3d(pp_line.Direction)
+                pp_dir.Unitize()
+                dot = abs(Vector3d.Multiply(edge_dir, pp_dir))
+                if dot > 0.5:  # roughly parallel (within ~60°)
+                    t0 = pp_line.ClosestParameter(s_nap)
+                    t1 = pp_line.ClosestParameter(e_nap)
+                    pp_s = pp_line.PointAt(t0)
+                    pp_e = pp_line.PointAt(t1)
+                    if pp_s.DistanceTo(pp_e) > tol:
+                        segments.append(("bend", LineCurve(Line(pp_s, pp_e)),
+                                         best_target))
+                    continue
 
         # perimeter edge (naked, not near any PP line, or no bend neighbors)
         if s_nap.DistanceTo(e_nap) > tol:
