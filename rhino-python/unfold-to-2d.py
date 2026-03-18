@@ -582,41 +582,32 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                     segments.append(("bend", LineCurve(Line(pp_s, pp_e)), target))
                 continue
 
-        # perimeter edge (naked or no PP line for neighbor)
+        # check if naked edge is at a bend (close to a PP line)
+        if len(adj) != 2 and bend_map:
+            mid_nap = Point3d((s_nap.X + e_nap.X) / 2,
+                              (s_nap.Y + e_nap.Y) / 2,
+                              (s_nap.Z + e_nap.Z) / 2)
+            best_target = None
+            best_dist = float("inf")
+            for tgt, pp_line in bend_map.items():
+                t = pp_line.ClosestParameter(mid_nap)
+                d = mid_nap.DistanceTo(pp_line.PointAt(t))
+                if d < best_dist:
+                    best_dist = d
+                    best_target = tgt
+            if best_target is not None and best_dist < offset_dist * 2:
+                pp_line = bend_map[best_target]
+                t0 = pp_line.ClosestParameter(s_nap)
+                t1 = pp_line.ClosestParameter(e_nap)
+                pp_s = pp_line.PointAt(t0)
+                pp_e = pp_line.PointAt(t1)
+                if pp_s.DistanceTo(pp_e) > tol:
+                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), best_target))
+                continue
+
+        # perimeter edge (naked, not near any PP line, or no bend neighbors)
         if s_nap.DistanceTo(e_nap) > tol:
             segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
-
-    # reclassify perimeters sandwiched between same-target bends as bends
-    # these are naked edges at the bend boundary (faces don't share direct edges)
-    # notch/cutout edges are NOT between same-target bends, so they stay perimeter
-    n_seg = len(segments)
-    reclassified = set()
-    for i in range(n_seg):
-        if segments[i][0] != "bend":
-            continue
-        target = segments[i][2]
-        # scan forward for next bend with same target
-        j = (i + 1) % n_seg
-        perim_run = []
-        while j != i:
-            if segments[j][0] == "bend":
-                if segments[j][2] == target and perim_run:
-                    # found matching bend — reclassify perimeters in between
-                    pp_line = bend_map[target]
-                    for k in perim_run:
-                        if k not in reclassified:
-                            s_crv = segments[k][1]
-                            t0 = pp_line.ClosestParameter(s_crv.PointAtStart)
-                            t1 = pp_line.ClosestParameter(s_crv.PointAtEnd)
-                            ps = pp_line.PointAt(t0)
-                            pe = pp_line.PointAt(t1)
-                            if ps.DistanceTo(pe) > tol:
-                                segments[k] = ("bend", LineCurve(Line(ps, pe)), target)
-                                reclassified.add(k)
-                break  # stop at any bend (different target = not our pattern)
-            else:
-                perim_run.append(j)
-            j = (j + 1) % n_seg
 
     if len(segments) < 3:
         # not enough segments — fallback to projected outline
