@@ -205,13 +205,14 @@ def classify_faces(brep, thickness):
         face_data.append((centroid, normal))
         face_breps.append(brep.Faces[i].DuplicateFace(False))
 
-    sheet_faces = []
-    edge_faces = []
+    # track which faces have a partner (symmetric: if i→j hits, both are sheet)
+    sheet_set = set()
 
     for i in range(brep.Faces.Count):
+        if i in sheet_set:
+            continue
         ci, ni = face_data[i]
         if ci is None or ni is None:
-            edge_faces.append(i)
             continue
 
         # shoot a ray inward from this face's centroid
@@ -220,7 +221,6 @@ def classify_faces(brep, thickness):
         end = ci + inward * (thickness * 3)
         ray = LineCurve(Line(start, end))
 
-        has_partner = False
         for j in range(brep.Faces.Count):
             if i == j:
                 continue
@@ -234,16 +234,15 @@ def classify_faces(brep, thickness):
             for pt in intersection_points:
                 dist = ci.DistanceTo(pt)
                 if abs(dist - thickness) < thick_tol:
-                    has_partner = True
+                    # both faces are sheet faces (partner relationship is symmetric)
+                    sheet_set.add(i)
+                    sheet_set.add(j)
                     break
-            if has_partner:
+            if i in sheet_set:
                 break
 
-        if has_partner:
-            sheet_faces.append(i)
-        else:
-            edge_faces.append(i)
-
+    sheet_faces = sorted(sheet_set)
+    edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
     return sheet_faces, edge_faces
 
 
