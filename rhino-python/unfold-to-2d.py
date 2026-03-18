@@ -873,18 +873,6 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
                 inner_count = 0
 
         if face_brep is not None:
-            # ensure NAS face normal matches expected direction
-            fb_face = face_brep.Faces[0]
-            fb_amp = AreaMassProperties.Compute(face_brep)
-            if fb_amp is not None:
-                rc_cp, u_cp, v_cp = fb_face.ClosestPoint(fb_amp.Centroid)
-                if rc_cp:
-                    fb_normal = fb_face.NormalAt(u_cp, v_cp)
-                    if fb_face.OrientationIsReversed:
-                        fb_normal = -fb_normal
-                    if Vector3d.Multiply(fb_normal, normal) < 0:
-                        face_brep.Flip()
-
             neutral_faces.append(face_brep)
             inner_str = " +{} holes".format(inner_count) if inner_count > 0 else ""
             print("  {}: {} trims{} → OK".format(
@@ -1255,59 +1243,14 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
             uf_centroid = amp_uf.Centroid
             na_centroid = amp_na.Centroid
             plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
-            # get normals from TryGetPlane (direction only, not axes)
             rc_uf_plane, uf_plane = unrolled_face.TryGetPlane(plane_tol)
             rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
             if rc_uf_plane and rc_na_plane:
-                uf_normal = uf_plane.Normal
-                na_normal = na_plane.Normal
-                # build alignment planes from longest matching edge
-                # (TryGetPlane XAxis/YAxis are arbitrary — edge tangent is stable)
-                na_longest_ei = None
-                na_longest_len = 0
-                for ei in na_face.AdjacentEdges():
-                    l = neutral_axis.Edges[ei].GetLength()
-                    if l > na_longest_len:
-                        na_longest_len = l
-                        na_longest_ei = ei
-                # match unrolled edge by length (Unroller preserves edge lengths)
-                uf_best_ei = None
-                uf_best_diff = float("inf")
-                for ei in unrolled_face.AdjacentEdges():
-                    diff = abs(unrolled_breps[0].Edges[ei].GetLength() - na_longest_len)
-                    if diff < uf_best_diff:
-                        uf_best_diff = diff
-                        uf_best_ei = ei
-                if na_longest_ei is not None and uf_best_ei is not None:
-                    # oriented tangent: (tangent × normal) points toward centroid
-                    def _tangent_toward(edge, centroid, normal):
-                        mid = edge.PointAt(edge.Domain.Mid)
-                        t = edge.TangentAt(edge.Domain.Mid)
-                        t.Unitize()
-                        cross = Vector3d.CrossProduct(t, normal)
-                        if Vector3d.Multiply(cross, centroid - mid) < 0:
-                            t = -t
-                        return t
-                    na_t = _tangent_toward(neutral_axis.Edges[na_longest_ei],
-                                           na_centroid, na_normal)
-                    uf_t = _tangent_toward(unrolled_breps[0].Edges[uf_best_ei],
-                                           uf_centroid, uf_normal)
-                    na_y = Vector3d.CrossProduct(na_normal, na_t)
-                    na_y.Unitize()
-                    uf_y = Vector3d.CrossProduct(uf_normal, uf_t)
-                    uf_y.Unitize()
-                    uf_align = Plane(uf_centroid, uf_t, uf_y)
-                    na_align = Plane(na_centroid, na_t, na_y)
-                    align_xform = Transform.PlaneToPlane(uf_align, na_align)
-                    print("  picked face {} → NA face {} (dist={:.4f}\") → edge-aligned".format(
-                        picked_face_index, best_na_idx, best_na_dist))
-                else:
-                    # fallback to TryGetPlane
-                    uf_plane.Origin = uf_centroid
-                    na_plane.Origin = na_centroid
-                    align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
-                    print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane (fallback)".format(
-                        picked_face_index, best_na_idx, best_na_dist))
+                uf_plane.Origin = uf_centroid
+                na_plane.Origin = na_centroid
+                align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
+                print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
+                    picked_face_index, best_na_idx, best_na_dist))
 
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
