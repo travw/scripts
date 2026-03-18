@@ -91,9 +91,13 @@ def pick_part_and_face():
 
 
 def get_face_outward_normal(brep, face_index):
-    """get outward-pointing normal at the centroid of a brep face."""
+    """get outward-pointing normal at the centroid of a brep face.
+    uses DuplicateFace to ensure AreaMassProperties works on a Brep (not BrepFace)."""
     face = brep.Faces[face_index]
-    amp = AreaMassProperties.Compute(face)
+    face_brep = face.DuplicateFace(False)
+    if face_brep is None:
+        return None, None
+    amp = AreaMassProperties.Compute(face_brep)
     if amp is None:
         return None, None
     centroid = amp.Centroid
@@ -192,11 +196,13 @@ def classify_faces(brep, thickness):
     returns (sheet_face_indices, edge_face_indices)."""
     thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
 
-    # precompute centroids and normals for all faces
+    # precompute centroids, normals, and duplicated face breps
     face_data = []
+    face_breps = []
     for i in range(brep.Faces.Count):
         centroid, normal = get_face_outward_normal(brep, i)
         face_data.append((centroid, normal))
+        face_breps.append(brep.Faces[i].DuplicateFace(False))
 
     sheet_faces = []
     edge_faces = []
@@ -219,11 +225,11 @@ def classify_faces(brep, thickness):
             if Vector3d.Multiply(ni, nj) > -0.7:
                 continue
 
-            # check distance: closest point on face j to centroid of face i
-            rc, u, v = brep.Faces[j].ClosestPoint(ci)
-            if not rc:
+            # check distance using Brep.ClosestPoint (respects trims)
+            fb = face_breps[j]
+            if fb is None:
                 continue
-            closest = brep.Faces[j].PointAt(u, v)
+            closest = fb.ClosestPoint(ci)
             dist = ci.DistanceTo(closest)
             if abs(dist - thickness) < thick_tol:
                 has_partner = True
