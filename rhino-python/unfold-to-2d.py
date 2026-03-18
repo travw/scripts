@@ -49,7 +49,6 @@ from Rhino.DocObjects import ObjectType
 # ---------------------------------------------------------------------------
 STANDARD_GAUGES = [0.100, 0.125, 0.160, 0.190]
 TEXT_HEIGHT = 0.25  # inches
-PLACEMENT_GAP_FACTOR = 1.5  # multiplier on part width for offset
 
 
 # ---------------------------------------------------------------------------
@@ -823,69 +822,85 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves):
     return all_text_curves
 
 
-def place_2d_output(brep_3d, unrolled_breps, outside_curves, inside_curves,
-                     unrolled_ink, unrolled_bend, text_curves, sublayers):
-    """place all 2D output on the correct layers, offset from the 3D part."""
-    bb_3d = brep_3d.GetBoundingBox(True)
-    bb_width = bb_3d.Max.X - bb_3d.Min.X
+def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
+               unrolled_bend, unrolled_ink, text_curves, sublayers):
+    """add 2D curves to fabrication sublayers, aligned to the neutral axis
+    face plane. the Unroller flattens to an arbitrary plane — we rotate
+    the output normal onto the NA face normal (preserving in-plane layout),
+    then translate to match centroids. applied via sc.doc.Objects.Transform
+    (the only transform method that works reliably in CPython 3)."""
+    # compute alignment: rotation + translation from unrolled to neutral axis
+    align_xform = None
+    if unrolled_breps and len(unrolled_breps) > 0:
+        # unrolled face centroid + normal
+        unrolled_face = unrolled_breps[0].Faces[0]
+        uf_brep = unrolled_face.DuplicateFace(False)
+        amp_uf = AreaMassProperties.Compute(uf_brep)
+        # neutral axis face centroid + normal
+        na_face = neutral_axis.Faces[0]
+        na_brep = na_face.DuplicateFace(False)
+        amp_na = AreaMassProperties.Compute(na_brep)
+        if amp_uf and amp_na:
+            rc_uf, u_uf, v_uf = unrolled_face.ClosestPoint(amp_uf.Centroid)
+            n_uf = unrolled_face.NormalAt(u_uf, v_uf)
+            if unrolled_face.OrientationIsReversed:
+                n_uf = -n_uf
 
-    all_2d_geo = []
-    all_2d_geo.extend(unrolled_breps)
-    for c in outside_curves:
-        all_2d_geo.append(c)
+            rc_na, u_na, v_na = na_face.ClosestPoint(amp_na.Centroid)
+            n_na = na_face.NormalAt(u_na, v_na)
+            if na_face.OrientationIsReversed:
+                n_na = -n_na
 
-    if not all_2d_geo:
-        print("error: no 2D geometry to place")
-        return 0
+            uf_centroid = amp_uf.Centroid
+            na_centroid = amp_na.Centroid
 
-    bb_2d = all_2d_geo[0].GetBoundingBox(True)
-    for geo in all_2d_geo[1:]:
-        bb_2d.Union(geo.GetBoundingBox(True))
-
-    offset_x = bb_3d.Max.X + bb_width * PLACEMENT_GAP_FACTOR - bb_2d.Min.X
-    offset_y = (bb_3d.Min.Y + bb_3d.Max.Y) / 2 - (bb_2d.Min.Y + bb_2d.Max.Y) / 2
-    offset_z = -bb_2d.Min.Z
-
-    xform = Transform.Translation(offset_x, offset_y, offset_z)
+            # step 1: rotate unrolled normal to NA normal (around unrolled centroid)
+            rotation = Transform.Rotation(n_uf, n_na, uf_centroid)
+            # step 2: translate rotated centroid to NA centroid
+            # (rotation pivots around uf_centroid, so it stays put — just translate)
+            translation = Transform.Translation(
+                na_centroid.X - uf_centroid.X,
+                na_centroid.Y - uf_centroid.Y,
+                na_centroid.Z - uf_centroid.Z,
+            )
+            align_xform = translation * rotation
 
     count = 0
-    outside_layer = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
-    inside_layer = sc.doc.Layers.FindByFullPath(sublayers["inside"], -1)
-    mark_layer = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
+    outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
+    inside_idx = sc.doc.Layers.FindByFullPath(sublayers["inside"], -1)
+    mark_idx = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
 
     attr_outside = Rhino.DocObjects.ObjectAttributes()
-    attr_outside.LayerIndex = outside_layer
+    attr_outside.LayerIndex = outside_idx
 
     attr_inside = Rhino.DocObjects.ObjectAttributes()
-    attr_inside.LayerIndex = inside_layer
+    attr_inside.LayerIndex = inside_idx
 
     attr_mark = Rhino.DocObjects.ObjectAttributes()
-    attr_mark.LayerIndex = mark_layer
+    attr_mark.LayerIndex = mark_idx
+
+    def _add(crv, attr):
+        guid = sc.doc.Objects.AddCurve(crv, attr)
+        if guid != System.Guid.Empty:
+            if align_xform is not None:
+                sc.doc.Objects.Transform(guid, align_xform, True)
+            return 1
+        return 0
 
     for crv in outside_curves:
-        crv.Transform(xform)
-        if sc.doc.Objects.AddCurve(crv, attr_outside) != System.Guid.Empty:
-            count += 1
+        count += _add(crv, attr_outside)
 
     for crv in inside_curves:
-        crv.Transform(xform)
-        if sc.doc.Objects.AddCurve(crv, attr_inside) != System.Guid.Empty:
-            count += 1
+        count += _add(crv, attr_inside)
 
     for crv in unrolled_bend:
-        crv.Transform(xform)
-        if sc.doc.Objects.AddCurve(crv, attr_mark) != System.Guid.Empty:
-            count += 1
+        count += _add(crv, attr_mark)
 
     for crv in unrolled_ink:
-        crv.Transform(xform)
-        if sc.doc.Objects.AddCurve(crv, attr_mark) != System.Guid.Empty:
-            count += 1
+        count += _add(crv, attr_mark)
 
     for crv in text_curves:
-        crv.Transform(xform)
-        if sc.doc.Objects.AddCurve(crv, attr_mark) != System.Guid.Empty:
-            count += 1
+        count += _add(crv, attr_mark)
 
     return count
 
@@ -895,27 +910,26 @@ def place_2d_output(brep_3d, unrolled_breps, outside_curves, inside_curves,
 # ---------------------------------------------------------------------------
 
 def unfold_to_2d():
-    # step 1-2: select part and pick face
+    # step 1: select part and pick face
     result = pick_part_and_face()
     if result is None:
         return
     brep, face_index, obj_id = result
+    print("picked face: index {}".format(face_index))
 
     _, picked_normal = get_face_outward_normal(brep, face_index)
     if picked_normal is None:
         print("error: could not compute face normal")
         return
 
-    print("picked face: index {}".format(face_index))
-
-    # step 3: detect thickness
+    # step 2: detect thickness
     auto_thickness = detect_thickness(brep, face_index)
     thickness = prompt_thickness(auto_thickness)
     if thickness is None:
         return
     print("thickness: {}".format(thickness))
 
-    # step 4: classify faces
+    # step 3: classify faces
     sheet_faces, edge_faces = classify_faces(brep, thickness)
     print("faces: {} sheet, {} edge".format(len(sheet_faces), len(edge_faces)))
 
@@ -923,39 +937,39 @@ def unfold_to_2d():
         print("error: need at least 2 sheet faces")
         return
 
-    # step 5: join sheet faces → 2 polysurfaces
+    # step 4: join sheet faces -> 2 polysurfaces
     side_a, side_b = join_sheet_faces(brep, sheet_faces)
     if side_a is None:
         return
     print("joined sheet faces: side A ({} faces), side B ({} faces)".format(
         side_a.Faces.Count, side_b.Faces.Count))
 
-    # step 6: identify reference side (contains picked face)
+    # step 5: identify reference side (contains picked face)
     ref_side, other_side = identify_reference_side(side_a, side_b, brep, face_index)
 
-    # step 7: construct neutral axis (plane geometry for sharp corners)
+    # step 6: construct neutral axis
     neutral_axis = construct_neutral_axis(ref_side, thickness)
     if neutral_axis is None:
         return
     print("neutral axis: {} faces".format(neutral_axis.Faces.Count))
 
-    # step 8: identify bends from reference polysurface
+    # step 7: identify bends
     bend_infos = identify_bends(ref_side)
     print("bends: {}".format(len(bend_infos)))
 
-    # step 9: project bend lines to neutral axis
+    # step 8: project bend lines to neutral axis
     project_bends_to_neutral_axis(bend_infos, neutral_axis)
 
-    # step 10: compute bend directions
+    # step 9: compute bend directions
     determine_bend_directions(bend_infos, picked_normal)
     for info in bend_infos:
         print("  bend: {:.1f} {}".format(info["angle"], info["direction"]))
 
-    # step 11: find ink curves
+    # step 10: find ink curves
     ink_curves = find_ink_curves(brep)
     print("ink curves: {}".format(len(ink_curves)))
 
-    # step 12: unroll
+    # step 11: unroll
     unroll_result = unroll_neutral_axis(neutral_axis, ink_curves, bend_infos)
     if unroll_result is None:
         return
@@ -963,21 +977,18 @@ def unfold_to_2d():
     print("unrolled: {} brep(s), {} ink, {} bend lines".format(
         len(unrolled_breps), len(unrolled_ink), len(unrolled_bend)))
 
-    # step 13: classify unrolled boundary curves
+    # step 12: classify unrolled boundary curves
     outside_curves, inside_curves = classify_unrolled_curves(unrolled_breps)
     print("cuts: {} outside, {} inside".format(len(outside_curves), len(inside_curves)))
 
-    # step 14: create bend angle text
+    # step 13: create bend angle text
     text_curves = create_bend_text_curves(bend_infos, unrolled_bend)
 
-    # ensure sublayers exist
+    # step 14: add curves to sublayers
     sublayers = ensure_sublayers()
-
-    # step 15: place 2D output
-    count = place_2d_output(
-        brep, unrolled_breps, outside_curves, inside_curves,
-        unrolled_ink, unrolled_bend, text_curves, sublayers,
-    )
+    count = add_output(neutral_axis, unrolled_breps, outside_curves,
+                       inside_curves, unrolled_bend, unrolled_ink,
+                       text_curves, sublayers)
 
     sc.doc.Views.Redraw()
     print("unfold complete: {} curves placed".format(count))

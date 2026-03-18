@@ -1,3 +1,4 @@
+#! python3
 """lay-flat: orient objects so a selected face sits on cplane, face-up.
 
 usage:
@@ -10,9 +11,66 @@ alias: lay-flat -> _-RunPythonScript "path/to/lay-flat.py"
 import Rhino
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
-from Rhino.Geometry import AreaMassProperties, Plane, Transform, Vector3d, Point3d
+from Rhino.Geometry import (
+    Brep,
+    Plane,
+    Point3d,
+    Transform,
+    Vector3d,
+)
+from Rhino.Geometry.Intersect import Intersection
 from Rhino.Input.Custom import GetObject
 from Rhino.DocObjects import ObjectType
+
+
+def face_centroid_and_normal(brep, face):
+    """compute face centroid and outward normal from boundary vertices only.
+    avoids AreaMassProperties, ClosestPoint, NormalAt — pure vertex math."""
+    loop = face.OuterLoop
+    if loop is None:
+        return None, None
+
+    # collect boundary vertices in order
+    pts = []
+    for trim in loop.Trims:
+        edge = trim.Edge
+        if edge is None:
+            continue
+        # use edge start point (in trim order)
+        if trim.IsReversed():
+            pts.append(edge.PointAtEnd)
+        else:
+            pts.append(edge.PointAtStart)
+
+    if len(pts) < 3:
+        return None, None
+
+    # centroid: average of boundary vertices
+    cx, cy, cz = 0, 0, 0
+    for p in pts:
+        cx += p.X
+        cy += p.Y
+        cz += p.Z
+    n = len(pts)
+    centroid = Point3d(cx / n, cy / n, cz / n)
+
+    # normal: Newell's method for robust polygon normal
+    nx, ny, nz = 0, 0, 0
+    for i in range(n):
+        curr = pts[i]
+        nxt = pts[(i + 1) % n]
+        nx += (curr.Y - nxt.Y) * (curr.Z + nxt.Z)
+        ny += (curr.Z - nxt.Z) * (curr.X + nxt.X)
+        nz += (curr.X - nxt.X) * (curr.Y + nxt.Y)
+    normal = Vector3d(nx, ny, nz)
+    normal.Unitize()
+
+    # ensure outward: test point slightly outside should be outside the brep
+    test_pt = centroid + normal * 0.01
+    if brep.IsPointInside(test_pt, sc.doc.ModelAbsoluteTolerance, False):
+        normal = -normal
+
+    return centroid, normal
 
 
 def lay_flat():
@@ -78,21 +136,12 @@ def lay_flat():
             print("error: click a face (ctrl+shift+click for sub-face)")
             return
 
-    # face centroid
-    amp = AreaMassProperties.Compute(face)
-    if amp is None:
-        print("error: couldn't compute face centroid")
+    centroid, normal = face_centroid_and_normal(brep, face)
+    if centroid is None:
+        print("error: could not compute face geometry")
         return
-    centroid = amp.Centroid
-
-    # outward normal at centroid
-    rc, u, v = face.ClosestPoint(centroid)
-    if not rc:
-        print("error: closest point failed")
-        return
-    normal = face.NormalAt(u, v)
-    if face.OrientationIsReversed:
-        normal = -normal
+    print("  lay-flat centroid: {:.4f}, {:.4f}, {:.4f}".format(centroid.X, centroid.Y, centroid.Z))
+    print("  lay-flat normal:   {:.4f}, {:.4f}, {:.4f}".format(normal.X, normal.Y, normal.Z))
 
     # active cplane
     cplane = sc.doc.Views.ActiveView.ActiveViewport.ConstructionPlane()
