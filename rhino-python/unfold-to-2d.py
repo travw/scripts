@@ -604,6 +604,8 @@ def identify_bends(ref_side):
             "direction": "UP",  # refined later
             "normal_a": na,
             "normal_b": nb,
+            "centroid_a": ca,
+            "centroid_b": cb,
             "mid_pt": mid_pt,
             "tangent": tangent,
         })
@@ -643,16 +645,19 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
 
 def determine_bend_directions(bend_infos, picked_normal):
     """compute UP/DN direction for each bend relative to the picked face normal.
-    uses the bisector of the two face normals: it points toward the convex
-    (outside) of the bend. if convex side faces picked_normal → UP."""
+    uses face centroid positions: vectors from bend edge midpoint to each
+    adjacent face centroid sum to a vector pointing toward the concave/inside
+    of the bend. if inside faces picked_normal → UP (folds toward picked face)."""
     for info in bend_infos:
-        na = info["normal_a"]
-        nb = info["normal_b"]
+        mid = info["mid_pt"]
+        ca = info["centroid_a"]
+        cb = info["centroid_b"]
 
-        bisector = na + nb
-        bisector.Unitize()
+        # sum of vectors from bend edge to face centroids → points to inside
+        inside_vec = (ca - mid) + (cb - mid)
+        inside_vec.Unitize()
 
-        dot = Vector3d.Multiply(bisector, picked_normal)
+        dot = Vector3d.Multiply(inside_vec, picked_normal)
         info["direction"] = "UP" if dot > 0 else "DN"
 
 
