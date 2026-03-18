@@ -1,87 +1,128 @@
-"""lay-flat: orient polysurface so selected face sits on cplane, face-up.
+"""lay-flat: orient objects so a selected face sits on cplane, face-up.
 
 usage:
-  _-RunPythonScript "path/to/lay-flat.py"
-  or create alias: lay-flat -> _-RunPythonScript "path/to/lay-flat.py"
+  select objects first, then run script.
+  pick a face to define orientation. all selected objects get the same transform.
 
-workflow:
-  1. click a face on a polysurface (ctrl+shift+click for sub-selection)
-  2. object reorients so that face is coplanar with cplane, normal = +Z
-  3. object body ends up below cplane (negative Z side)
-  4. loops until enter/esc
+alias: lay-flat -> _-RunPythonScript "path/to/lay-flat.py"
 """
 
 import Rhino
+import rhinoscriptsyntax as rs
 import scriptcontext as sc
-from Rhino.Geometry import AreaMassProperties, Plane, Transform
+from Rhino.Geometry import AreaMassProperties, Plane, Transform, Vector3d, Point3d
 from Rhino.Input.Custom import GetObject
 from Rhino.DocObjects import ObjectType
 
 
 def lay_flat():
-    while True:
-        go = GetObject()
-        go.SetCommandPrompt("which face up? (enter when done)")
-        go.GeometryFilter = ObjectType.Surface
-        go.SubObjectSelect = True
-        go.EnablePreSelect(False, True)
-        go.DeselectAllBeforePostSelect = False
-        go.AcceptNothing(True)
-        go.GroupSelect = False
-        go.Get()
+    # grab pre-selected objects, or ask user to select
+    pre = [obj.Id for obj in sc.doc.Objects.GetSelectedObjects(False, False)]
 
-        if go.CommandResult() != Rhino.Commands.Result.Success:
-            break
-        if go.ObjectCount == 0:
-            break
+    if not pre:
+        go_sel = GetObject()
+        go_sel.SetCommandPrompt("select objects to lay flat")
+        go_sel.GeometryFilter = (
+            ObjectType.Brep
+            | ObjectType.Surface
+            | ObjectType.Extrusion
+            | ObjectType.InstanceReference
+            | ObjectType.Mesh
+            | ObjectType.SubD
+            | ObjectType.Curve
+            | ObjectType.Point
+        )
+        go_sel.EnablePreSelect(False, True)
+        go_sel.SubObjectSelect = False
+        go_sel.GroupSelect = True
+        go_sel.GetMultiple(1, 0)
+        if go_sel.CommandResult() != Rhino.Commands.Result.Success:
+            return
+        pre = [go_sel.Object(i).ObjectId for i in range(go_sel.ObjectCount)]
 
-        objref = go.Object(0)
-        obj_id = objref.ObjectId
-        brep = objref.Brep()
+    if not pre:
+        print("nothing selected")
+        return
 
-        if brep is None:
-            print("error: not a brep/polysurface")
-            continue
+    # clear selection so sub-face picking works
+    rs.UnselectAllObjects()
+    sc.doc.Views.Redraw()
 
-        face = objref.Face()
-        if face is None:
-            if brep.Faces.Count == 1:
-                face = brep.Faces[0]
-            else:
-                print("error: click a face, not the whole object")
-                print("       try ctrl+shift+click for sub-face selection")
-                continue
+    # now pick the orientation face
+    go = GetObject()
+    go.SetCommandPrompt("which face up?")
+    go.GeometryFilter = ObjectType.Surface
+    go.SubObjectSelect = True
+    go.EnablePreSelect(False, True)
+    go.DeselectAllBeforePostSelect = False
+    go.GroupSelect = False
+    go.Get()
 
-        # face centroid
-        amp = AreaMassProperties.Compute(face)
-        if amp is None:
-            print("error: couldn't compute face centroid")
-            continue
-        centroid = amp.Centroid
+    if go.CommandResult() != Rhino.Commands.Result.Success:
+        return
+    if go.ObjectCount == 0:
+        return
 
-        # surface normal at centroid
-        rc, u, v = face.ClosestPoint(centroid)
-        if not rc:
-            print("error: closest point failed")
-            continue
+    objref = go.Object(0)
+    brep = objref.Brep()
 
-        normal = face.NormalAt(u, v)
+    if brep is None:
+        print("error: not a brep/polysurface")
+        return
 
-        # flip to outward-facing normal if face orientation is reversed
-        if face.OrientationIsReversed:
-            normal = -normal
+    face = objref.Face()
+    if face is None:
+        if brep.Faces.Count == 1:
+            face = brep.Faces[0]
+        else:
+            print("error: click a face (ctrl+shift+click for sub-face)")
+            return
 
-        # source plane: face centroid, outward normal as Z axis
-        source_plane = Plane(centroid, normal)
+    # face centroid
+    amp = AreaMassProperties.Compute(face)
+    if amp is None:
+        print("error: couldn't compute face centroid")
+        return
+    centroid = amp.Centroid
 
-        # target: active construction plane
-        cplane = sc.doc.Views.ActiveView.ActiveViewport.ConstructionPlane()
+    # outward normal at centroid
+    rc, u, v = face.ClosestPoint(centroid)
+    if not rc:
+        print("error: closest point failed")
+        return
+    normal = face.NormalAt(u, v)
+    if face.OrientationIsReversed:
+        normal = -normal
 
-        # orient face -> cplane
-        xform = Transform.PlaneToPlane(source_plane, cplane)
-        sc.doc.Objects.Transform(obj_id, xform, True)
-        sc.doc.Views.Redraw()
-        print("laid flat")
+    # active cplane
+    cplane = sc.doc.Views.ActiveView.ActiveViewport.ConstructionPlane()
+
+    # step 1: rotation around centroid to align face normal -> cplane +Z
+    rotation = Transform.Rotation(normal, cplane.ZAxis, centroid)
+
+    # step 2: translate along cplane Z only, so face centroid lands on cplane
+    # (centroid doesn't move during rotation bc it's the pivot)
+    dist = Vector3d.Multiply(centroid - cplane.Origin, cplane.ZAxis)
+    translation = Transform.Translation(
+        Vector3d.Multiply(-dist, cplane.ZAxis)
+    )
+
+    # combined: rotate then translate
+    xform = translation * rotation
+
+    # make sure the reference face's parent object is in the list
+    ref_id = objref.ObjectId
+    if ref_id not in pre:
+        pre.append(ref_id)
+
+    # apply to all objects
+    count = 0
+    for obj_id in pre:
+        if sc.doc.Objects.Transform(obj_id, xform, True):
+            count += 1
+
+    sc.doc.Views.Redraw()
+    print("laid flat: {} object(s)".format(count))
 
 
 if __name__ == "__main__":
