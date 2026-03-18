@@ -191,8 +191,8 @@ def prompt_thickness(auto_thickness):
 
 def classify_faces(brep, thickness):
     """classify brep faces into sheet faces and edge faces.
-    a sheet face has a parallel partner: shoot a ray inward from its centroid
-    and check if it hits another face at ~thickness distance with antiparallel normal.
+    a sheet face has a parallel partner: shoot rays BOTH directions from its centroid
+    and check if either hits another face at ~thickness distance.
     returns (sheet_face_indices, edge_face_indices)."""
     tol = sc.doc.ModelAbsoluteTolerance
     thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
@@ -205,45 +205,48 @@ def classify_faces(brep, thickness):
         face_data.append((centroid, normal))
         face_breps.append(brep.Faces[i].DuplicateFace(False))
 
-    sheet_faces = []
-    edge_faces = []
+    # track which faces have a partner (symmetric: if i→j hits, both are sheet)
+    sheet_set = set()
 
     for i in range(brep.Faces.Count):
+        if i in sheet_set:
+            continue
         ci, ni = face_data[i]
         if ci is None or ni is None:
-            edge_faces.append(i)
+            print("  face {}: no centroid/normal, skipping".format(i))
             continue
 
-        # shoot a ray inward from this face's centroid
-        inward = -ni
-        start = ci + inward * 0.001
-        end = ci + inward * (thickness * 3)
-        ray = LineCurve(Line(start, end))
-
-        has_partner = False
-        for j in range(brep.Faces.Count):
-            if i == j:
-                continue
-            fb = face_breps[j]
-            if fb is None:
-                continue
-            # CurveBrep returns (bool, Curve[] overlapCurves, Point3d[] intersectionPoints)
-            rc, _, intersection_points = Intersection.CurveBrep(ray, fb, tol)
-            if not rc or intersection_points is None or len(intersection_points) == 0:
-                continue
-            for pt in intersection_points:
-                dist = ci.DistanceTo(pt)
-                if abs(dist - thickness) < thick_tol:
-                    has_partner = True
-                    break
-            if has_partner:
+        found = False
+        # shoot rays in BOTH directions from centroid
+        for direction in [ni, -ni]:
+            if found:
                 break
+            start = ci + direction * 0.001
+            end = ci + direction * 2.0  # generous ray length
+            ray = LineCurve(Line(start, end))
 
-        if has_partner:
-            sheet_faces.append(i)
-        else:
-            edge_faces.append(i)
+            for j in range(brep.Faces.Count):
+                if i == j:
+                    continue
+                fb = face_breps[j]
+                if fb is None:
+                    continue
+                rc, _, intersection_points = Intersection.CurveBrep(ray, fb, tol)
+                if not rc or intersection_points is None or len(intersection_points) == 0:
+                    continue
+                for pt in intersection_points:
+                    dist = ci.DistanceTo(pt)
+                    if abs(dist - thickness) < thick_tol:
+                        sheet_set.add(i)
+                        sheet_set.add(j)
+                        print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
+                        found = True
+                        break
+                if found:
+                    break
 
+    sheet_faces = sorted(sheet_set)
+    edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
     return sheet_faces, edge_faces
 
 
