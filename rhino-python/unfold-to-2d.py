@@ -396,6 +396,8 @@ def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
     ref_color = color.get(picked_face_index, 0)
     side_a_indices = [fi for fi in sheet_faces if color.get(fi, 0) == ref_color]
     side_b_indices = [fi for fi in sheet_faces if color.get(fi, 0) != ref_color]
+    print("  side A (ref): {} ({} faces)".format(side_a_indices, len(side_a_indices)))
+    print("  side B:       {} ({} faces)".format(side_b_indices, len(side_b_indices)))
 
     if not side_a_indices or not side_b_indices:
         print("error: could not split sheet faces into 2 sides (A={}, B={})".format(
@@ -553,7 +555,7 @@ def _validate_polygon(vertices, face_plane, tol):
         seg = Line(prev_pt, next_pt)
         t = seg.ClosestParameter(curr)
         closest = seg.PointAt(t)
-        if curr.DistanceTo(closest) > tol * 10:
+        if curr.DistanceTo(closest) > tol * 2:
             simplified.append(curr)
     if len(simplified) < 3:
         return None
@@ -563,25 +565,8 @@ def _validate_polygon(vertices, face_plane, tol):
     for pt in simplified:
         projected.append(face_plane.ClosestPoint(pt))
 
-    # 2D self-intersection check
-    origin = face_plane.Origin
-    x_axis = face_plane.XAxis
-    y_axis = face_plane.YAxis
-    pts_2d = []
-    for pt in projected:
-        v = pt - origin
-        pts_2d.append((Vector3d.Multiply(v, x_axis),
-                        Vector3d.Multiply(v, y_axis)))
-
-    m = len(pts_2d)
-    for i in range(m):
-        for j in range(i + 2, m):
-            if i == 0 and j == m - 1:
-                continue  # adjacent segments
-            if _segments_cross_2d(pts_2d[i], pts_2d[(i + 1) % m],
-                                   pts_2d[j], pts_2d[(j + 1) % m]):
-                return None  # self-intersecting
-
+    # skip self-intersection check — let CreatePlanarBreps be the judge
+    # (the check had false positives on simple faces with near-collinear edges)
     return projected
 
 
@@ -627,7 +612,7 @@ def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist):
     return edge_lines
 
 
-def construct_neutral_axis(ref_side, thickness):
+def construct_neutral_axis(ref_side, thickness, original_brep=None):
     """construct the neutral axis surface from plane geometry.
     for each planar face in ref_side, computes the offset plane (t/2 inward),
     then builds each face's boundary from:
@@ -672,17 +657,57 @@ def construct_neutral_axis(ref_side, thickness):
         return None
 
     # step 2: build each neutral axis face using robust helpers
+    print("=== neutral axis construction ===")
+    print("  ref_side has {} faces, {} have offset planes".format(
+        ref_side.Faces.Count, len(face_planes)))
+
+    # map ref_side face indices to original brep face indices by centroid matching
+    orig_map = {}
+    if original_brep is not None:
+        for rfi in range(ref_side.Faces.Count):
+            rf_brep = ref_side.Faces[rfi].DuplicateFace(False)
+            rf_amp = AreaMassProperties.Compute(rf_brep)
+            if rf_amp is None:
+                continue
+            rc = rf_amp.Centroid
+            best_oi = -1
+            best_d = float("inf")
+            for oi in range(original_brep.Faces.Count):
+                oc, _ = get_face_outward_normal(original_brep, oi)
+                if oc is None:
+                    continue
+                d = rc.DistanceTo(oc)
+                if d < best_d:
+                    best_d = d
+                    best_oi = oi
+            if best_oi >= 0 and best_d < 1.0:
+                orig_map[rfi] = best_oi
+
     neutral_faces = []
+    nas_ok = 0
+    nas_skip = 0
     for fi in face_planes:
         normal = face_normals[fi]
         face = ref_side.Faces[fi]
+        fl = "face {}".format(fi)
+        if fi in orig_map:
+            fl = "face {} (orig {})".format(fi, orig_map[fi])
         if face.OuterLoop is None:
+            print("  {}: no outer loop → SKIPPED".format(fl))
+            nas_skip += 1
             continue
 
         # build edge lines (guaranteed 1:1 with trims, no silent skipping)
         edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist)
+        n_bend = sum(1 for t, _ in edge_lines if t == "bend")
+        n_perim = sum(1 for t, _ in edge_lines if t == "perimeter")
+        n_fallback = sum(1 for t, _ in edge_lines if t == "perimeter_fallback")
+        n_trims = face.OuterLoop.Trims.Count
+
         if len(edge_lines) < 3:
-            print("warning: face {} has only {} edge lines".format(fi, len(edge_lines)))
+            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → SKIPPED (too few)".format(
+                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback))
+            nas_skip += 1
             continue
 
         # compute vertices with multi-strategy intersection
@@ -696,13 +721,33 @@ def construct_neutral_axis(ref_side, thickness):
                 vertices.append(pt)
 
         if len(vertices) < 3:
-            print("warning: face {} has only {} vertices".format(fi, len(vertices)))
+            # fallback: translate the face boundary curve to offset plane
+            outer_crv = face.OuterLoop.To3dCurve()
+            offset_vec = Vector3d(-normal.X * offset_dist,
+                                   -normal.Y * offset_dist,
+                                   -normal.Z * offset_dist)
+            if outer_crv is not None:
+                outer_translated = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+                fb = Brep.CreatePlanarBreps([outer_translated], tol)
+                if not fb or len(fb) == 0:
+                    fb = Brep.CreatePlanarBreps([outer_translated], tol * 100)
+                if fb and len(fb) > 0:
+                    neutral_faces.append(fb[0])
+                    print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → FALLBACK (boundary translate) → OK".format(
+                        fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+                    nas_ok += 1
+                    continue
+            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → SKIPPED".format(
+                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+            nas_skip += 1
             continue
 
         # validate and repair polygon
         validated = _validate_polygon(vertices, face_planes[fi], tol)
         if validated is None:
-            print("warning: face {} polygon invalid, skipping".format(fi))
+            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → INVALID → SKIPPED".format(
+                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+            nas_skip += 1
             continue
 
         # close polyline and create planar face
@@ -725,22 +770,31 @@ def construct_neutral_axis(ref_side, thickness):
             inner_3d = _doc_translate(inner_3d, offset_vec.X, offset_vec.Y, offset_vec.Z)
             all_curves.append(inner_3d)
             inner_count += 1
-        if inner_count > 0:
-            print("  face {}: {} inner loops found".format(fi, inner_count))
 
         face_breps = Brep.CreatePlanarBreps(all_curves, tol)
         if not face_breps or len(face_breps) == 0:
             face_breps = Brep.CreatePlanarBreps(all_curves, tol * 100)
         if face_breps and len(face_breps) > 0:
             neutral_faces.append(face_breps[0])
+            inner_str = " +{} holes".format(inner_count) if inner_count > 0 else ""
+            print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → {} validated{} → OK".format(
+                fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback,
+                len(vertices), len(validated) - 1, inner_str))
+            nas_ok += 1
         else:
             # last resort: try without inner loops
             face_breps = Brep.CreatePlanarBreps([boundary], tol * 100)
             if face_breps and len(face_breps) > 0:
-                print("warning: face {} inner loops failed, using solid face".format(fi))
                 neutral_faces.append(face_breps[0])
+                print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → OK (no holes)".format(
+                    fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+                nas_ok += 1
             else:
-                print("warning: CreatePlanarBreps failed for face {}".format(fi))
+                print("  {}: {} trims, {} edge_lines ({}b/{}p/{}f) → {} verts → CreatePlanarBreps FAILED".format(
+                    fl, n_trims, len(edge_lines), n_bend, n_perim, n_fallback, len(vertices)))
+                nas_skip += 1
+
+    print("  result: {} of {} faces OK".format(nas_ok, nas_ok + nas_skip))
 
     if not neutral_faces:
         print("error: could not create any neutral axis faces")
@@ -1083,6 +1137,9 @@ def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
                     if d < best_na_dist:
                         best_na_dist = d
                         best_na_idx = nfi
+        print("=== alignment ===")
+        print("  picked face {} → NA face {} (dist={:.4f}\")".format(
+            picked_face_index, best_na_idx, best_na_dist))
         na_face = neutral_axis.Faces[best_na_idx]
         na_brep = na_face.DuplicateFace(False)
         amp_na = AreaMassProperties.Compute(na_brep)
@@ -1182,8 +1239,41 @@ def unfold_to_2d():
     print("thickness: {}".format(thickness))
 
     # step 3: classify faces
+    print("=== face classification ===")
     sheet_faces, edge_faces, partners = classify_faces(brep, thickness)
-    print("faces: {} sheet, {} edge".format(len(sheet_faces), len(edge_faces)))
+    print("  {} sheet faces, {} edge faces".format(len(sheet_faces), len(edge_faces)))
+
+    # print compact partner list
+    seen_pairs = set()
+    pair_strs = []
+    for fi in sorted(partners.keys()):
+        pair = tuple(sorted([fi, partners[fi]]))
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            pair_strs.append("{}↔{}".format(pair[0], pair[1]))
+    print("  partners: {}".format(", ".join(pair_strs)))
+
+    # add face index text dots for visual identification
+    sheet_set = set(sheet_faces)
+    dot_ids = []
+    for i in range(brep.Faces.Count):
+        centroid, _ = get_face_outward_normal(brep, i)
+        if centroid is None:
+            continue
+        dot = Rhino.Geometry.TextDot(str(i), centroid)
+        dot.FontHeight = 14
+        attr = Rhino.DocObjects.ObjectAttributes()
+        if i in sheet_set:
+            attr.ObjectColor = System.Drawing.Color.FromArgb(0, 180, 0)
+        else:
+            attr.ObjectColor = System.Drawing.Color.FromArgb(220, 0, 0)
+        attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+        dot_ids.append(sc.doc.Objects.AddTextDot(dot, attr))
+    if dot_ids:
+        group_idx = sc.doc.Groups.Add("unfold_face_dots")
+        for did in dot_ids:
+            sc.doc.Groups.AddToGroup(group_idx, did)
+    sc.doc.Views.Redraw()
 
     if len(sheet_faces) < 2:
         print("error: need at least 2 sheet faces")
@@ -1194,18 +1284,30 @@ def unfold_to_2d():
     ref_side, other_side = join_sheet_faces(brep, sheet_faces, partners, face_index)
     if ref_side is None:
         return
-    print("joined sheet faces: ref ({} faces), other ({} faces)".format(
+
+    print("  ref side: {} faces, other side: {} faces".format(
         ref_side.Faces.Count, other_side.Faces.Count))
 
-    # step 6: construct neutral axis
-    neutral_axis = construct_neutral_axis(ref_side, thickness)
+    # step 6: construct neutral axis (prints its own === header ===)
+    neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep)
     if neutral_axis is None:
         return
-    print("neutral axis: {} faces".format(neutral_axis.Faces.Count))
+    print("  neutral axis: {} faces".format(neutral_axis.Faces.Count))
+
+    # debug: bake NAS to viewport for visual inspection
+    nas_attr = Rhino.DocObjects.ObjectAttributes()
+    nas_attr.ObjectColor = System.Drawing.Color.FromArgb(0, 200, 200)
+    nas_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+    bake_layer = "03 - Bake"
+    if rs.IsLayer(bake_layer):
+        nas_attr.LayerIndex = sc.doc.Layers.FindByFullPath(bake_layer, -1)
+    nas_debug_id = sc.doc.Objects.AddBrep(neutral_axis, nas_attr)
+    sc.doc.Views.Redraw()
 
     # step 7: identify bends
+    print("=== bends ===")
     bend_infos = identify_bends(ref_side)
-    print("bends: {}".format(len(bend_infos)))
+    print("  {} bends found".format(len(bend_infos)))
 
     # step 8: project bend lines to neutral axis
     project_bends_to_neutral_axis(bend_infos, neutral_axis)
@@ -1220,16 +1322,17 @@ def unfold_to_2d():
     print("ink curves: {}".format(len(ink_curves)))
 
     # step 11: unroll
+    print("=== unroll ===")
     unroll_result = unroll_neutral_axis(neutral_axis, ink_curves, bend_infos)
     if unroll_result is None:
         return
     unrolled_breps, unrolled_ink, unrolled_bend = unroll_result
-    print("unrolled: {} brep(s), {} ink, {} bend lines".format(
+    print("  {} brep(s), {} ink, {} bend lines".format(
         len(unrolled_breps), len(unrolled_ink), len(unrolled_bend)))
 
     # step 12: classify unrolled boundary curves
     outside_curves, inside_curves = classify_unrolled_curves(unrolled_breps)
-    print("cuts: {} outside, {} inside".format(len(outside_curves), len(inside_curves)))
+    print("  cuts: {} outside, {} inside".format(len(outside_curves), len(inside_curves)))
 
     # step 13: create bend angle text
     text_curves = create_bend_text_curves(bend_infos, unrolled_bend)
