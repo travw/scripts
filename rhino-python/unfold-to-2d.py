@@ -570,7 +570,82 @@ def _validate_polygon(vertices, face_plane, tol):
     return projected
 
 
-def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist):
+def _find_through_face(ref_side, fi, edge, skipped_faces, face_planes):
+    """trace through a chain of skipped transition faces to find the next
+    real face. handles multi-level chains (e.g., 32 → 0 → 24 → 22)."""
+    visited = {fi}
+    current_fi = fi
+    current_edge = edge
+
+    for step in range(10):  # safety limit
+        adj = list(current_edge.AdjacentFaces())
+        if len(adj) != 2:
+            print("    look-through step {}: edge has {} adj faces, dead end".format(step, len(adj)))
+            return None
+        next_fi = adj[0] if adj[1] == current_fi else adj[1]
+        if next_fi in visited:
+            print("    look-through step {}: face {} already visited, loop".format(step, next_fi))
+            return None
+        visited.add(next_fi)
+
+        in_planes = next_fi in face_planes
+        in_skipped = next_fi in skipped_faces
+        print("    look-through step {}: face {} → face {} (planes={}, skipped={})".format(
+            step, current_fi, next_fi, in_planes, in_skipped))
+
+        # found a real (non-skipped) face with an offset plane
+        if in_planes and not in_skipped:
+            print("    look-through: found real face {}!".format(next_fi))
+            return next_fi
+
+        # hit a face that's not in face_planes at all (non-sheet edge face)
+        if not in_skipped:
+            print("    look-through: face {} not skipped and not in planes, dead end".format(next_fi))
+            return None
+
+        # it's a skipped face — try ALL other edges (not just the first)
+        skipped_face = ref_side.Faces[next_fi]
+        if skipped_face.OuterLoop is None:
+            return None
+        # first check: does any edge lead directly to a real face?
+        for trim in skipped_face.OuterLoop.Trims:
+            if trim.Edge is None:
+                continue
+            other_edge = trim.Edge
+            if other_edge.EdgeIndex == current_edge.EdgeIndex:
+                continue
+            other_adj = list(other_edge.AdjacentFaces())
+            if len(other_adj) != 2:
+                continue
+            far_fi = other_adj[0] if other_adj[1] == next_fi else other_adj[1]
+            if far_fi in face_planes and far_fi not in skipped_faces and far_fi not in visited:
+                return far_fi  # found real face directly
+        # second check: try edges leading to more skipped faces (continue walking)
+        found_next = False
+        for trim in skipped_face.OuterLoop.Trims:
+            if trim.Edge is None:
+                continue
+            other_edge = trim.Edge
+            if other_edge.EdgeIndex == current_edge.EdgeIndex:
+                continue
+            other_adj = list(other_edge.AdjacentFaces())
+            if len(other_adj) != 2:
+                continue
+            far_fi = other_adj[0] if other_adj[1] == next_fi else other_adj[1]
+            if far_fi in visited:
+                continue
+            if far_fi in skipped_faces:
+                current_fi = next_fi
+                current_edge = other_edge
+                found_next = True
+                break
+        if not found_next:
+            return None
+    return None
+
+
+def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
+                      ref_side=None, skipped_faces=None):
     """build edge lines for a face's outer loop. every trim produces exactly
     one (type, Line) entry. bend edges use PlanePlane with translated fallback.
     respects trim.IsReversed() for consistent winding."""
@@ -595,12 +670,35 @@ def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist):
         adj = list(edge.AdjacentFaces())
         if len(adj) == 2:
             other = adj[0] if adj[1] == fi else adj[1]
-            if other in face_planes:
-                rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[other])
+            target_fi = other  # face to use for PlanePlane
+
+            # if adjacent face is skipped (transition face), find nearest real face
+            # by geometric proximity (topological walk fails on complex corner topology)
+            if skipped_faces and other in skipped_faces and ref_side is not None:
+                edge_mid = Point3d((e_start.X + e_end.X) / 2,
+                                   (e_start.Y + e_end.Y) / 2,
+                                   (e_start.Z + e_end.Z) / 2)
+                best_fi = None
+                best_d = float("inf")
+                for cfi in face_planes:
+                    if cfi == fi or cfi in skipped_faces:
+                        continue
+                    cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
+                    cf_amp = AreaMassProperties.Compute(cf_brep)
+                    if cf_amp is not None:
+                        d = edge_mid.DistanceTo(cf_amp.Centroid)
+                        if d < best_d:
+                            best_d = d
+                            best_fi = cfi
+                if best_fi is not None:
+                    target_fi = best_fi
+
+            if target_fi in face_planes and target_fi not in (skipped_faces or set()):
+                rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[target_fi])
                 if rc:
                     edge_lines.append(("bend", int_line))
                     continue
-            # PlanePlane failed or other not in face_planes: fallback to translated
+            # PlanePlane failed or target not usable: fallback to translated
             p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
             p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
             edge_lines.append(("perimeter_fallback", Line(p0, p1)))
@@ -689,6 +787,15 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
             if best_oi >= 0 and best_d < 1.0:
                 orig_map[rfi] = best_oi
 
+    # pre-compute skipped faces (transition faces below area threshold)
+    min_area = thickness * 2.0
+    skipped_faces = set()
+    for fi in face_planes:
+        face_brep_check = ref_side.Faces[fi].DuplicateFace(False)
+        amp_check = AreaMassProperties.Compute(face_brep_check)
+        if amp_check is not None and amp_check.Area < min_area:
+            skipped_faces.add(fi)
+
     neutral_faces = []
     nas_ok = 0
     nas_skip = 0
@@ -705,17 +812,18 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
 
         # skip small transition faces (they're in the polysurface for connectivity
         # but shouldn't generate their own NAS face)
-        min_area = thickness * 2.0
-        face_brep_area = face.DuplicateFace(False)
-        amp_area = AreaMassProperties.Compute(face_brep_area)
-        if amp_area is not None and amp_area.Area < min_area:
+        if fi in skipped_faces:
+            face_brep_area = face.DuplicateFace(False)
+            amp_area = AreaMassProperties.Compute(face_brep_area)
+            area_val = amp_area.Area if amp_area else 0
             print("  {}: area {:.4f} < {:.4f} min → SKIPPED (transition face)".format(
-                fl, amp_area.Area, min_area))
+                fl, area_val, min_area))
             nas_skip += 1
             continue
 
-        # build edge lines (guaranteed 1:1 with trims, no silent skipping)
-        edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist)
+        # build edge lines (look through skipped faces to find real neighbors)
+        edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
+                                        ref_side=ref_side, skipped_faces=skipped_faces)
         n_bend = sum(1 for t, _ in edge_lines if t == "bend")
         n_perim = sum(1 for t, _ in edge_lines if t == "perimeter")
         n_fallback = sum(1 for t, _ in edge_lines if t == "perimeter_fallback")
