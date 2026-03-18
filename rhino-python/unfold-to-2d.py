@@ -410,36 +410,33 @@ def identify_bends(ref_side):
 
 
 def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
-    """project bend line curves onto the neutral axis surface.
+    """find bend lines on the neutral axis surface by extracting internal edges
+    (edges shared by 2 faces = bend seams). matches each bend to its nearest
+    internal edge and simplifies to a straight LineCurve.
     updates each bend_info with 'curve_na' key."""
-    tol = sc.doc.ModelAbsoluteTolerance
+    # collect internal (non-naked) edges — these are the bend seams
+    internal_edges = []
+    for ei in range(neutral_axis_brep.Edges.Count):
+        edge = neutral_axis_brep.Edges[ei]
+        if len(edge.AdjacentFaces()) == 2:
+            internal_edges.append(edge)
 
     for info in bend_infos:
-        curve = info["curve_3d"]
-        projected = _project_curve_to_brep(curve, neutral_axis_brep, tol)
-        if projected is not None:
-            info["curve_na"] = projected
+        bend_mid = info["mid_pt"]
+        best_edge = None
+        best_dist = float("inf")
+        for edge in internal_edges:
+            cp = edge.PointAt(edge.Domain.Mid)
+            d = bend_mid.DistanceTo(cp)
+            if d < best_dist:
+                best_dist = d
+                best_edge = edge
+
+        if best_edge is not None:
+            # simplify to a straight line (endpoints only)
+            info["curve_na"] = LineCurve(Line(best_edge.PointAtStart, best_edge.PointAtEnd))
         else:
-            info["curve_na"] = curve  # fallback: use original
-
-
-def _project_curve_to_brep(curve, target_brep, tol):
-    """project a curve onto a brep surface. returns the projected curve or None."""
-    pts = []
-    num_samples = 20
-    domain = curve.Domain
-    for i in range(num_samples + 1):
-        t = domain.T0 + (i / num_samples) * (domain.T1 - domain.T0)
-        pt = curve.PointAt(t)
-        closest_pt = target_brep.ClosestPoint(pt)
-        if closest_pt.IsValid:
-            pts.append(closest_pt)
-
-    if len(pts) < 2:
-        return None
-
-    projected = Curve.CreateInterpolatedCurve(pts, 3)
-    return projected
+            info["curve_na"] = info["curve_3d"]  # fallback
 
 
 def determine_bend_directions(bend_infos, picked_normal):
