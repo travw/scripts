@@ -127,6 +127,7 @@ def detect_thickness(brep, face_index):
     ray = LineCurve(Line(start, end))
 
     # intersect ray with each face individually (exploded approach)
+    # CurveBrep returns (bool, Curve[] overlapCurves, Point3d[] intersectionPoints)
     hits = []
     for fi in range(brep.Faces.Count):
         if fi == face_index:
@@ -134,11 +135,10 @@ def detect_thickness(brep, face_index):
         face_brep = brep.Faces[fi].DuplicateFace(False)
         if face_brep is None:
             continue
-        rc, intersections, _ = Intersection.CurveBrep(ray, face_brep, tol)
-        if not rc or intersections is None:
+        rc, _, intersection_points = Intersection.CurveBrep(ray, face_brep, tol)
+        if not rc or intersection_points is None:
             continue
-        for ci in range(intersections.Count):
-            pt = intersections[ci].PointA
+        for pt in intersection_points:
             dist = centroid.DistanceTo(pt)
             if dist > 0.01:
                 hits.append(dist)
@@ -191,9 +191,10 @@ def prompt_thickness(auto_thickness):
 
 def classify_faces(brep, thickness):
     """classify brep faces into sheet faces and edge faces.
-    a sheet face has a parallel partner: another face with antiparallel normal
-    at approximately thickness distance. edge faces lack such a partner.
+    a sheet face has a parallel partner: shoot a ray inward from its centroid
+    and check if it hits another face at ~thickness distance with antiparallel normal.
     returns (sheet_face_indices, edge_face_indices)."""
+    tol = sc.doc.ModelAbsoluteTolerance
     thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
 
     # precompute centroids, normals, and duplicated face breps
@@ -213,26 +214,29 @@ def classify_faces(brep, thickness):
             edge_faces.append(i)
             continue
 
+        # shoot a ray inward from this face's centroid
+        inward = -ni
+        start = ci + inward * 0.001
+        end = ci + inward * (thickness * 3)
+        ray = LineCurve(Line(start, end))
+
         has_partner = False
         for j in range(brep.Faces.Count):
             if i == j:
                 continue
-            cj, nj = face_data[j]
-            if cj is None or nj is None:
-                continue
-
-            # partner must have antiparallel normal
-            if Vector3d.Multiply(ni, nj) > -0.7:
-                continue
-
-            # check distance using Brep.ClosestPoint (respects trims)
             fb = face_breps[j]
             if fb is None:
                 continue
-            closest = fb.ClosestPoint(ci)
-            dist = ci.DistanceTo(closest)
-            if abs(dist - thickness) < thick_tol:
-                has_partner = True
+            # CurveBrep returns (bool, Curve[] overlapCurves, Point3d[] intersectionPoints)
+            rc, _, intersection_points = Intersection.CurveBrep(ray, fb, tol)
+            if not rc or intersection_points is None or len(intersection_points) == 0:
+                continue
+            for pt in intersection_points:
+                dist = ci.DistanceTo(pt)
+                if abs(dist - thickness) < thick_tol:
+                    has_partner = True
+                    break
+            if has_partner:
                 break
 
         if has_partner:
