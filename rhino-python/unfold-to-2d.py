@@ -647,7 +647,8 @@ def _find_through_face(ref_side, fi, edge, skipped_faces, face_planes):
 def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
                       ref_side=None, skipped_faces=None):
     """build edge lines for a face's outer loop. every trim produces exactly
-    one (type, Line) entry. bend edges use PlanePlane with translated fallback.
+    one (type, Line, target_fi) entry. bend edges use PlanePlane with translated
+    fallback. target_fi is the PlanePlane partner face index (or None for perimeter).
     respects trim.IsReversed() for consistent winding."""
     normal = face_normals[fi]
     offset_vec = Vector3d(-normal.X * offset_dist,
@@ -696,18 +697,44 @@ def _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
             if target_fi in face_planes and target_fi not in (skipped_faces or set()):
                 rc, int_line = Intersection.PlanePlane(face_planes[fi], face_planes[target_fi])
                 if rc:
-                    edge_lines.append(("bend", int_line))
+                    edge_lines.append(("bend", int_line, target_fi))
                     continue
             # PlanePlane failed or target not usable: fallback to translated
             p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
             p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
-            edge_lines.append(("perimeter_fallback", Line(p0, p1)))
+            edge_lines.append(("perimeter_fallback", Line(p0, p1), None))
         else:
             p0 = Point3d(e_start.X + offset_vec.X, e_start.Y + offset_vec.Y, e_start.Z + offset_vec.Z)
             p1 = Point3d(e_end.X + offset_vec.X, e_end.Y + offset_vec.Y, e_end.Z + offset_vec.Z)
-            edge_lines.append(("perimeter", Line(p0, p1)))
+            edge_lines.append(("perimeter", Line(p0, p1), None))
 
     return edge_lines
+
+
+def _merge_same_target_runs(edge_lines):
+    """merge consecutive bend edges that share the same PlanePlane target.
+    when multiple edges adjacent to skipped transition faces all resolve to
+    the same target, they produce identical infinite lines that cause
+    degenerate vertices. collapsing them into a single bend entry fixes this."""
+    if len(edge_lines) < 3:
+        return edge_lines
+    merged = []
+    i = 0
+    while i < len(edge_lines):
+        typ, line, target = edge_lines[i]
+        if target is not None:
+            # start of a potential run — find how far it extends
+            run_end = i + 1
+            while run_end < len(edge_lines) and edge_lines[run_end][2] == target:
+                run_end += 1
+            if run_end - i > 1:
+                # run of N entries with same target: keep just one bend entry
+                merged.append(("bend", line, target))
+                i = run_end
+                continue
+        merged.append((typ, line, target))
+        i += 1
+    return merged
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None):
@@ -824,9 +851,12 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
         # build edge lines (look through skipped faces to find real neighbors)
         edge_lines = _build_edge_lines(face, fi, face_planes, face_normals, offset_dist,
                                         ref_side=ref_side, skipped_faces=skipped_faces)
-        n_bend = sum(1 for t, _ in edge_lines if t == "bend")
-        n_perim = sum(1 for t, _ in edge_lines if t == "perimeter")
-        n_fallback = sum(1 for t, _ in edge_lines if t == "perimeter_fallback")
+        pre_merge = len(edge_lines)
+        edge_lines = _merge_same_target_runs(edge_lines)
+        n_bend = sum(1 for t, _, _tgt in edge_lines if t == "bend")
+        n_perim = sum(1 for t, _, _tgt in edge_lines if t == "perimeter")
+        n_fallback = sum(1 for t, _, _tgt in edge_lines if t == "perimeter_fallback")
+        n_merged = pre_merge - len(edge_lines)
         n_trims = face.OuterLoop.Trims.Count
 
         if len(edge_lines) < 3:
@@ -839,8 +869,8 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None):
         n = len(edge_lines)
         vertices = []
         for i in range(n):
-            type_a, line_a = edge_lines[i]
-            type_b, line_b = edge_lines[(i + 1) % n]
+            type_a, line_a, _tgt_a = edge_lines[i]
+            type_b, line_b, _tgt_b = edge_lines[(i + 1) % n]
             pt = _compute_vertex(line_a, type_a, line_b, type_b, face_planes[fi])
             if pt is not None:
                 vertices.append(pt)
