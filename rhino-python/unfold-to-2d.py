@@ -107,7 +107,8 @@ def get_face_outward_normal(brep, face_index):
 
 
 def detect_thickness(brep, face_index):
-    """detect material thickness by shooting a ray inward from the picked face.
+    """detect material thickness by shooting a ray inward from the picked face
+    and intersecting with each exploded face individually.
     snaps to nearest standard aluminum gauge (0.100, 0.125, 0.160, 0.190).
     returns the gauge thickness, or None if measurement is out of range."""
     tol = sc.doc.ModelAbsoluteTolerance
@@ -117,33 +118,38 @@ def detect_thickness(brep, face_index):
 
     # shoot a line inward from the face centroid
     inward = -normal
-    start = centroid + inward * 0.01  # nudge off surface
-    end = centroid + inward * 2.0  # 2" should be more than enough
-    line = LineCurve(Line(start, end))
+    start = centroid + inward * 0.001  # small nudge off surface
+    end = centroid + inward * 2.0
+    ray = LineCurve(Line(start, end))
 
-    rc, intersections, _ = Intersection.CurveBrep(line, brep, tol)
-    if not rc or intersections is None or intersections.Count == 0:
+    # intersect ray with each face individually (exploded approach)
+    hits = []
+    for fi in range(brep.Faces.Count):
+        if fi == face_index:
+            continue
+        face_brep = brep.Faces[fi].DuplicateFace(False)
+        if face_brep is None:
+            continue
+        rc, intersections, _ = Intersection.CurveBrep(ray, face_brep, tol)
+        if not rc or intersections is None:
+            continue
+        for ci in range(intersections.Count):
+            pt = intersections[ci].PointA
+            dist = centroid.DistanceTo(pt)
+            if dist > 0.01:
+                hits.append(dist)
+
+    if not hits:
         return None
 
-    # find closest intersection that isn't on the picked face
-    best_dist = None
-    for ci in range(intersections.Count):
-        pt = intersections[ci].PointA
-        dist = centroid.DistanceTo(pt)
-        if dist > 0.05:  # skip near-self intersections
-            if best_dist is None or dist < best_dist:
-                best_dist = dist
-
-    if best_dist is None:
+    # pick hit closest to sensible aluminum gauge range (1/16" to 1/4")
+    sensible = [d for d in hits if 0.0625 < d < 0.250]
+    if not sensible:
+        print("warning: no hits in expected thickness range. closest: {:.4f}".format(min(hits)))
         return None
 
-    # validate: must be in reasonable range for aluminum sheet (1/16" to 1/4")
-    if best_dist < 0.0625 or best_dist > 0.250:
-        print("warning: measured thickness {:.4f} is outside expected range".format(best_dist))
-        return None
-
-    # snap to nearest standard gauge
-    closest_gauge = min(STANDARD_GAUGES, key=lambda g: abs(g - best_dist))
+    raw = min(sensible)
+    closest_gauge = min(STANDARD_GAUGES, key=lambda g: abs(g - raw))
     return closest_gauge
 
 
@@ -181,36 +187,52 @@ def prompt_thickness(auto_thickness):
 
 def classify_faces(brep, thickness):
     """classify brep faces into sheet faces and edge faces.
-    edge faces are narrow strips whose width ≈ thickness (area / longest edge).
+    a sheet face has a parallel partner: another face with antiparallel normal
+    at approximately thickness distance. edge faces lack such a partner.
     returns (sheet_face_indices, edge_face_indices)."""
-    thick_tol = thickness * 0.4  # 40% tolerance
+    thick_tol = thickness * 0.5  # 50% tolerance for partner distance matching
 
-    edge_faces = []
+    # precompute centroids and normals for all faces
+    face_data = []
+    for i in range(brep.Faces.Count):
+        centroid, normal = get_face_outward_normal(brep, i)
+        face_data.append((centroid, normal))
+
     sheet_faces = []
+    edge_faces = []
 
     for i in range(brep.Faces.Count):
-        face = brep.Faces[i]
-        amp = AreaMassProperties.Compute(face)
-        if amp is None:
-            sheet_faces.append(i)
+        ci, ni = face_data[i]
+        if ci is None or ni is None:
+            edge_faces.append(i)
             continue
 
-        area = amp.Area
-        edge_indices = face.AdjacentEdges()
-        max_edge_len = 0
-        for ei in edge_indices:
-            el = brep.Edges[ei].GetLength()
-            if el > max_edge_len:
-                max_edge_len = el
+        has_partner = False
+        for j in range(brep.Faces.Count):
+            if i == j:
+                continue
+            cj, nj = face_data[j]
+            if cj is None or nj is None:
+                continue
 
-        if max_edge_len > 0:
-            approx_width = area / max_edge_len
-            if abs(approx_width - thickness) < thick_tol:
-                edge_faces.append(i)
-            else:
-                sheet_faces.append(i)
-        else:
+            # partner must have antiparallel normal
+            if Vector3d.Multiply(ni, nj) > -0.7:
+                continue
+
+            # check distance: closest point on face j to centroid of face i
+            rc, u, v = brep.Faces[j].ClosestPoint(ci)
+            if not rc:
+                continue
+            closest = brep.Faces[j].PointAt(u, v)
+            dist = ci.DistanceTo(closest)
+            if abs(dist - thickness) < thick_tol:
+                has_partner = True
+                break
+
+        if has_partner:
             sheet_faces.append(i)
+        else:
+            edge_faces.append(i)
 
     return sheet_faces, edge_faces
 
