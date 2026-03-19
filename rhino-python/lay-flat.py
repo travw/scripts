@@ -127,19 +127,23 @@ def compute_transform(normal, centroid, obj_ids, placement):
 
     rot_center = rotated_bbox.Center
 
+    # centroid is the rotation pivot so it doesn't move during rotation —
+    # use its Z to place the selected face exactly at Z=0
+    face_z = centroid.Z
+
     if placement == 1:
-        # UnderPart: XY align with original bbox center, Z bottom at 0
+        # UnderPart: XY align with original bbox center, selected face at Z=0
         translation = Transform.Translation(
             orig_center.X - rot_center.X,
             orig_center.Y - rot_center.Y,
-            -rotated_bbox.Min.Z,
+            -face_z,
         )
     else:
-        # Origin: center at world origin, Z bottom at 0
+        # Origin: center at world origin, selected face at Z=0
         translation = Transform.Translation(
             -rot_center.X,
             -rot_center.Y,
-            -rotated_bbox.Min.Z,
+            -face_z,
         )
 
     return translation * rotation
@@ -257,15 +261,20 @@ def lay_flat():
 
     # apply to all objects
     delete_original = not copy_mode
-    count = 0
+    result_ids = []
     for obj_id in pre:
-        if sc.doc.Objects.Transform(obj_id, xform, delete_original):
-            count += 1
+        new_id = sc.doc.Objects.Transform(obj_id, xform, delete_original)
+        if new_id:
+            result_ids.append(new_id)
+
+    # select output geometry
+    for rid in result_ids:
+        sc.doc.Objects.Select(rid)
 
     sc.doc.Views.Redraw()
     tag = " (copy)" if copy_mode else ""
     mode = PLACEMENTS[placement_idx]
-    print("laid flat{}: {} object(s) [{}]".format(tag, count, mode))
+    print("laid flat{}: {} object(s) [{}]".format(tag, len(result_ids), mode))
 
 
 if __name__ == "__main__":

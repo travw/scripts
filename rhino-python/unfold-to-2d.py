@@ -1034,22 +1034,19 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
     and 'na_axis' keys."""
     nas = neutral_axis_brep
 
-    # pre-compute NAS face normals and planes
-    nas_normals = {}  # fi -> Vector3d (outward)
-    nas_planes = {}   # fi -> Plane
+    # pre-compute NAS face centroids and planes
+    nas_centroids = {}  # fi -> Point3d
+    nas_planes = {}     # fi -> Plane
     for fi in range(nas.Faces.Count):
         face = nas.Faces[fi]
+        face_brep = face.DuplicateFace(False)
+        amp = AreaMassProperties.Compute(face_brep)
+        if amp:
+            nas_centroids[fi] = amp.Centroid
         plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
         rc, plane = face.TryGetPlane(plane_tol)
-        if not rc:
-            continue
-        mid_u = face.Domain(0).Mid
-        mid_v = face.Domain(1).Mid
-        n = face.NormalAt(mid_u, mid_v)
-        if face.OrientationIsReversed:
-            n.Reverse()
-        nas_normals[fi] = n
-        nas_planes[fi] = plane
+        if rc:
+            nas_planes[fi] = plane
 
     # collect internal edges for curve_na extent (optional, best-effort)
     internal_edges = []
@@ -1059,31 +1056,31 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
             internal_edges.append(edge)
 
     for i, info in enumerate(bend_infos):
-        bend_na = info["normal_a"]  # outward normal of ref_side face A
-        bend_nb = info["normal_b"]  # outward normal of ref_side face B
         bend_mid = info["mid_pt"]
+        ca = info["centroid_a"]  # ref_side face A centroid
+        cb = info["centroid_b"]  # ref_side face B centroid
 
-        # match NAS faces by normal: best dot product with bend normals
-        best_a = (-1, -1.0)  # (face_idx, dot)
-        best_b = (-1, -1.0)
-        for fi, n in nas_normals.items():
-            dot_a = abs(Vector3d.Multiply(n, bend_na))
-            dot_b = abs(Vector3d.Multiply(n, bend_nb))
-            if dot_a > best_a[1]:
-                best_a = (fi, dot_a)
-            if dot_b > best_b[1]:
-                best_b = (fi, dot_b)
+        # match NAS faces by centroid proximity to ref_side face centroids
+        # (NAS faces are offset t/2 from ref_side faces, centroids are close)
+        best_a = (-1, float("inf"))
+        best_b = (-1, float("inf"))
+        for fi, nc in nas_centroids.items():
+            da = ca.DistanceTo(nc)
+            db = cb.DistanceTo(nc)
+            if da < best_a[1]:
+                best_a = (fi, da)
+            if db < best_b[1]:
+                best_b = (fi, db)
 
-        # if both matched to same face, re-pick the second-best
+        # if both matched same face, re-pick second-best for b
         if best_a[0] == best_b[0]:
-            # re-find best_b excluding best_a's face
-            best_b = (-1, -1.0)
-            for fi, n in nas_normals.items():
+            best_b = (-1, float("inf"))
+            for fi, nc in nas_centroids.items():
                 if fi == best_a[0]:
                     continue
-                dot_b = abs(Vector3d.Multiply(n, bend_nb))
-                if dot_b > best_b[1]:
-                    best_b = (fi, dot_b)
+                db = cb.DistanceTo(nc)
+                if db < best_b[1]:
+                    best_b = (fi, db)
 
         fa = best_a[0]
         fb = best_b[0]
