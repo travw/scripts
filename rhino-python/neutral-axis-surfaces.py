@@ -521,17 +521,17 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                 trimmed_brep = best_piece
 
     # step 4.5: split using raw intersection curves to remove bridging artifacts
+    # pick largest piece by area (not closest to centroid — centroid may be in a hole)
     if raw_curves_for_split and trimmed_brep.Faces.Count > 0:
         split_brep = trimmed_brep.Faces[0].Split(raw_curves_for_split, tol)
         if split_brep is not None and split_brep.Faces.Count > 1:
             best_piece = None
-            best_d = float("inf")
+            best_area = 0
             for fi_s in range(split_brep.Faces.Count):
                 piece = split_brep.Faces[fi_s].DuplicateFace(False)
-                cp = piece.ClosestPoint(centroid_nap)
-                d = centroid_nap.DistanceTo(cp)
-                if d < best_d:
-                    best_d = d
+                amp_s = AreaMassProperties.Compute(piece)
+                if amp_s and amp_s.Area > best_area:
+                    best_area = amp_s.Area
                     best_piece = piece
             if best_piece is not None:
                 trimmed_brep = best_piece
