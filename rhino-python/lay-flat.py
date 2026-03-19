@@ -114,9 +114,10 @@ def face_centroid_and_normal(brep, face):
     return centroid, normal
 
 
-def compute_transform(normal, centroid, obj_ids, placement):
+def compute_transform(normal, centroid, obj_ids, placement, face=None):
     """compute the lay-flat transform for the given placement mode.
     placement: 0=CPlane, 1=UnderPart, 2=Origin, 3=Select (same as Origin initially)
+    face: BrepFace used for orientation — needed for curved faces to find min Z.
     returns Transform."""
 
     if placement == 0:
@@ -157,9 +158,18 @@ def compute_transform(normal, centroid, obj_ids, placement):
 
     rot_center = rotated_bbox.Center
 
-    # centroid is the rotation pivot so it doesn't move during rotation —
-    # use its Z to place the selected face exactly at Z=0
-    face_z = centroid.Z
+    # find the Z value where the selected face sits after rotation.
+    # for planar faces the centroid Z is correct (whole face at one Z).
+    # for curved faces we need the lowest Z of the face so the part
+    # rests on Z=0 like a planar face would.
+    face_z = centroid.Z  # default / planar fallback
+    if face is not None:
+        face_brep = face.DuplicateFace(False)
+        if face_brep is not None:
+            face_brep.Transform(rotation)
+            face_bb = face_brep.GetBoundingBox(True)
+            if face_bb.IsValid:
+                face_z = face_bb.Min.Z
 
     if placement == 1:
         # UnderPart: XY align with original bbox center, selected face at Z=0
@@ -322,7 +332,7 @@ def lay_flat():
         pre.append(ref_id)
 
     # compute transform for the chosen placement mode
-    xform = compute_transform(normal, centroid, pre, placement_idx)
+    xform = compute_transform(normal, centroid, pre, placement_idx, face)
 
     # identify brep-type originals for selective color application
     brep_types = (ObjectType.Brep, ObjectType.Surface, ObjectType.Extrusion)
