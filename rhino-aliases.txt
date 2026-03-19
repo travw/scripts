@@ -1,0 +1,163 @@
+﻿Z '_Zoom
+ze '_Zoom _Extents
+ZT '_Zoom _Target
+ZEA '_Zoom _All _Extents
+zs '_Zoom _Selected
+ZSA '_Zoom _All _Selected
+s '_scale1d
+o offset
+P '_Polyline
+M ! _Move
+U _Undo
+POn ! _PointsOn
+POff ! _PointsOff
+c _copy
+W '_SelWindow
+COn '_CurvatureGraph
+COff '_CurvatureGraphOff
+PlugInManager ! _OptionsPage _PlugIns
+AdvancedDisplay ! _OptionsPage _DisplayModes
+DisplayAttrsMgr ! _OptionsPage _DisplayModes
+Break ! _DeleteSubCrv
+SelPolysurface _SelPolysrf
+d _dim
+mf moveface
+l line
+e _extrudecrv
+t '_trim
+bm _blockmanager
+bu _booleanunion
+sa saveas
+bs _booleansplit
+sc '_selcolor
+g _group
+h _hide
+le length
+sn '_selname
+r '_Rectangle _p
+pl plane p
+f _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd _Dim _Pause _Pause 1/4"
+ff _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd _Dim _Pause _Pause 1/2"
+dd _dimdiameter
+sd '_setdisplaymode
+ss '_showselected
+ug '_ungroup
+da _dimaligned
+sca '_scale
+v '_volume
+doc _documentproperties
+sz '_setzto0
+i _isolate
+dw _dotwithdata
+hd _hideindetail
+ssd '_showselectedindetail
+sh '_show
+cs _ClippingSections
+ssid '_showselectedindetail
+zw zoomwindow
+o3 orient3pt
+te '_text
+uls '_unlockselected
+r3 '_rotate3d
+ex _export
+ihd invert _hideindetail
+al _ArrayLinear
+gh _grasshopper
+mh movehole
+eb _ExplodeBlock
+bum _BooleanUnion _MergeAllCoplanarFaces
+rot '_rotate
+dx _distribute _x
+dy _distribute _y
+dz _distribute _z
+ep _EditPythonScript
+b '_Box _p
+x '_projectosnap _t
+fe _filletedge
+ap '_align _p _p
+sb '_subdbox _p
+vp '_setview _world _perspective
+vt '_setview _world _top
+rp '_runpythonscript
+ah _arrowhead
+vc '_ViewCaptureToFile
+ps '_PlanarSrf
+mi mirror
+mei '_meshintersect
+bb _BoundingBox
+ic '_InterpCrv
+s2 _Sweep2
+s1 _Sweep1
+sv '_setdisplaymode _shaded
+gv _setdisplaymode _ghosted
+os _offsetsrf
+is _intersect
+es _extrudesrf
+wv _setdisplaymode _wireframe
+rv '_setdisplaymode _rendered
+tv '_setdisplaymode _technical
+pv '_setdisplaymode _pen
+se select
+rav _setdisplaymode _raytraced
+mix '_mirror _x
+miy '_mirror _y
+miz '_mirror _z
+mv '_setdisplaymode _monochrome
+fff _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd _Dim _Pause _Pause 3/4"
+so '_SetObjectDisplayMode _m
+bbox '_boundingbox
+pp '_PushPull
+db _DupBorder
+to '_TextObject
+su _-runpythonscript "C:\Users\travi\AppData\Roaming\McNeel\Rhinoceros\8.0\scripts\select-by-user-text.py" build
+pm _PackageManager
+sev '_setview
+cd _ClippingDrawings
+ud _updateclippingdrawings
+ce _chamferedge
+GR '_gumballrelocate
+ar _arrowhead
+clp _clippingplane
+pc _projecttocplane
+pj _project
+ur _unrollsrf
+ca _cap
+av _setdisplaymode _arctic
+fi _fillet
+fc _filletcorners
+at _angle _t
+dr _dimradius
+sp _setpt
+sep _setview _w _p
+sec _plan
+sl _sellast
+c1 _cplane _world _top
+c3 _cplane _3point
+mip _mirror _3point
+co _cplane _object
+rad _radius
+dia _diameter
+ul _unlock
+de _NoEcho ! -_Layer _Current "01 - Default" _EnterEnd
+za '_zoom _all
+dv '_setdisplaymode _darkmonochrome
+ws _worksession
+cdv '_setdisplaymode _coloreddarkmode
+q _history _record _enter
+cv '_setdisplaymode _coloredview
+cl _-runpythonscript "C:\Sites\rhino-python\CollapseLayers.py"
+el _-runpythonscript "C:\Sites\rhino-python\ExpandLayers.py"
+oc _offsetcrvonsrf
+cb _curveboolean
+di _distribute _d
+d3 _-runpythonscript "C:\Sites\rhino-python\Dim3D.py"
+brfr _-runpythonscript "C:\Sites\rhino-python\ToggleLayoutDarkMode.py"
+re _NoEcho ! -_Layer _Current "02 - Reference" _EnterEnd
+pt _point
+a _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd
+il _invert _lock
+can _curvatureanalysis
+rc _rotatecamera
+ocs _offsetcrvonsrf
+ae -runpythonscript "G:\My Drive\RaiderDrive\MACK\Python Scripts\Anglev2w-txt.py"
+2ds _-runpythonscript "C:\Sites\rhino-python\2D-geo_sublayers.py" build
