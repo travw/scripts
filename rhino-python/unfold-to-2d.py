@@ -740,8 +740,8 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
                     original_brep, partner_fi)
                 if partner_centroid is not None:
                     to_partner = partner_centroid - centroid
-                    if Vector3d.Multiply(to_partner, normal) < 0:
-                        normal = -normal
+                    if Vector3d.Multiply(to_partner, normal) > 0:
+                        normal = -normal  # normal was pointing toward partner (inward), flip to outward
                     direction_set = True
         if not direction_set:
             if other_side is not None:
