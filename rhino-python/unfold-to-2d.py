@@ -677,7 +677,8 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     return PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in cleaned])
 
 
-def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None):
+def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
+                           partners=None):
     """construct the neutral axis surface from plane geometry.
     for each planar face in ref_side, computes the offset plane (t/2 inward),
     then builds each face's boundary from:
@@ -712,18 +713,48 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         if face.OrientationIsReversed:
             normal = -normal
 
-        # verify offset direction: NAS point should be between ref_side and other_side
-        if other_side is not None:
-            test_a = centroid - normal * offset_dist
-            test_b = centroid + normal * offset_dist
-            dist_a = test_a.DistanceTo(other_side.ClosestPoint(test_a))
-            dist_b = test_b.DistanceTo(other_side.ClosestPoint(test_b))
-            if dist_b < dist_a:
-                normal = -normal  # flip toward other_side
-        elif original_brep is not None:
-            test_pt = centroid - normal * offset_dist
-            if not original_brep.IsPointInside(test_pt, tol, False):
-                normal = -normal
+        # verify offset direction: should point toward partner face
+        direction_set = False
+        if partners is not None and original_brep is not None:
+            # use partner face centroid from original brep (most robust)
+            orig_fi = None
+            # find original face index for this ref_side face
+            face_brep_c = face.DuplicateFace(False)
+            amp_c = AreaMassProperties.Compute(face_brep_c)
+            if amp_c is not None:
+                best_oi = -1
+                best_od = float("inf")
+                for oi in range(original_brep.Faces.Count):
+                    oc, _ = get_face_outward_normal(original_brep, oi)
+                    if oc is None:
+                        continue
+                    d = amp_c.Centroid.DistanceTo(oc)
+                    if d < best_od:
+                        best_od = d
+                        best_oi = oi
+                if best_oi >= 0 and best_od < 1.0:
+                    orig_fi = best_oi
+            if orig_fi is not None and orig_fi in partners:
+                partner_fi = partners[orig_fi]
+                partner_centroid, _ = get_face_outward_normal(
+                    original_brep, partner_fi)
+                if partner_centroid is not None:
+                    to_partner = partner_centroid - centroid
+                    if Vector3d.Multiply(to_partner, normal) < 0:
+                        normal = -normal
+                    direction_set = True
+        if not direction_set:
+            if other_side is not None:
+                test_a = centroid - normal * offset_dist
+                test_b = centroid + normal * offset_dist
+                dist_a = test_a.DistanceTo(other_side.ClosestPoint(test_a))
+                dist_b = test_b.DistanceTo(other_side.ClosestPoint(test_b))
+                if dist_b < dist_a:
+                    normal = -normal
+            elif original_brep is not None:
+                test_pt = centroid - normal * offset_dist
+                if not original_brep.IsPointInside(test_pt, tol, False):
+                    normal = -normal
 
         # offset plane inward (opposite to outward normal)
         offset_origin = plane.Origin - normal * offset_dist
@@ -1336,7 +1367,8 @@ def unfold_to_2d():
 
     # step 6: construct neutral axis (prints its own === header ===)
     neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep,
-                                          other_side=other_side)
+                                          other_side=other_side,
+                                          partners=partners)
     if neutral_axis is None:
         return
     print("  neutral axis: {} faces".format(neutral_axis.Faces.Count))
