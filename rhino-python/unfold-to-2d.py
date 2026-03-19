@@ -1223,7 +1223,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
 
             # use known bend angle — try both rotation signs
             # pick the one that moves the neighbor AWAY from current (not on top)
-            bend_angle_rad = math.radians(bi["angle"])
+            bend_angle_rad = math.radians(180.0 - bi["angle"])
             flatten_angle = bend_angle_rad
 
             # get current face centroid in flat coordinates

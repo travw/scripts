@@ -324,13 +324,24 @@ def lay_flat():
     # compute transform for the chosen placement mode
     xform = compute_transform(normal, centroid, pre, placement_idx)
 
+    # identify brep-type originals for selective color application
+    brep_types = (ObjectType.Brep, ObjectType.Surface, ObjectType.Extrusion)
+    brep_originals = set()
+    for obj_id in pre:
+        obj = sc.doc.Objects.FindId(obj_id)
+        if obj and obj.ObjectType in brep_types:
+            brep_originals.add(obj_id)
+
     # apply to all objects
     delete_original = not copy_mode
     result_ids = []
+    brep_result_ids = []
     for obj_id in pre:
         new_id = sc.doc.Objects.Transform(obj_id, xform, delete_original)
         if new_id:
             result_ids.append(new_id)
+            if obj_id in brep_originals:
+                brep_result_ids.append(new_id)
 
     # Select mode: let user pick placement point with live preview
     if placement_idx == 3 and result_ids:
@@ -359,16 +370,24 @@ def lay_flat():
         pick_pt = gp.Point()
         move = Transform.Translation(Vector3d(pick_pt - base_center))
         moved_ids = []
+        brep_result_set = set(brep_result_ids)
+        moved_brep_ids = []
         for rid in result_ids:
             new_id = sc.doc.Objects.Transform(rid, move, True)
             if new_id:
                 moved_ids.append(new_id)
+                if rid in brep_result_set:
+                    moved_brep_ids.append(new_id)
         result_ids = moved_ids
+        brep_result_ids = moved_brep_ids
 
-    # apply custom color if enabled
+    # apply custom color to brep-type objects only
     if color_on and color_rgb:
         obj_color = System.Drawing.Color.FromArgb(*color_rgb)
-        for rid in result_ids:
+        color_targets = list(brep_result_ids)
+        if copy_mode:
+            color_targets.extend(brep_originals)
+        for rid in color_targets:
             obj = sc.doc.Objects.FindId(rid)
             if obj:
                 attr = obj.Attributes.Duplicate()
