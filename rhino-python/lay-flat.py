@@ -65,65 +65,105 @@ class PlaceGetPoint(GetPoint):
 
 
 def face_centroid_and_normal(brep, face):
-    """compute face centroid and outward normal from boundary vertices only.
-    avoids AreaMassProperties, ClosestPoint, NormalAt — pure vertex math."""
+    """compute face centroid and outward normal.
+    uses NormalAt + OrientationIsReversed for reliable normals on both
+    open and closed breps, planar and curved faces.
+    centroid is boundary vertex average — good enough as rotation pivot."""
+    # outward normal via surface evaluation
+    u_mid = (face.Domain(0)[0] + face.Domain(0)[1]) / 2.0
+    v_mid = (face.Domain(1)[0] + face.Domain(1)[1]) / 2.0
+    normal = face.NormalAt(u_mid, v_mid)
+    if face.OrientationIsReversed:
+        normal = -normal
+
+    # centroid from boundary vertices
     loop = face.OuterLoop
     if loop is None:
         return None, None
-
-    # collect boundary vertices in order
     pts = []
     for trim in loop.Trims:
         edge = trim.Edge
         if edge is None:
             continue
-        # use edge start point (in trim order)
         if trim.IsReversed():
             pts.append(edge.PointAtEnd)
         else:
             pts.append(edge.PointAtStart)
-
     if len(pts) < 3:
         return None, None
-
-    # centroid: average of boundary vertices
-    cx, cy, cz = 0, 0, 0
-    for p in pts:
-        cx += p.X
-        cy += p.Y
-        cz += p.Z
-    n = len(pts)
-    centroid = Point3d(cx / n, cy / n, cz / n)
-
-    # normal: Newell's method for robust polygon normal
-    nx, ny, nz = 0, 0, 0
-    for i in range(n):
-        curr = pts[i]
-        nxt = pts[(i + 1) % n]
-        nx += (curr.Y - nxt.Y) * (curr.Z + nxt.Z)
-        ny += (curr.Z - nxt.Z) * (curr.X + nxt.X)
-        nz += (curr.X - nxt.X) * (curr.Y + nxt.Y)
-    normal = Vector3d(nx, ny, nz)
-    normal.Unitize()
-
-    # ensure outward: test point slightly outside should be outside the brep
-    test_pt = centroid + normal * 0.01
-    if brep.IsPointInside(test_pt, sc.doc.ModelAbsoluteTolerance, False):
-        normal = -normal
+    cx = sum(p.X for p in pts) / len(pts)
+    cy = sum(p.Y for p in pts) / len(pts)
+    cz = sum(p.Z for p in pts) / len(pts)
+    centroid = Point3d(cx, cy, cz)
 
     return centroid, normal
 
 
-def compute_transform(normal, centroid, obj_ids, placement):
+def face_min_along_axis(face, xform, origin=None, axis=None):
+    """find the minimum extent of a BrepFace after applying a transform.
+    if axis is given, measures signed distance from origin along axis.
+    otherwise measures world Z. returns float or None."""
+    min_val = None
+
+    def track(pt):
+        nonlocal min_val
+        pt = Point3d(pt)
+        pt.Transform(xform)
+        if axis is not None:
+            val = Vector3d.Multiply(pt - origin, axis)
+        else:
+            val = pt.Z
+        if min_val is None or val < min_val:
+            min_val = val
+
+    # sample boundary edges densely
+    loop = face.OuterLoop
+    if loop is not None:
+        for trim in loop.Trims:
+            edge = trim.Edge
+            if edge is None:
+                continue
+            params = edge.DivideByCount(20, True)
+            if params:
+                for t in params:
+                    track(edge.PointAt(t))
+
+    # sample interior grid (skip points outside trim boundary)
+    u_dom = face.Domain(0)
+    v_dom = face.Domain(1)
+    steps = 10
+    for i in range(steps + 1):
+        for j in range(steps + 1):
+            u = u_dom[0] + (u_dom[1] - u_dom[0]) * i / steps
+            v = v_dom[0] + (v_dom[1] - v_dom[0]) * j / steps
+            if face.IsPointOnFace(u, v) != Rhino.Geometry.PointFaceRelation.Exterior:
+                track(face.PointAt(u, v))
+
+    return min_val
+
+
+def compute_transform(normal, centroid, obj_ids, placement, face=None):
     """compute the lay-flat transform for the given placement mode.
     placement: 0=CPlane, 1=UnderPart, 2=Origin, 3=Select (same as Origin initially)
+    face: BrepFace — used to find true min Z for curved faces.
     returns Transform."""
 
     if placement == 0:
         # CPlane: orient to active construction plane
         cplane = sc.doc.Views.ActiveView.ActiveViewport.ConstructionPlane()
         rotation = Transform.Rotation(normal, cplane.ZAxis, centroid)
-        dist = Vector3d.Multiply(centroid - cplane.Origin, cplane.ZAxis)
+        # for curved faces, find the face point closest to the cplane
+        # (minimum distance along cplane Z axis). for planar, centroid works.
+        if face is not None:
+            sampled = face_min_along_axis(
+                face, rotation, cplane.Origin, cplane.ZAxis
+            )
+            if sampled is not None:
+                dist = sampled
+            else:
+                dist = Vector3d.Multiply(centroid - cplane.Origin, cplane.ZAxis)
+        else:
+            dist = Vector3d.Multiply(centroid - cplane.Origin, cplane.ZAxis)
         translation = Transform.Translation(
             Vector3d.Multiply(-dist, cplane.ZAxis)
         )
@@ -157,10 +197,13 @@ def compute_transform(normal, centroid, obj_ids, placement):
 
     rot_center = rotated_bbox.Center
 
-    # centroid is the rotation pivot so it doesn't move during rotation —
-    # use its Z to place the selected face exactly at Z=0
+    # find face Z after rotation. for planar faces centroid.Z is exact.
+    # for curved faces, sample the face to find the lowest Z.
     face_z = centroid.Z
-
+    if face is not None:
+        sampled = face_min_along_axis(face, rotation)
+        if sampled is not None:
+            face_z = sampled
     if placement == 1:
         # UnderPart: XY align with original bbox center, selected face at Z=0
         translation = Transform.Translation(
@@ -322,7 +365,7 @@ def lay_flat():
         pre.append(ref_id)
 
     # compute transform for the chosen placement mode
-    xform = compute_transform(normal, centroid, pre, placement_idx)
+    xform = compute_transform(normal, centroid, pre, placement_idx, face)
 
     # identify brep-type originals for selective color application
     brep_types = (ObjectType.Brep, ObjectType.Surface, ObjectType.Extrusion)
@@ -353,7 +396,9 @@ def lay_flat():
             if obj and obj.Geometry:
                 geo_list.append(obj.Geometry.Duplicate())
                 bbox.Union(obj.Geometry.GetBoundingBox(True))
-        base_center = bbox.Center
+        # use bbox center XY but Z=0 (the face level after initial transform)
+        # so the pick point anchors at the face, not the object bottom
+        base_center = Point3d(bbox.Center.X, bbox.Center.Y, 0.0)
 
         gp = PlaceGetPoint(geo_list, base_center)
         gp.SetCommandPrompt("pick placement point")

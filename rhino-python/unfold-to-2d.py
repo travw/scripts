@@ -734,7 +734,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
-                           partners=None):
+                           partners=None, quiet=False):
     """construct the neutral axis surface from plane geometry.
     for each planar face in ref_side, computes the offset plane (t/2 inward),
     then builds each face's boundary from:
@@ -744,6 +744,10 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
     tol = sc.doc.ModelAbsoluteTolerance
     offset_dist = thickness / 2.0
 
+    def _log(msg):
+        if not quiet:
+            print(msg)
+
     # step 1: compute offset plane for each face
     face_planes = {}
     face_normals = {}
@@ -752,18 +756,18 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         plane_tol = max(tol * 10, 0.01)  # loosen for near-planar faces
         rc, plane = face.TryGetPlane(plane_tol)
         if not rc:
-            print("warning: face {} is not planar, skipping".format(fi))
+            _log("warning: face {} is not planar, skipping".format(fi))
             continue
         # get outward normal for this face in the ref_side context
         face_brep = face.DuplicateFace(False)
         amp = AreaMassProperties.Compute(face_brep)
         if amp is None:
-            print("warning: face {} AreaMassProperties failed, skipping".format(fi))
+            _log("warning: face {} AreaMassProperties failed, skipping".format(fi))
             continue
         centroid = amp.Centroid
         rc2, u, v = face.ClosestPoint(centroid)
         if not rc2:
-            print("warning: face {} ClosestPoint failed, skipping".format(fi))
+            _log("warning: face {} ClosestPoint failed, skipping".format(fi))
             continue
         normal = face.NormalAt(u, v)
         if face.OrientationIsReversed:
@@ -818,12 +822,12 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         face_normals[fi] = normal
 
     if len(face_planes) < 1:
-        print("error: no planar faces found in ref_side")
+        _log("error: no planar faces found in ref_side")
         return None
 
     # step 2: build each neutral axis face using robust helpers
-    print("=== neutral axis construction ===")
-    print("  ref_side has {} faces, {} have offset planes".format(
+    _log("=== neutral axis construction ===")
+    _log("  ref_side has {} faces, {} have offset planes".format(
         ref_side.Faces.Count, len(face_planes)))
 
     # map ref_side face indices to original brep face indices by centroid matching
@@ -867,7 +871,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         if fi in orig_map:
             fl = "face {} (orig {})".format(fi, orig_map[fi])
         if face.OuterLoop is None:
-            print("  {}: no outer loop → SKIPPED".format(fl))
+            _log("  {}: no outer loop → SKIPPED".format(fl))
             nas_skip += 1
             continue
 
@@ -877,7 +881,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
             face_brep_area = face.DuplicateFace(False)
             amp_area = AreaMassProperties.Compute(face_brep_area)
             area_val = amp_area.Area if amp_area else 0
-            print("  {}: area {:.4f} < {:.4f} min → SKIPPED (transition face)".format(
+            _log("  {}: area {:.4f} < {:.4f} min → SKIPPED (transition face)".format(
                 fl, area_val, min_area))
             nas_skip += 1
             continue
@@ -888,7 +892,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
                                         original_brep=original_brep)
 
         if boundary is None:
-            print("  {}: boundary construction failed → SKIPPED".format(fl))
+            _log("  {}: boundary construction failed → SKIPPED".format(fl))
             nas_skip += 1
             continue
 
@@ -919,18 +923,18 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         if face_brep is not None:
             neutral_faces.append(face_brep)
             inner_str = " +{} holes".format(inner_count) if inner_count > 0 else ""
-            print("  {}: {} trims{} → OK".format(
+            _log("  {}: {} trims{} → OK".format(
                 fl, face.OuterLoop.Trims.Count, inner_str))
             nas_ok += 1
         else:
-            print("  {}: {} trims → CreatePlanarBreps FAILED".format(
+            _log("  {}: {} trims → CreatePlanarBreps FAILED".format(
                 fl, face.OuterLoop.Trims.Count))
             nas_skip += 1
 
-    print("  result: {} of {} faces OK".format(nas_ok, nas_ok + nas_skip))
+    _log("  result: {} of {} faces OK".format(nas_ok, nas_ok + nas_skip))
 
     if not neutral_faces:
-        print("error: could not create any neutral axis faces")
+        _log("error: could not create any neutral axis faces")
         return None
 
     # step 4: join all faces into a polysurface
@@ -951,10 +955,10 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
                 result = pieces[0]
                 for pi in range(1, len(pieces)):
                     result.Join(pieces[pi], tol * 10, True)
-                print("warning: neutral axis joined with loose tolerance ({} pieces)".format(
+                _log("warning: neutral axis joined with loose tolerance ({} pieces)".format(
                     len(pieces)))
         else:
-            print("warning: could not join neutral axis faces")
+            _log("warning: could not join neutral axis faces")
             result = neutral_faces[0]
 
     return result
@@ -1675,20 +1679,34 @@ def unfold_to_2d():
 
     # step 4: join sheet faces -> 2 polysurfaces (graph-colored by partner pairs)
     # ref_side contains the picked face, other_side is the opposite
-    ref_side, other_side = join_sheet_faces(brep, sheet_faces, partners, face_index)
-    if ref_side is None:
+    side_a, side_b = join_sheet_faces(brep, sheet_faces, partners, face_index)
+    if side_a is None:
         return
 
-    print("  ref side: {} faces, other side: {} faces".format(
-        ref_side.Faces.Count, other_side.Faces.Count))
+    print("  side A: {} faces, side B: {} faces".format(
+        side_a.Faces.Count, side_b.Faces.Count))
 
-    # step 6: construct neutral axis (prints its own === header ===)
+    # try NAS from both sides, use whichever produces more faces
+    nas_a = construct_neutral_axis(side_a, thickness, original_brep=brep,
+                                    other_side=side_b, partners=partners, quiet=True)
+    nas_b = construct_neutral_axis(side_b, thickness, original_brep=brep,
+                                    other_side=side_a, partners=partners, quiet=True)
+    count_a = nas_a.Faces.Count if nas_a else 0
+    count_b = nas_b.Faces.Count if nas_b else 0
+
+    if count_a >= count_b:
+        ref_side, other_side = side_a, side_b
+    else:
+        ref_side, other_side = side_b, side_a
+
+    # rebuild NAS from the winning side with output visible
     neutral_axis = construct_neutral_axis(ref_side, thickness, original_brep=brep,
                                           other_side=other_side,
                                           partners=partners)
     if neutral_axis is None:
         return
-    print("  neutral axis: {} faces".format(neutral_axis.Faces.Count))
+    print("  neutral axis: {} faces (other side had {})".format(
+        neutral_axis.Faces.Count, min(count_a, count_b)))
 
     # step 7: identify bends
     print("=== bends ===")
