@@ -585,88 +585,52 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         # no bends — raw loop is already the boundary
         return raw_loop
 
-    # step 4: trim the raw loop at each PP axis
-    # for each PP line, find where the loop crosses it, split, keep segments
-    # on our side (toward centroid), replace overshoot with PP line segments
-    trimmed = raw_loop
+    # step 4: trim the raw loop at each PP axis using Brep.Trim
+    # create a planar brep from the raw loop, then trim against each PP
+    # half-plane. Brep.Trim handles all topology robustly.
+    raw_breps = Brep.CreatePlanarBreps([raw_loop], tol)
+    if not raw_breps or len(raw_breps) == 0:
+        # try loose tolerance
+        raw_breps = Brep.CreatePlanarBreps([raw_loop], tol * 100)
+    if not raw_breps or len(raw_breps) == 0:
+        return raw_loop
+
+    trimmed_brep = raw_breps[0]
     for tgt, pp_line in bend_map.items():
-        # create a trim plane: contains the PP line, perpendicular to NAP
+        # trim plane: contains PP line, perpendicular to NAP, normal toward centroid
         pp_dir = Vector3d(pp_line.Direction)
         pp_dir.Unitize()
-        # normal of the trim plane: perpendicular to PP line and to NAP normal
         trim_normal = Vector3d.CrossProduct(pp_dir, nap_plane.Normal)
         trim_normal.Unitize()
-        # orient so trim_normal points toward our centroid
         pp_mid = pp_line.PointAt(pp_line.ClosestParameter(centroid_nap))
-        to_centroid = centroid_nap - pp_mid
-        if Vector3d.Multiply(to_centroid, trim_normal) < 0:
+        if Vector3d.Multiply(centroid_nap - pp_mid, trim_normal) < 0:
             trim_normal = -trim_normal
-        trim_plane = Plane(pp_line.PointAt(0), trim_normal)
+        trim_plane = Plane(pp_mid, trim_normal)
 
-        # find intersection points of the loop with a long PP line curve
-        pp_crv = LineCurve(Line(
-            pp_line.PointAt(pp_line.ClosestParameter(centroid_nap) - 1000),
-            pp_line.PointAt(pp_line.ClosestParameter(centroid_nap) + 1000)))
-        events = Intersection.CurveCurve(trimmed, pp_crv, tol, tol * 10)
-        if events is None or events.Count < 2:
-            continue
+        # trim both orientations and pick the piece containing the centroid
+        pieces_pos = trimmed_brep.Trim(trim_plane, tol)
+        trim_plane_flip = Plane(pp_mid, -trim_normal)
+        pieces_neg = trimmed_brep.Trim(trim_plane_flip, tol)
+        all_pieces = list(pieces_pos or []) + list(pieces_neg or [])
+        if all_pieces:
+            best_piece = None
+            best_d = float("inf")
+            for piece in all_pieces:
+                cp = piece.ClosestPoint(centroid_nap)
+                d = centroid_nap.DistanceTo(cp)
+                if d < best_d:
+                    best_d = d
+                    best_piece = piece
+            if best_piece is not None:
+                trimmed_brep = best_piece
 
-        # collect crossing parameters on the main curve, sorted
-        params = []
-        for ei in range(events.Count):
-            ev = events[ei]
-            params.append(ev.ParameterA)
-        params.sort()
+    # extract boundary curve from trimmed brep
+    if trimmed_brep.Faces.Count > 0:
+        boundary = trimmed_brep.Faces[0].OuterLoop.To3dCurve()
+        if boundary is not None and boundary.IsClosed:
+            return boundary
 
-        if len(params) < 2:
-            continue
-
-        # split the curve at crossing points
-        splits = trimmed.Split(params)
-        if splits is None or len(splits) < 2:
-            continue
-
-        # keep segments on our side (centroid side of PP line)
-        keep = []
-        pp_segments = []
-        for seg in splits:
-            seg_mid = seg.PointAt(seg.Domain.Mid)
-            side = Vector3d.Multiply(seg_mid - pp_mid, trim_normal)
-            if side >= -tol:
-                # on our side — keep
-                keep.append(seg)
-            else:
-                # overshoot — replace with PP line segment
-                pp_t0 = pp_line.ClosestParameter(seg.PointAtStart)
-                pp_t1 = pp_line.ClosestParameter(seg.PointAtEnd)
-                pp_seg = LineCurve(Line(pp_line.PointAt(pp_t0), pp_line.PointAt(pp_t1)))
-                if pp_seg.GetLength() > tol:
-                    pp_segments.append(pp_seg)
-
-        # rejoin: kept segments + PP replacement segments
-        all_segs = list(keep) + pp_segments
-        if len(all_segs) < 2:
-            continue
-        rejoined = Curve.JoinCurves(all_segs, tol * 10)
-        if rejoined and len(rejoined) > 0:
-            # find the closed one (or closest to closed)
-            for rj in rejoined:
-                if rj.IsClosed:
-                    trimmed = rj
-                    break
-            else:
-                # try to close the longest one
-                longest = max(rejoined, key=lambda c: c.GetLength())
-                if longest.PointAtStart.DistanceTo(longest.PointAtEnd) < tol * 100:
-                    longest = longest.ToNurbsCurve()
-                    longest.SetEndPoint(longest.PointAtStart)
-                    if longest.IsClosed:
-                        trimmed = longest
-
-    # project to NAP for exact planarity
-    if not trimmed.IsClosed:
-        return fallback
-    return trimmed
+    return raw_loop
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
