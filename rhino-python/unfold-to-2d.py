@@ -670,7 +670,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             pp_dir = Vector3d(pp_line.Direction)
             pp_dir.Unitize()
             dot = abs(Vector3d.Multiply(seg_dir, pp_dir))
-            if dot < 0.9:
+            if dot < 0.999:
                 continue  # angled segment (corner/notch) — don't snap
             # snap both endpoints to PP line
             t0 = pp_line.ClosestParameter(pts[i])
