@@ -11,9 +11,14 @@ options (on face-pick prompt):
     CPlane    - orient to active construction plane (default)
     UnderPart - lay on world XY, bbox center XY-aligned with original
     Origin    - lay on world XY, centered at world origin
+  Color=Yes/No   apply custom display color to output objects (sticky)
+    first time: opens color picker. remembered for future runs.
+    PickColor  - (when Color=Yes) re-open picker to change color
 
 alias: lay-flat -> _-RunPythonScript "path/to/lay-flat.py"
 """
+
+import System.Drawing
 
 import Rhino
 import rhinoscriptsyntax as rs
@@ -185,13 +190,21 @@ def lay_flat():
     # read sticky settings
     copy_mode = sc.sticky.get("lay_flat_copy", False)
     placement_idx = sc.sticky.get("lay_flat_placement", 0)
+    color_on = sc.sticky.get("lay_flat_color_on", False)
+    color_rgb = sc.sticky.get("lay_flat_color_rgb", None)  # (r, g, b) or None
 
     # options step: let user toggle settings, press Enter to proceed
     while True:
         gopt = GetOption()
+        color_tag = ""
+        if color_on and color_rgb:
+            color_tag = " #{:02X}{:02X}{:02X}".format(*color_rgb)
         gopt.SetCommandPrompt(
-            "lay-flat options (Copy={} Place={}) press Enter to pick face".format(
-                "Yes" if copy_mode else "No", PLACEMENTS[placement_idx]
+            "lay-flat options (Copy={} Place={} Color={}{}) press Enter to pick face".format(
+                "Yes" if copy_mode else "No",
+                PLACEMENTS[placement_idx],
+                "Yes" if color_on else "No",
+                color_tag,
             )
         )
         gopt.AcceptNothing(True)
@@ -199,16 +212,43 @@ def lay_flat():
         copy_toggle = OptionToggle(copy_mode, "No", "Yes")
         gopt.AddOptionToggle("Copy", copy_toggle)
         gopt.AddOptionList("Place", PLACEMENTS, placement_idx)
+        color_toggle = OptionToggle(color_on, "No", "Yes")
+        gopt.AddOptionToggle("Color", color_toggle)
+        pick_idx = -1
+        if color_on:
+            pick_idx = gopt.AddOption("PickColor")
 
         result = gopt.Get()
 
         if result == GetResult.Option:
             copy_mode = copy_toggle.CurrentValue
+            old_color_on = color_on
+            color_on = color_toggle.CurrentValue
+
             opt = gopt.Option()
             if opt and opt.CurrentListOptionIndex >= 0:
                 placement_idx = opt.CurrentListOptionIndex
+
+            # user just turned color on and has no saved color — show picker
+            if color_on and not old_color_on and not color_rgb:
+                picked = rs.GetColor()
+                if picked:
+                    color_rgb = (picked[0], picked[1], picked[2])
+                else:
+                    color_on = False  # cancelled picker, leave color off
+
+            # user clicked PickColor
+            if color_on and opt and opt.Index == pick_idx:
+                default = System.Drawing.Color.FromArgb(*color_rgb) if color_rgb else None
+                picked = rs.GetColor(default)
+                if picked:
+                    color_rgb = (picked[0], picked[1], picked[2])
+
             sc.sticky["lay_flat_copy"] = copy_mode
             sc.sticky["lay_flat_placement"] = placement_idx
+            sc.sticky["lay_flat_color_on"] = color_on
+            if color_rgb:
+                sc.sticky["lay_flat_color_rgb"] = color_rgb
             continue
 
         if result == GetResult.Nothing:
@@ -267,6 +307,17 @@ def lay_flat():
         if new_id:
             result_ids.append(new_id)
 
+    # apply custom color if enabled
+    if color_on and color_rgb:
+        obj_color = System.Drawing.Color.FromArgb(*color_rgb)
+        for rid in result_ids:
+            obj = sc.doc.Objects.FindId(rid)
+            if obj:
+                attr = obj.Attributes.Duplicate()
+                attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+                attr.ObjectColor = obj_color
+                sc.doc.Objects.ModifyAttributes(rid, attr, True)
+
     # select output geometry
     for rid in result_ids:
         sc.doc.Objects.Select(rid)
@@ -274,7 +325,10 @@ def lay_flat():
     sc.doc.Views.Redraw()
     tag = " (copy)" if copy_mode else ""
     mode = PLACEMENTS[placement_idx]
-    print("laid flat{}: {} object(s) [{}]".format(tag, len(result_ids), mode))
+    color_tag = ""
+    if color_on and color_rgb:
+        color_tag = " color=#{:02X}{:02X}{:02X}".format(*color_rgb)
+    print("laid flat{}: {} object(s) [{}]{}".format(tag, len(result_ids), mode, color_tag))
 
 
 if __name__ == "__main__":

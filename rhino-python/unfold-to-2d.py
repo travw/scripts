@@ -1131,7 +1131,7 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
             i, info["angle"], fa, fb, axis_line.Length))
 
 
-def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos):
+def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.125):
     """unroll the NAS by rotating planar faces around bend axes.
     bypasses Rhino's Unroller which can't handle NAS edge mismatches.
     returns (flat_brep, outside_curves, inside_curves,
@@ -1188,7 +1188,8 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos):
             seed = fi
             break
     seed_plane = face_planes[seed]
-    transforms[seed] = Transform.PlaneToPlane(seed_plane, Plane.WorldXY)
+    transforms[seed] = Transform.Identity
+    flat_normal = seed_plane.Normal  # target normal for all flattened faces
     visited.add(seed)
 
     bfs_path = ["face {}".format(seed)]
@@ -1214,13 +1215,13 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos):
             neighbor_plane = Plane(face_planes[neighbor])
             neighbor_plane.Transform(current_xform)
 
-            # compute rotation to flatten neighbor normal onto Z axis
+            # compute rotation to flatten neighbor normal onto seed face normal
             n_neighbor = neighbor_plane.Normal
-            z = Vector3d.ZAxis
+            target = Vector3d(flat_normal)
 
             # project both onto plane perpendicular to axis
             n_perp = n_neighbor - axis_dir * Vector3d.Multiply(n_neighbor, axis_dir)
-            z_perp = z - axis_dir * Vector3d.Multiply(z, axis_dir)
+            z_perp = target - axis_dir * Vector3d.Multiply(target, axis_dir)
 
             n_len = n_perp.Length
             z_len = z_perp.Length
@@ -1305,104 +1306,51 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos):
             ink_copy.Transform(transforms[best_fi])
             flat_ink_curves.append(ink_copy)
 
-    # --- extract boundary from flat faces ---
-    # collect outer loops from each flat face
-    outer_loops = []
-    inner_loops = []
-    for fb in flat_faces:
-        for fi_flat in range(fb.Faces.Count):
-            face = fb.Faces[fi_flat]
-            for li in range(face.Loops.Count):
-                loop = face.Loops[li]
-                crv = loop.To3dCurve()
-                if crv is None:
-                    continue
-                if not crv.IsClosed:
-                    gap = crv.PointAtStart.DistanceTo(crv.PointAtEnd)
-                    if gap < tol * 100:
-                        rejoined = Curve.JoinCurves([crv], tol * 100)
-                        if rejoined and len(rejoined) > 0 and rejoined[0].IsClosed:
-                            crv = rejoined[0]
-                        else:
-                            continue
-                    else:
-                        continue
-                if loop.LoopType == BrepLoopType.Outer:
-                    outer_loops.append(crv)
-                else:
-                    inner_loops.append(crv)
+    # --- bake flat faces directly for visual verification ---
+    bake_layer = "03 - Bake"
+    if not rs.IsLayer(bake_layer):
+        rs.AddLayer(bake_layer)
+    colors = [
+        System.Drawing.Color.FromArgb(255, 100, 100),  # red
+        System.Drawing.Color.FromArgb(100, 255, 100),  # green
+        System.Drawing.Color.FromArgb(100, 100, 255),  # blue
+        System.Drawing.Color.FromArgb(255, 255, 100),  # yellow
+        System.Drawing.Color.FromArgb(255, 100, 255),  # magenta
+        System.Drawing.Color.FromArgb(100, 255, 255),  # cyan
+        System.Drawing.Color.FromArgb(255, 180, 100),  # orange
+        System.Drawing.Color.FromArgb(180, 100, 255),  # purple
+    ]
+    attr = Rhino.DocObjects.ObjectAttributes()
+    attr.LayerIndex = sc.doc.Layers.FindByFullPath(bake_layer, -1)
+    baked_guids = []
+    layer_idx = sc.doc.Layers.FindByFullPath(bake_layer, -1)
+    for i, fb in enumerate(flat_faces):
+        a = Rhino.DocObjects.ObjectAttributes()
+        a.LayerIndex = layer_idx
+        a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+        a.ObjectColor = colors[i % len(colors)]
+        guid = sc.doc.Objects.AddBrep(fb, a)
+        if guid != System.Guid.Empty:
+            baked_guids.append(guid)
+    # bake bend curves too
+    for bc in flat_bend_curves:
+        a = Rhino.DocObjects.ObjectAttributes()
+        a.LayerIndex = layer_idx
+        a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+        a.ObjectColor = System.Drawing.Color.Black
+        guid = sc.doc.Objects.AddCurve(bc, a)
+        if guid != System.Guid.Empty:
+            baked_guids.append(guid)
+    print("  baked {} flat faces + {} bend curves to '{}'".format(
+        len(flat_faces), len(flat_bend_curves), bake_layer))
 
-    print("  flat faces: {}, outer loops: {}, inner loops: {}".format(
-        len(flat_faces), len(outer_loops), len(inner_loops)))
-
-    # boolean union of outer loops to get combined boundary
+    # still return expected tuple so caller doesn't crash
     outside_curves = []
-    inside_curves = list(inner_loops)  # inner loops are always inside cuts
-
-    if len(outer_loops) == 1:
-        outside_curves = outer_loops
-    elif len(outer_loops) > 1:
-        # try Curve.CreateBooleanUnion
-        try:
-            union = Curve.CreateBooleanUnion(outer_loops, tol)
-            if union and len(union) > 0:
-                closed_union = [c for c in union if c.IsClosed]
-                if closed_union:
-                    # largest = outside, rest = inside (holes created by union)
-                    areas = []
-                    for c in closed_union:
-                        amp = AreaMassProperties.Compute(c)
-                        areas.append((amp.Area if amp else 0, c))
-                    areas.sort(key=lambda x: x[0], reverse=True)
-                    outside_curves = [areas[0][1]]
-                    inside_curves.extend(a[1] for a in areas[1:])
-                    print("  boolean union: {} curves".format(len(closed_union)))
-        except Exception as e:
-            print("  boolean union failed: {}".format(e))
-
-        # fallback: rs.CurveBooleanUnion via temp doc objects
-        if not outside_curves:
-            print("  fallback: rs.CurveBooleanUnion")
-            temp_ids = []
-            for crv in outer_loops:
-                guid = sc.doc.Objects.AddCurve(crv)
-                if guid != System.Guid.Empty:
-                    temp_ids.append(guid)
-            if temp_ids:
-                result_ids = rs.CurveBooleanUnion(temp_ids)
-                if result_ids:
-                    for rid in result_ids:
-                        rcrv = rs.coercecurve(rid)
-                        if rcrv and rcrv.IsClosed:
-                            outside_curves.append(rcrv.DuplicateCurve())
-                    rs.DeleteObjects(result_ids)
-                # clean up temp curves
-                for tid in temp_ids:
-                    sc.doc.Objects.Delete(tid, True)
-
-        # second fallback: just use largest loop
-        if not outside_curves and outer_loops:
-            print("  fallback: largest outer loop")
-            areas = []
-            for c in outer_loops:
-                amp = AreaMassProperties.Compute(c)
-                areas.append((amp.Area if amp else 0, c))
-            areas.sort(key=lambda x: x[0], reverse=True)
-            outside_curves = [areas[0][1]]
-
-    # --- join flat faces into a single brep for alignment ---
-    flat_brep = None
-    if flat_faces:
-        joined = Brep.JoinBreps(flat_faces, tol * 100)
-        if joined and len(joined) >= 1:
-            flat_brep = joined[0]
-        else:
-            flat_brep = flat_faces[0]
-
+    inside_curves = []
+    flat_brep = flat_faces[0] if flat_faces else None
     if flat_brep is None:
         print("error: no flat geometry produced")
         return None
-
     return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves
 
 
@@ -1754,7 +1702,7 @@ def unfold_to_2d():
     ink_curves = projected_ink
     # step 11: unroll by face rotation
     print("=== unroll ===")
-    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos)
+    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos, thickness)
     if unroll_result is None:
         return
     flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink = unroll_result
