@@ -1221,34 +1221,45 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
             axis_dir = Vector3d(p2 - p1)
             axis_dir.Unitize()
 
-            # use known bend angle — try both rotation signs
-            # pick the one that moves the neighbor AWAY from current (not on top)
-            bend_angle_rad = math.radians(180.0 - bi["angle"])
-            flatten_angle = bend_angle_rad
+            # direct rotation: compute exact angle to align neighbor
+            # normal with flat_normal — no stored angles or sign guessing
+            nei_n = xform_normal(face_planes[neighbor].Normal, current_xform)
 
-            # get current face centroid in flat coordinates
+            # project both normals onto plane perpendicular to bend axis
+            nei_proj = nei_n - axis_dir * Vector3d.Multiply(nei_n, axis_dir)
+            flat_proj = flat_normal - axis_dir * Vector3d.Multiply(flat_normal, axis_dir)
+            nei_proj.Unitize()
+            flat_proj.Unitize()
+
+            # signed angle from nei_proj to flat_proj around axis_dir
+            dot_val = Vector3d.Multiply(nei_proj, flat_proj)
+            cross = Vector3d.CrossProduct(nei_proj, flat_proj)
+            sin_val = Vector3d.Multiply(cross, axis_dir)
+            flatten_angle = math.atan2(sin_val, dot_val)
+
+            rot = Transform.Rotation(flatten_angle, axis_dir, p1)
+            best_combined = Transform.Multiply(rot, current_xform)
+            chosen_angle = flatten_angle
+
+            # verify neighbor unfolds to opposite side of bend edge
             cur_amp = AreaMassProperties.Compute(nas.Faces[current].DuplicateFace(False))
             cur_c = Point3d(cur_amp.Centroid)
             cur_c.Transform(current_xform)
-
-            # get neighbor centroid in 3D
             nei_amp = AreaMassProperties.Compute(nas.Faces[neighbor].DuplicateFace(False))
-            nei_c_3d = nei_amp.Centroid
+            nei_c = Point3d(nei_amp.Centroid)
+            nei_c.Transform(best_combined)
 
-            best_combined = None
-            best_dist = -1.0
-            chosen_angle = 0
-            for sign in [1.0, -1.0]:
-                rot = Transform.Rotation(sign * flatten_angle, axis_dir, p1)
-                candidate = Transform.Multiply(rot, current_xform)
-                nei_c = Point3d(nei_c_3d)
-                nei_c.Transform(candidate)
-                # correct rotation unfolds AWAY — maximize centroid distance
-                dist = cur_c.DistanceTo(nei_c)
-                if dist > best_dist:
-                    best_dist = dist
-                    best_combined = candidate
-                    chosen_angle = sign * flatten_angle
+            # side test: cross(axis, centroid_vec) · flat_normal gives signed side
+            cur_side = Vector3d.Multiply(
+                Vector3d.CrossProduct(axis_dir, Vector3d(cur_c - p1)), flat_normal)
+            nei_side = Vector3d.Multiply(
+                Vector3d.CrossProduct(axis_dir, Vector3d(nei_c - p1)), flat_normal)
+
+            if cur_side * nei_side > 0:
+                # same side — flip by adding pi
+                rot2 = Transform.Rotation(flatten_angle + math.pi, axis_dir, p1)
+                best_combined = Transform.Multiply(rot2, current_xform)
+                chosen_angle = flatten_angle + math.pi
 
             transforms[neighbor] = best_combined
             visited.add(neighbor)
