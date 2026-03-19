@@ -109,7 +109,7 @@ bbox '_boundingbox
 pp '_PushPull
 db _DupBorder
 to '_TextObject
-su -runpythonscript "C:\Users\travi\AppData\Roaming\McNeel\Rhinoceros\8.0\scripts\select-by-user-text.py" build
+su _-runpythonscript "C:\Users\travi\AppData\Roaming\McNeel\Rhinoceros\8.0\scripts\select-by-user-text.py" build
 pm _PackageManager
 sev '_setview
 cd _ClippingDrawings
@@ -145,13 +145,13 @@ ws _worksession
 cdv '_setdisplaymode _coloreddarkmode
 q _history _record _enter
 cv '_setdisplaymode _coloredview
-cl -runpythonscript "C:\Sites\scripts\rhino-python\collapse-layers.py"
-el -runpythonscript "C:\Sites\scripts\rhino-python\expand-layers.py"
+cl _-runpythonscript "C:\Sites\scripts\rhino-python\collapse-layers.py"
+el _-runpythonscript "C:\Sites\scripts\rhino-python\expand-layers.py"
 oc _offsetcrvonsrf
 cb _curveboolean
 di _distribute _d
-d3 -runpythonscript "C:\Sites\scripts\rhino-python\dim-3d.py"
-brfr -runpythonscript "C:\Sites\scripts\rhino-python\toggle-layout-darkmode.py"
+d3 _-runpythonscript "C:\Sites\scripts\rhino-python\dim-3d.py"
+brfr _-runpythonscript "C:\Sites\scripts\rhino-python\toggle-layout-darkmode.py"
 re _NoEcho ! -_Layer _Current "02 - Reference" _EnterEnd
 pt _point
 a _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd
@@ -159,5 +159,6 @@ il _invert _lock
 can _curvatureanalysis
 rc _rotatecamera
 ocs _offsetcrvonsrf
-ae -runpythonscript "G:\My Drive\RaiderDrive\MACK\Python Scripts\Anglev2w-txt.py"
-2ds -runpythonscript "C:\Sites\scripts\rhino-python\2D-geo-sublayers.py" build
+ae _-runpythonscript "G:\My Drive\RaiderDrive\MACK\Python Scripts\Anglev2w-txt.py"
+2ds _-runpythonscript "C:\Sites\scripts\rhino-python\2D-geo-sublayers.py" build
+nas _-runpythonscript "C:\Sites\scripts\rhino-python\neutral-axis-surfaces.py"
