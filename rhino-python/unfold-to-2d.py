@@ -1131,7 +1131,7 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
             i, info["angle"], fa, fb, axis_line.Length))
 
 
-def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.125):
+def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.125, picked_na_face=0):
     """unroll the NAS by rotating planar faces around bend axes.
     bypasses Rhino's Unroller which can't handle NAS edge mismatches.
     returns (flat_brep, outside_curves, inside_curves,
@@ -1181,8 +1181,8 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     transforms = {}  # face_idx -> Transform (3D -> flat XY)
     visited = set()
 
-    # seed: face 0 -> WorldXY
-    seed = 0
+    # seed: picked NAS face stays in place
+    seed = picked_na_face if picked_na_face in face_planes else 0
     if seed not in face_planes:
         for fi in face_planes:
             seed = fi
@@ -1191,6 +1191,16 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     transforms[seed] = Transform.Identity
     flat_normal = seed_plane.Normal  # target normal for all flattened faces
     visited.add(seed)
+
+    # helper: transform a direction vector through a transform
+    def xform_normal(n, xf):
+        tip = Point3d(n.X, n.Y, n.Z)
+        org = Point3d(0, 0, 0)
+        tip.Transform(xf)
+        org.Transform(xf)
+        v = Vector3d(tip - org)
+        v.Unitize()
+        return v
 
     bfs_path = ["face {}".format(seed)]
     queue = [seed]
@@ -1211,49 +1221,40 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
             axis_dir = Vector3d(p2 - p1)
             axis_dir.Unitize()
 
-            # transform the neighbor's plane to current state
-            neighbor_plane = Plane(face_planes[neighbor])
-            neighbor_plane.Transform(current_xform)
+            # use known bend angle — try both rotation signs
+            # pick the one that moves the neighbor AWAY from current (not on top)
+            bend_angle_rad = math.radians(bi["angle"])
+            flatten_angle = bend_angle_rad
 
-            # compute rotation to flatten neighbor normal onto seed face normal
-            n_neighbor = neighbor_plane.Normal
-            target = Vector3d(flat_normal)
+            # get current face centroid in flat coordinates
+            cur_amp = AreaMassProperties.Compute(nas.Faces[current].DuplicateFace(False))
+            cur_c = Point3d(cur_amp.Centroid)
+            cur_c.Transform(current_xform)
 
-            # project both onto plane perpendicular to axis
-            n_perp = n_neighbor - axis_dir * Vector3d.Multiply(n_neighbor, axis_dir)
-            z_perp = target - axis_dir * Vector3d.Multiply(target, axis_dir)
+            # get neighbor centroid in 3D
+            nei_amp = AreaMassProperties.Compute(nas.Faces[neighbor].DuplicateFace(False))
+            nei_c_3d = nei_amp.Centroid
 
-            n_len = n_perp.Length
-            z_len = z_perp.Length
-            if n_len < 1e-10 or z_len < 1e-10:
-                # normals parallel to axis — no rotation needed
-                transforms[neighbor] = Transform(current_xform)
-                visited.add(neighbor)
-                queue.append(neighbor)
-                bfs_path.append("face {} (0.0°)".format(neighbor))
-                continue
+            best_combined = None
+            best_dist = -1.0
+            chosen_angle = 0
+            for sign in [1.0, -1.0]:
+                rot = Transform.Rotation(sign * flatten_angle, axis_dir, p1)
+                candidate = Transform.Multiply(rot, current_xform)
+                nei_c = Point3d(nei_c_3d)
+                nei_c.Transform(candidate)
+                # correct rotation unfolds AWAY — maximize centroid distance
+                dist = cur_c.DistanceTo(nei_c)
+                if dist > best_dist:
+                    best_dist = dist
+                    best_combined = candidate
+                    chosen_angle = sign * flatten_angle
 
-            n_perp.Unitize()
-            z_perp.Unitize()
-
-            cos_angle = max(-1.0, min(1.0, Vector3d.Multiply(n_perp, z_perp)))
-            angle = math.acos(cos_angle)
-
-            # determine sign from cross product
-            cross = Vector3d.CrossProduct(n_perp, z_perp)
-            if Vector3d.Multiply(cross, axis_dir) < 0:
-                angle = -angle
-
-            rotation = Transform.Rotation(angle, axis_dir, p1)
-
-            # combined: first apply current_xform (3D -> current flat),
-            # then rotation (flatten neighbor around axis)
-            combined = Transform.Multiply(rotation, current_xform)
-
-            transforms[neighbor] = combined
+            transforms[neighbor] = best_combined
             visited.add(neighbor)
             queue.append(neighbor)
-            bfs_path.append("face {} ({:.1f}°)".format(neighbor, math.degrees(angle)))
+            bfs_path.append("face {} ({:.1f}°)".format(
+                neighbor, math.degrees(chosen_angle)))
 
     print("  BFS: {}".format(" → ".join(bfs_path)))
     if len(transforms) < n_faces:
@@ -1262,20 +1263,21 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
 
     # --- transform face breps to flat ---
     flat_faces = []
+    fn = flat_normal
+    print("  target normal: ({:.4f},{:.4f},{:.4f})".format(fn.X, fn.Y, fn.Z))
     for fi in range(n_faces):
         if fi not in transforms:
             continue
+        result_n = xform_normal(face_planes[fi].Normal, transforms[fi])
+        dot = Vector3d.Multiply(result_n, flat_normal)
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
         flat_faces.append(face_brep)
-
-    # diagnostic: print flat face info
-    for fb in flat_faces:
-        amp = AreaMassProperties.Compute(fb)
-        if amp:
-            c = amp.Centroid
-            print("    flat face: area={:.1f}, centroid=({:.2f},{:.2f},{:.4f})".format(
-                amp.Area, c.X, c.Y, c.Z))
+        amp = AreaMassProperties.Compute(face_brep)
+        seed_tag = " (SEED)" if fi == seed else ""
+        print("    face {}: n=({:.4f},{:.4f},{:.4f}) dot={:.4f} area={:.1f}{}".format(
+            fi, result_n.X, result_n.Y, result_n.Z, dot,
+            amp.Area if amp else 0, seed_tag))
 
     # --- transform bend curves ---
     flat_bend_curves = []
@@ -1700,9 +1702,22 @@ def unfold_to_2d():
         else:
             projected_ink.append((guid, crv))
     ink_curves = projected_ink
+    # find NAS face closest to picked face (needed for seed + alignment)
+    picked_centroid, _ = get_face_outward_normal(brep, face_index)
+    picked_na_face = 0
+    if picked_centroid is not None:
+        best_dist = float("inf")
+        for nfi in range(neutral_axis.Faces.Count):
+            nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
+            nf_amp = AreaMassProperties.Compute(nf_brep)
+            if nf_amp is not None:
+                d = picked_centroid.DistanceTo(nf_amp.Centroid)
+                if d < best_dist:
+                    best_dist = d
+                    picked_na_face = nfi
     # step 11: unroll by face rotation
     print("=== unroll ===")
-    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos, thickness)
+    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos, thickness, picked_na_face)
     if unroll_result is None:
         return
     flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink = unroll_result

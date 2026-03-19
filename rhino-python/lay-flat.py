@@ -7,10 +7,11 @@ usage:
 
 options (on face-pick prompt):
   Copy=Yes/No    copy objects instead of moving them (sticky)
-  Place=CPlane/UnderPart/Origin   where to place result (sticky)
+  Place=CPlane/UnderPart/Origin/Select   where to place result (sticky)
     CPlane    - orient to active construction plane (default)
     UnderPart - lay on world XY, bbox center XY-aligned with original
     Origin    - lay on world XY, centered at world origin
+    Select    - lay flat then pick a point to place (live wireframe preview)
   Color=Yes/No   apply custom display color to output objects (sticky)
     first time: opens color picker. remembered for future runs.
     PickColor  - (when Color=Yes) re-open picker to change color
@@ -33,10 +34,34 @@ from Rhino.Geometry import (
 )
 from Rhino.Geometry.Intersect import Intersection
 from Rhino.Input import GetResult
-from Rhino.Input.Custom import GetObject, GetOption, OptionToggle
+from Rhino.Input.Custom import GetObject, GetOption, GetPoint, OptionToggle
 from Rhino.DocObjects import ObjectType
 
-PLACEMENTS = ["CPlane", "UnderPart", "Origin"]
+PLACEMENTS = ["CPlane", "UnderPart", "Origin", "Select"]
+PREVIEW_COLOR = System.Drawing.Color.FromArgb(180, 180, 180)
+
+
+class PlaceGetPoint(GetPoint):
+    """GetPoint with dynamic wireframe preview of geometry following the cursor."""
+
+    def __init__(self, geo_list, base_center):
+        super().__init__()
+        self.geo_list = geo_list  # list of Brep/Curve/etc geometry
+        self.base_center = base_center  # Point3d — current bbox center of geo
+
+    def OnDynamicDraw(self, e):
+        offset = e.CurrentPoint - self.base_center
+        xf = Transform.Translation(Vector3d(offset))
+        for geo in self.geo_list:
+            moved = geo.Duplicate()
+            moved.Transform(xf)
+            if isinstance(moved, Brep):
+                e.Display.DrawBrepWires(moved, PREVIEW_COLOR)
+            else:
+                try:
+                    e.Display.DrawObject(moved, xf)
+                except Exception:
+                    pass
 
 
 def face_centroid_and_normal(brep, face):
@@ -91,7 +116,7 @@ def face_centroid_and_normal(brep, face):
 
 def compute_transform(normal, centroid, obj_ids, placement):
     """compute the lay-flat transform for the given placement mode.
-    placement: 0=CPlane, 1=UnderPart, 2=Origin
+    placement: 0=CPlane, 1=UnderPart, 2=Origin, 3=Select (same as Origin initially)
     returns Transform."""
 
     if placement == 0:
@@ -144,7 +169,7 @@ def compute_transform(normal, centroid, obj_ids, placement):
             -face_z,
         )
     else:
-        # Origin: center at world origin, selected face at Z=0
+        # Origin / Select: center at world origin, selected face at Z=0
         translation = Transform.Translation(
             -rot_center.X,
             -rot_center.Y,
@@ -306,6 +331,39 @@ def lay_flat():
         new_id = sc.doc.Objects.Transform(obj_id, xform, delete_original)
         if new_id:
             result_ids.append(new_id)
+
+    # Select mode: let user pick placement point with live preview
+    if placement_idx == 3 and result_ids:
+        # gather transformed geometry for preview
+        geo_list = []
+        bbox = BoundingBox.Empty
+        for rid in result_ids:
+            obj = sc.doc.Objects.FindId(rid)
+            if obj and obj.Geometry:
+                geo_list.append(obj.Geometry.Duplicate())
+                bbox.Union(obj.Geometry.GetBoundingBox(True))
+        base_center = bbox.Center
+
+        gp = PlaceGetPoint(geo_list, base_center)
+        gp.SetCommandPrompt("pick placement point")
+        gp.Get()
+        if gp.CommandResult() != Rhino.Commands.Result.Success:
+            # cancelled — undo the transform by deleting results, but only if copied
+            if copy_mode:
+                for rid in result_ids:
+                    sc.doc.Objects.Delete(rid, True)
+            sc.doc.Views.Redraw()
+            print("placement cancelled")
+            return
+
+        pick_pt = gp.Point()
+        move = Transform.Translation(Vector3d(pick_pt - base_center))
+        moved_ids = []
+        for rid in result_ids:
+            new_id = sc.doc.Objects.Transform(rid, move, True)
+            if new_id:
+                moved_ids.append(new_id)
+        result_ids = moved_ids
 
     # apply custom color if enabled
     if color_on and color_rgb:
