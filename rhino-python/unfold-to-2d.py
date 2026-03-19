@@ -32,6 +32,7 @@ from Rhino.Geometry import (
     Line,
     Plane,
     Point3d,
+    PointContainment,
     PointFaceRelation,
     PolylineCurve,
     TextEntity,
@@ -468,27 +469,84 @@ def _make_planar(curves, tol):
 
 
 def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
-                        ref_side, skipped_faces, tol):
-    """build the boundary curve for a NAS face using edge-walk + PP projection.
+                        ref_side, skipped_faces, tol, original_brep=None):
+    """build the NAS face boundary by intersecting the offset plane with the
+    original polysurface, then trimming at PP axes (bend lines).
 
-    walks each trim edge in winding order:
-    - perimeter edges: translate endpoints by offset_vec
-    - bend edges: project translated endpoints onto the PlanePlane line
-    merges consecutive same-target bends (transition zone case) into one
-    PP segment, connects sequential segments, and joins into a closed curve.
+    the NAP (neutral axis plane, offset t/2 from the face) is parallel to
+    the sheet face and cuts through the edge/transition faces of the original
+    polysurface. the intersection curves capture exact boundary geometry
+    including notches and cutouts. trimming at PP axes (where adjacent NAPs
+    meet) gives correct bend extents without overshoot.
 
     returns a closed Curve on the NAP, or None."""
     normal = face_normals[fi]
     offset_vec = Vector3d(-normal.X * offset_dist,
                            -normal.Y * offset_dist,
                            -normal.Z * offset_dist)
+    nap_plane = face_planes[fi]
 
-    # projected outer loop (used as fallback only)
+    # fallback: translated outer loop
     outer_crv = face.OuterLoop.To3dCurve()
     if outer_crv is None:
         return None
+    fallback = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
+    if fallback is not None and not fallback.IsClosed:
+        fallback = None
 
-    # build bend_map: PP axes for adjacent faces only (via trim adjacency)
+    if original_brep is None:
+        return fallback
+
+    # step 1: intersect NAP with original polysurface
+    rc, curves, points = Intersection.BrepPlane(original_brep, nap_plane, tol)
+    if not rc or curves is None or len(curves) == 0:
+        return fallback
+
+    # step 2: join intersection curves into closed loops
+    joined = Curve.JoinCurves(curves, tol * 10)
+    if joined is None or len(joined) == 0:
+        return fallback
+
+    # find the closed loop containing this face's centroid
+    face_brep = face.DuplicateFace(False)
+    amp = AreaMassProperties.Compute(face_brep)
+    if amp is None:
+        return fallback
+    centroid_nap = nap_plane.ClosestPoint(amp.Centroid)
+
+    raw_loop = None
+    for crv in joined:
+        if not crv.IsClosed:
+            continue
+        contain = crv.Contains(centroid_nap, nap_plane, tol)
+        if contain == PointContainment.Inside:
+            if raw_loop is None:
+                raw_loop = crv
+            else:
+                # pick the smallest loop containing centroid (most specific)
+                amp_new = AreaMassProperties.Compute(Brep.CreatePlanarBreps(
+                    [crv], tol)[0]) if Brep.CreatePlanarBreps([crv], tol) else None
+                amp_old = AreaMassProperties.Compute(Brep.CreatePlanarBreps(
+                    [raw_loop], tol)[0]) if Brep.CreatePlanarBreps([raw_loop], tol) else None
+                if amp_new and amp_old and amp_new.Area < amp_old.Area:
+                    raw_loop = crv
+
+    if raw_loop is None:
+        # containment check failed — try closest closed loop
+        best_d = float("inf")
+        for crv in joined:
+            if not crv.IsClosed:
+                continue
+            rc_cp, t_cp = crv.ClosestPoint(centroid_nap)
+            if rc_cp:
+                d = centroid_nap.DistanceTo(crv.PointAt(t_cp))
+                if d < best_d:
+                    best_d = d
+                    raw_loop = crv
+    if raw_loop is None:
+        return fallback
+
+    # step 3: compute PP axes for adjacent faces (bend lines)
     bend_map = {}  # target_fi -> Line (infinite PlanePlane line)
     for trim_obj in face.OuterLoop.Trims:
         edge = trim_obj.Edge
@@ -499,7 +557,6 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             continue
         other = adj[0] if adj[1] == fi else adj[1]
         target = other
-        # resolve skipped (transition) faces to nearest real face
         if skipped_faces and other in skipped_faces:
             edge_mid = edge.PointAt(edge.Domain.Mid)
             best_fi = None
@@ -520,161 +577,96 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             continue
         if target in bend_map:
             continue
-        rc, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[target])
-        if rc:
+        rc_pp, pp_line = Intersection.PlanePlane(face_planes[fi], face_planes[target])
+        if rc_pp:
             bend_map[target] = pp_line
 
-    # walk trims in winding order, building segments
-    # purely geometric classification: an edge is a bend if it's parallel to
-    # AND near a PP axis. everything else is perimeter.
-    segments = []  # list of ("perimeter"|"bend", LineCurve, target_fi|None)
-    for trim_obj in face.OuterLoop.Trims:
-        edge = trim_obj.Edge
-        if edge is None:
+    if not bend_map:
+        # no bends — raw loop is already the boundary
+        return raw_loop
+
+    # step 4: trim the raw loop at each PP axis
+    # for each PP line, find where the loop crosses it, split, keep segments
+    # on our side (toward centroid), replace overshoot with PP line segments
+    trimmed = raw_loop
+    for tgt, pp_line in bend_map.items():
+        # create a trim plane: contains the PP line, perpendicular to NAP
+        pp_dir = Vector3d(pp_line.Direction)
+        pp_dir.Unitize()
+        # normal of the trim plane: perpendicular to PP line and to NAP normal
+        trim_normal = Vector3d.CrossProduct(pp_dir, nap_plane.Normal)
+        trim_normal.Unitize()
+        # orient so trim_normal points toward our centroid
+        pp_mid = pp_line.PointAt(pp_line.ClosestParameter(centroid_nap))
+        to_centroid = centroid_nap - pp_mid
+        if Vector3d.Multiply(to_centroid, trim_normal) < 0:
+            trim_normal = -trim_normal
+        trim_plane = Plane(pp_line.PointAt(0), trim_normal)
+
+        # find intersection points of the loop with a long PP line curve
+        pp_crv = LineCurve(Line(
+            pp_line.PointAt(pp_line.ClosestParameter(centroid_nap) - 1000),
+            pp_line.PointAt(pp_line.ClosestParameter(centroid_nap) + 1000)))
+        events = Intersection.CurveCurve(trimmed, pp_crv, tol, tol * 10)
+        if events is None or events.Count < 2:
             continue
 
-        # directed edge respecting trim winding
-        if trim_obj.IsReversed():
-            e_start = edge.PointAtEnd
-            e_end = edge.PointAtStart
-        else:
-            e_start = edge.PointAtStart
-            e_end = edge.PointAtEnd
+        # collect crossing parameters on the main curve, sorted
+        params = []
+        for ei in range(events.Count):
+            ev = events[ei]
+            params.append(ev.ParameterA)
+        params.sort()
 
-        # translate endpoints to NAP
-        s_nap = Point3d(e_start.X + offset_vec.X,
-                        e_start.Y + offset_vec.Y,
-                        e_start.Z + offset_vec.Z)
-        e_nap = Point3d(e_end.X + offset_vec.X,
-                        e_end.Y + offset_vec.Y,
-                        e_end.Z + offset_vec.Z)
+        if len(params) < 2:
+            continue
 
-        # geometric bend classification: parallel to + near a PP axis
-        edge_dir = Vector3d(e_nap.X - s_nap.X, e_nap.Y - s_nap.Y,
-                            e_nap.Z - s_nap.Z)
-        edge_len = edge_dir.Length
-        classified = False
-        if edge_len > tol:
-            edge_dir.Unitize()
-            mid_nap = Point3d((s_nap.X + e_nap.X) / 2,
-                              (s_nap.Y + e_nap.Y) / 2,
-                              (s_nap.Z + e_nap.Z) / 2)
-            for tgt, pp_line in bend_map.items():
-                # distance: midpoint within offset_dist * 2 of PP axis
-                t = pp_line.ClosestParameter(mid_nap)
-                dist = mid_nap.DistanceTo(pp_line.PointAt(t))
-                if dist > offset_dist * 2:
-                    continue
-                # direction: within ~2° of parallel
-                pp_dir = Vector3d(pp_line.Direction)
-                pp_dir.Unitize()
-                dot = abs(Vector3d.Multiply(edge_dir, pp_dir))
-                if dot < 0.999:
-                    continue
-                # bend edge: project onto PP axis
-                t0 = pp_line.ClosestParameter(s_nap)
-                t1 = pp_line.ClosestParameter(e_nap)
-                pp_s = pp_line.PointAt(t0)
-                pp_e = pp_line.PointAt(t1)
-                if pp_s.DistanceTo(pp_e) > tol:
-                    segments.append(("bend", LineCurve(Line(pp_s, pp_e)), tgt))
-                classified = True
-                break
+        # split the curve at crossing points
+        splits = trimmed.Split(params)
+        if splits is None or len(splits) < 2:
+            continue
 
-        if not classified and edge_len > tol:
-            segments.append(("perimeter", LineCurve(Line(s_nap, e_nap)), None))
-
-    if len(segments) < 3:
-        # not enough segments — fallback to projected outline
-        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-        return projected if projected.IsClosed else None
-
-    # merge consecutive bend segments with same target
-    merged = []
-    i = 0
-    while i < len(segments):
-        typ, crv, target = segments[i]
-        if typ == "bend" and target is not None:
-            # collect run of same target
-            run_start = crv.PointAtStart
-            run_end = crv.PointAtEnd
-            j = i + 1
-            while j < len(segments) and segments[j][2] == target:
-                run_end = segments[j][1].PointAtEnd
-                j += 1
-            merged.append(("bend", LineCurve(Line(run_start, run_end)), target))
-            i = j
-        else:
-            merged.append(segments[i])
-            i += 1
-
-    if len(merged) < 3:
-        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-        return projected if projected.IsClosed else None
-
-    # compute vertices at each segment transition using LineLine intersection
-    n = len(merged)
-    vertices = []
-    for i in range(n):
-        curr_type, curr_crv, curr_target = merged[i]
-        next_type, next_crv, next_target = merged[(i + 1) % n]
-
-        # get lines for intersection
-        if curr_type == "bend":
-            line_a = bend_map[curr_target]  # infinite PP line
-        else:
-            line_a = Line(curr_crv.PointAtStart, curr_crv.PointAtEnd)
-
-        if next_type == "bend":
-            line_b = bend_map[next_target]
-        else:
-            line_b = Line(next_crv.PointAtStart, next_crv.PointAtEnd)
-
-        rc, ta, tb = Intersection.LineLine(line_a, line_b)
-        if rc:
-            pt_a = line_a.PointAt(ta)
-            pt_b = line_b.PointAt(tb)
-            gap = pt_a.DistanceTo(pt_b)
-            if gap < tol * 100:
-                vertex = Point3d((pt_a.X + pt_b.X) / 2,
-                                 (pt_a.Y + pt_b.Y) / 2,
-                                 (pt_a.Z + pt_b.Z) / 2)
+        # keep segments on our side (centroid side of PP line)
+        keep = []
+        pp_segments = []
+        for seg in splits:
+            seg_mid = seg.PointAt(seg.Domain.Mid)
+            side = Vector3d.Multiply(seg_mid - pp_mid, trim_normal)
+            if side >= -tol:
+                # on our side — keep
+                keep.append(seg)
             else:
-                # 3D skew too large — use closest point on face plane
-                vertex = face_planes[fi].ClosestPoint(pt_a)
-        else:
-            # parallel lines — use shared endpoint
-            if next_type in ("perimeter",):
-                vertex = Point3d(next_crv.PointAtStart.X,
-                                 next_crv.PointAtStart.Y,
-                                 next_crv.PointAtStart.Z)
+                # overshoot — replace with PP line segment
+                pp_t0 = pp_line.ClosestParameter(seg.PointAtStart)
+                pp_t1 = pp_line.ClosestParameter(seg.PointAtEnd)
+                pp_seg = LineCurve(Line(pp_line.PointAt(pp_t0), pp_line.PointAt(pp_t1)))
+                if pp_seg.GetLength() > tol:
+                    pp_segments.append(pp_seg)
+
+        # rejoin: kept segments + PP replacement segments
+        all_segs = list(keep) + pp_segments
+        if len(all_segs) < 2:
+            continue
+        rejoined = Curve.JoinCurves(all_segs, tol * 10)
+        if rejoined and len(rejoined) > 0:
+            # find the closed one (or closest to closed)
+            for rj in rejoined:
+                if rj.IsClosed:
+                    trimmed = rj
+                    break
             else:
-                vertex = Point3d(curr_crv.PointAtEnd.X,
-                                 curr_crv.PointAtEnd.Y,
-                                 curr_crv.PointAtEnd.Z)
+                # try to close the longest one
+                longest = max(rejoined, key=lambda c: c.GetLength())
+                if longest.PointAtStart.DistanceTo(longest.PointAtEnd) < tol * 100:
+                    longest = longest.ToNurbsCurve()
+                    longest.SetEndPoint(longest.PointAtStart)
+                    if longest.IsClosed:
+                        trimmed = longest
 
-        # project to face plane for exact planarity
-        vertices.append(face_planes[fi].ClosestPoint(vertex))
-
-    if len(vertices) < 3:
-        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-        return projected if projected.IsClosed else None
-
-    # remove consecutive duplicate vertices
-    cleaned = [vertices[0]]
-    for v in vertices[1:]:
-        if v.DistanceTo(cleaned[-1]) > tol:
-            cleaned.append(v)
-    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
-        cleaned.pop()
-
-    if len(cleaned) < 3:
-        projected = _doc_translate(outer_crv, offset_vec.X, offset_vec.Y, offset_vec.Z)
-        return projected if projected.IsClosed else None
-
-    # close and build polyline
-    cleaned.append(cleaned[0])
-    return PolylineCurve([Point3d(v.X, v.Y, v.Z) for v in cleaned])
+    # project to NAP for exact planarity
+    if not trimmed.IsClosed:
+        return fallback
+    return trimmed
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
@@ -826,9 +818,10 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
             nas_skip += 1
             continue
 
-        # build NAS face boundary via project + trim at bends
+        # build NAS face boundary via BrepPlane intersection + PP trimming
         boundary = _build_nas_boundary(face, fi, face_planes, face_normals,
-                                        offset_dist, ref_side, skipped_faces, tol)
+                                        offset_dist, ref_side, skipped_faces, tol,
+                                        original_brep=original_brep)
 
         if boundary is None:
             print("  {}: boundary construction failed → SKIPPED".format(fl))
