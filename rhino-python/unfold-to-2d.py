@@ -502,12 +502,11 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     if not rc or curves is None or len(curves) == 0:
         return fallback
 
-    # step 2: join intersection curves into closed loops
+    # step 2: join intersection curves and find the closed loop for this face
     joined = Curve.JoinCurves(curves, tol * 10)
     if joined is None or len(joined) == 0:
         return fallback
 
-    # find the closed loop containing this face's centroid
     face_brep = face.DuplicateFace(False)
     amp = AreaMassProperties.Compute(face_brep)
     if amp is None:
@@ -523,16 +522,13 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             if raw_loop is None:
                 raw_loop = crv
             else:
-                # pick the smallest loop containing centroid (most specific)
-                amp_new = AreaMassProperties.Compute(Brep.CreatePlanarBreps(
-                    [crv], tol)[0]) if Brep.CreatePlanarBreps([crv], tol) else None
-                amp_old = AreaMassProperties.Compute(Brep.CreatePlanarBreps(
-                    [raw_loop], tol)[0]) if Brep.CreatePlanarBreps([raw_loop], tol) else None
+                # pick smallest loop containing centroid
+                amp_new = AreaMassProperties.Compute(crv)
+                amp_old = AreaMassProperties.Compute(raw_loop)
                 if amp_new and amp_old and amp_new.Area < amp_old.Area:
                     raw_loop = crv
-
     if raw_loop is None:
-        # containment check failed — try closest closed loop
+        # fallback: closest closed loop
         best_d = float("inf")
         for crv in joined:
             if not crv.IsClosed:
@@ -582,22 +578,17 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             bend_map[target] = pp_line
 
     if not bend_map:
-        # no bends — raw loop is already the boundary
         return raw_loop
 
-    # step 4: trim the raw loop at each PP axis using Brep.Trim
-    # create a planar brep from the raw loop, then trim against each PP
-    # half-plane. Brep.Trim handles all topology robustly.
+    # step 4: trim raw loop at PP planes using Brep.Trim
     raw_breps = Brep.CreatePlanarBreps([raw_loop], tol)
     if not raw_breps or len(raw_breps) == 0:
-        # try loose tolerance
         raw_breps = Brep.CreatePlanarBreps([raw_loop], tol * 100)
     if not raw_breps or len(raw_breps) == 0:
         return raw_loop
 
     trimmed_brep = raw_breps[0]
     for tgt, pp_line in bend_map.items():
-        # trim plane: contains PP line, perpendicular to NAP, normal toward centroid
         pp_dir = Vector3d(pp_line.Direction)
         pp_dir.Unitize()
         trim_normal = Vector3d.CrossProduct(pp_dir, nap_plane.Normal)
@@ -624,13 +615,64 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             if best_piece is not None:
                 trimmed_brep = best_piece
 
-    # extract boundary curve from trimmed brep
-    if trimmed_brep.Faces.Count > 0:
-        boundary = trimmed_brep.Faces[0].OuterLoop.To3dCurve()
-        if boundary is not None and boundary.IsClosed:
+    # step 5: extract boundary, snap bend edges to PP lines, project to NAP
+    if trimmed_brep.Faces.Count == 0:
+        return raw_loop
+    boundary = trimmed_brep.Faces[0].OuterLoop.To3dCurve()
+    if boundary is None or not boundary.IsClosed:
+        return raw_loop
+
+    # convert boundary to polyline points for snapping
+    polyline_result = boundary.TryGetPolyline()
+    if polyline_result[0]:
+        pts = list(polyline_result[1])
+    else:
+        # approximate as polyline
+        poly = boundary.ToPolyline(tol, tol, 0.01, 10000)
+        if poly and poly.TryGetPolyline()[0]:
+            pts = list(poly.TryGetPolyline()[1])
+        else:
+            # can't convert — just project boundary to NAP and return
             return boundary
 
-    return raw_loop
+    if len(pts) < 3:
+        return boundary
+
+    # snap segments near PP lines: project endpoints onto the PP line
+    for i in range(len(pts) - 1):
+        mid = Point3d((pts[i].X + pts[i + 1].X) / 2,
+                      (pts[i].Y + pts[i + 1].Y) / 2,
+                      (pts[i].Z + pts[i + 1].Z) / 2)
+        for tgt, pp_line in bend_map.items():
+            t = pp_line.ClosestParameter(mid)
+            dist = mid.DistanceTo(pp_line.PointAt(t))
+            if dist < offset_dist * 3:
+                # snap both endpoints to PP line
+                t0 = pp_line.ClosestParameter(pts[i])
+                t1 = pp_line.ClosestParameter(pts[i + 1])
+                pts[i] = pp_line.PointAt(t0)
+                pts[i + 1] = pp_line.PointAt(t1)
+                break
+
+    # project ALL points to NAP for exact planarity
+    for i in range(len(pts)):
+        pts[i] = nap_plane.ClosestPoint(pts[i])
+
+    # ensure closure
+    pts[-1] = Point3d(pts[0].X, pts[0].Y, pts[0].Z)
+
+    # remove consecutive duplicates
+    cleaned = [pts[0]]
+    for p in pts[1:]:
+        if p.DistanceTo(cleaned[-1]) > tol:
+            cleaned.append(p)
+    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
+        cleaned.pop()
+    if len(cleaned) < 3:
+        return boundary
+    cleaned.append(Point3d(cleaned[0].X, cleaned[0].Y, cleaned[0].Z))
+
+    return PolylineCurve(cleaned)
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
