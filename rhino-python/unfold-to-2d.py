@@ -502,16 +502,25 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     if not rc or curves is None or len(curves) == 0:
         return fallback
 
-    # step 2: join intersection curves and find the closed loop for this face
-    joined = Curve.JoinCurves(curves, tol * 10)
-    if joined is None or len(joined) == 0:
-        return fallback
-
+    # step 1.5: compute face geometry for filtering and centroid
     face_brep = face.DuplicateFace(False)
     amp = AreaMassProperties.Compute(face_brep)
     if amp is None:
         return fallback
     centroid_nap = nap_plane.ClosestPoint(amp.Centroid)
+
+    # filter intersection curves to those near this face (exclude distant faces
+    # at the same elevation whose curves would create unwanted extensions)
+    face_bb = face_brep.GetBoundingBox(True)
+    face_bb.Inflate(offset_dist * 5)
+    near_curves = [c for c in curves if face_bb.Contains(c.PointAt(c.Domain.Mid))]
+    if near_curves:
+        curves = near_curves
+
+    # step 2: join intersection curves and find the closed loop for this face
+    joined = Curve.JoinCurves(curves, tol * 10)
+    if joined is None or len(joined) == 0:
+        return fallback
 
     raw_loop = None
     for crv in joined:
@@ -522,10 +531,10 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             if raw_loop is None:
                 raw_loop = crv
             else:
-                # pick smallest loop containing centroid
+                # pick largest loop containing centroid (outer boundary, not window holes)
                 amp_new = AreaMassProperties.Compute(crv)
                 amp_old = AreaMassProperties.Compute(raw_loop)
-                if amp_new and amp_old and amp_new.Area < amp_old.Area:
+                if amp_new and amp_old and amp_new.Area > amp_old.Area:
                     raw_loop = crv
     if raw_loop is None:
         # fallback: closest closed loop
@@ -638,21 +647,37 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     if len(pts) < 3:
         return boundary
 
-    # snap segments near PP lines: project endpoints onto the PP line
+    # snap bend-edge segments to PP lines: only segments that are both
+    # near AND parallel to a PP line. corner/notch segments at angles are
+    # preserved even if they're close to a PP line.
     for i in range(len(pts) - 1):
+        seg_dir = Vector3d(pts[i + 1].X - pts[i].X,
+                           pts[i + 1].Y - pts[i].Y,
+                           pts[i + 1].Z - pts[i].Z)
+        seg_len = seg_dir.Length
+        if seg_len < tol:
+            continue
+        seg_dir.Unitize()
         mid = Point3d((pts[i].X + pts[i + 1].X) / 2,
                       (pts[i].Y + pts[i + 1].Y) / 2,
                       (pts[i].Z + pts[i + 1].Z) / 2)
         for tgt, pp_line in bend_map.items():
             t = pp_line.ClosestParameter(mid)
             dist = mid.DistanceTo(pp_line.PointAt(t))
-            if dist < offset_dist * 3:
-                # snap both endpoints to PP line
-                t0 = pp_line.ClosestParameter(pts[i])
-                t1 = pp_line.ClosestParameter(pts[i + 1])
-                pts[i] = pp_line.PointAt(t0)
-                pts[i + 1] = pp_line.PointAt(t1)
-                break
+            if dist > offset_dist:
+                continue
+            # check parallelism: segment must be nearly parallel to PP line
+            pp_dir = Vector3d(pp_line.Direction)
+            pp_dir.Unitize()
+            dot = abs(Vector3d.Multiply(seg_dir, pp_dir))
+            if dot < 0.9:
+                continue  # angled segment (corner/notch) — don't snap
+            # snap both endpoints to PP line
+            t0 = pp_line.ClosestParameter(pts[i])
+            t1 = pp_line.ClosestParameter(pts[i + 1])
+            pts[i] = pp_line.PointAt(t0)
+            pts[i + 1] = pp_line.PointAt(t1)
+            break
 
     # project ALL points to NAP for exact planarity
     for i in range(len(pts)):
@@ -661,12 +686,12 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     # ensure closure
     pts[-1] = Point3d(pts[0].X, pts[0].Y, pts[0].Z)
 
-    # remove consecutive duplicates
+    # remove consecutive duplicates and short segments (trim corner artifacts)
     cleaned = [pts[0]]
     for p in pts[1:]:
-        if p.DistanceTo(cleaned[-1]) > tol:
+        if p.DistanceTo(cleaned[-1]) > offset_dist * 0.5:
             cleaned.append(p)
-    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < tol:
+    if len(cleaned) > 1 and cleaned[-1].DistanceTo(cleaned[0]) < offset_dist * 0.5:
         cleaned.pop()
     if len(cleaned) < 3:
         return boundary
