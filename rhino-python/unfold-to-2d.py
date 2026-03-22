@@ -1303,8 +1303,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
             crv.Transform(transforms[fa])
         flat_bend_curves.append(crv)
 
-    # --- transform ink curves ---
+    # --- transform ink curves (same rotation as their NAS face, then project to flat plane) ---
     flat_ink_curves = []
+    seed_plane = face_planes[seed]
+    proj_to_plane = Transform.PlanarProjection(seed_plane)
     for guid, crv in ink_curves:
         mid = crv.PointAt(crv.Domain.Mid)
         best_fi = None
@@ -1321,6 +1323,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
         if best_fi is not None:
             ink_copy = crv.DuplicateCurve()
             ink_copy.Transform(transforms[best_fi])
+            ink_copy.Transform(proj_to_plane)
             flat_ink_curves.append(ink_copy)
 
     # --- bake flat faces directly for visual verification ---
@@ -1349,17 +1352,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
         guid = sc.doc.Objects.AddBrep(fb, a)
         if guid != System.Guid.Empty:
             baked_guids.append(guid)
-    # bake bend curves too
-    for bc in flat_bend_curves:
-        a = Rhino.DocObjects.ObjectAttributes()
-        a.LayerIndex = layer_idx
-        a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-        a.ObjectColor = System.Drawing.Color.Black
-        guid = sc.doc.Objects.AddCurve(bc, a)
-        if guid != System.Guid.Empty:
-            baked_guids.append(guid)
-    print("  baked {} flat faces + {} bend curves to '{}'".format(
-        len(flat_faces), len(flat_bend_curves), bake_layer))
+    print("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
 
     # still return expected tuple so caller doesn't crash
     outside_curves = []
@@ -1368,7 +1361,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     if flat_brep is None:
         print("error: no flat geometry produced")
         return None
-    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves
+    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal
 
 
 def determine_bend_directions(bend_infos, picked_normal):
@@ -1451,8 +1444,9 @@ def ensure_sublayers():
 
 
 
-def create_bend_text_curves(bend_infos, unrolled_bend_curves):
+def create_bend_text_curves(bend_infos, unrolled_bend_curves, flat_normal):
     """create text as curve geometry for bend angle annotations.
+    flat_normal is the unrolled NAS plane normal (for correct text orientation).
     returns list of curves."""
     all_text_curves = []
 
@@ -1474,8 +1468,8 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves):
         tangent = crv.TangentAt(mid_t)
         tangent.Unitize()
 
-        # perpendicular in XY plane (unrolled is flat)
-        perp = Vector3d(-tangent.Y, tangent.X, 0)
+        # perpendicular in the unrolled NAS plane
+        perp = Vector3d.CrossProduct(flat_normal, tangent)
         perp.Unitize()
 
         text_origin = mid_pt + perp * TEXT_HEIGHT * 2
@@ -1721,16 +1715,9 @@ def unfold_to_2d():
     # step 10: find ink curves on ref_side (the surface they're drawn on)
     ink_curves = find_ink_curves(ref_side)
     print("  ink curves: {}".format(len(ink_curves)))
-    # step 10b: project ink curves onto NAS so they unroll flush
-    tol = sc.doc.ModelAbsoluteTolerance
-    projected_ink = []
-    for guid, crv in ink_curves:
-        proj = Curve.ProjectToBrep(crv, neutral_axis, -picked_normal, tol)
-        if proj and len(proj) > 0:
-            projected_ink.append((guid, proj[0]))
-        else:
-            projected_ink.append((guid, crv))
-    ink_curves = projected_ink
+    # ink curves stay in their original 3D positions on ref_side.
+    # unroll_by_rotation applies each NAS face's rotation transform,
+    # then projects onto the flat NAS plane.
     # find NAS face closest to picked face (needed for seed + alignment)
     picked_centroid, _ = get_face_outward_normal(brep, face_index)
     picked_na_face = 0
@@ -1749,13 +1736,13 @@ def unfold_to_2d():
     unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos, thickness, picked_na_face)
     if unroll_result is None:
         return
-    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink = unroll_result
+    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal = unroll_result
     unrolled_breps = [flat_brep]
     print("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
     # step 13: create bend angle text
-    text_curves = create_bend_text_curves(bend_infos, unrolled_bend)
+    text_curves = create_bend_text_curves(bend_infos, unrolled_bend, flat_normal)
     # step 14: add curves to sublayers
     sublayers = ensure_sublayers()
     count = add_output(neutral_axis, unrolled_breps, outside_curves,
