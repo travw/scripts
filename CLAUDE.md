@@ -154,3 +154,11 @@ key geometric concepts:
   for sharp corners, build offset geometry from plane math instead.
 - `Intersection.PlanePlane` returns `(bool, Line)` — an infinite Line.
   `Line.ClosestParameter` returns a double, not a tuple.
+- joined polysurface face normals are NOT consistently oriented.
+  use `abs(dot)` when computing angles between faces in a joined brep.
+- unfold-to-2d coordinate spaces: the BFS unroll produces geometry in the
+  seed face's plane (flat space). the baked flat faces on 03 - Bake are in
+  this space. `align_xform` (PlaneToPlane) maps flat space → 3D NAS space
+  for the 11 - 2D geo output. bend lines and ink curves should be output
+  directly in flat space (same as bake), NOT through align_xform.
+  align_xform was the source of persistent bend line placement bugs.
