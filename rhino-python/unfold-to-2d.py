@@ -28,6 +28,7 @@ from Rhino.Geometry import (
     Brep,
     BrepLoopType,
     Curve,
+    CurveSimplifyOptions,
     LineCurve,
     Line,
     Plane,
@@ -1381,7 +1382,13 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         if rc_int and len(rc_int) >= 3:
             overlap_curves = rc_int[1]
             if overlap_curves and len(overlap_curves) > 0:
-                for oc in overlap_curves:
+                # join collinear segments that CurveBrep splits unnecessarily
+                joined = Curve.JoinCurves(overlap_curves, tol)
+                result = []
+                for jc in (joined if joined else overlap_curves):
+                    simplified = jc.Simplify(CurveSimplifyOptions.All, tol, tol * 10)
+                    result.append(simplified if simplified else jc)
+                for oc in result:
                     entry["flat_curves"].append(oc)
                     flat_bend_curves.append(oc)
                 continue
