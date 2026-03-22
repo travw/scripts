@@ -1135,35 +1135,23 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
             i, info["angle"], fa, fb, axis_line.Length))
 
 
-def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.125, picked_na_face=0):
+def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na_face=0):
     """unroll the NAS by rotating planar faces around bend axes.
-    bypasses Rhino's Unroller which can't handle NAS edge mismatches.
+    adjacency and bend axes are derived directly from NAS internal edges.
     returns (flat_brep, outside_curves, inside_curves,
-             flat_bend_curves, flat_ink_curves) or None."""
+             flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends)
+    or None."""
     tol = sc.doc.ModelAbsoluteTolerance
     nas = neutral_axis_brep
     n_faces = nas.Faces.Count
 
-    # --- build adjacency from bend_infos ---
-    # adjacency[face_idx] = [(neighbor_idx, bend_info, axis_line), ...]
-    adjacency = {}
-    for bi in bend_infos:
-        fa = bi.get("na_face_a", -1)
-        fb = bi.get("na_face_b", -1)
-        axis = bi.get("na_axis")
-        if fa < 0 or fb < 0 or axis is None:
-            continue
-        adjacency.setdefault(fa, []).append((fb, bi, axis))
-        adjacency.setdefault(fb, []).append((fa, bi, axis))
-
-    # --- get face planes ---
+    # --- get face planes (needed before adjacency) ---
     face_planes = {}
     for fi in range(n_faces):
         face = nas.Faces[fi]
         plane_tol = max(tol * 100, 0.1)
         rc, plane = face.TryGetPlane(plane_tol)
         if rc:
-            # ensure normal points outward (away from brep interior)
             amp = AreaMassProperties.Compute(face.DuplicateFace(False))
             if amp:
                 mid_u = face.Domain(0).Mid
@@ -1172,7 +1160,6 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
                 if face.OrientationIsReversed:
                     n.Reverse()
                 plane = Plane(amp.Centroid, plane.XAxis, plane.YAxis)
-                # re-orient so plane.Normal matches outward normal
                 if Vector3d.Multiply(plane.Normal, n) < 0:
                     plane = Plane(plane.Origin, plane.XAxis, -plane.YAxis)
             face_planes[fi] = plane
@@ -1180,6 +1167,61 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     if len(face_planes) < n_faces:
         print("  warning: only {} of {} faces have planes".format(
             len(face_planes), n_faces))
+
+    # --- build adjacency directly from NAS internal edges ---
+    # collect ALL internal edges between non-coplanar face pairs, then
+    # deduplicate: one adjacency entry per face pair (longest edge for rotation),
+    # but keep all edge curves for flat bend line output.
+    bend_edges_by_pair = {}  # (min_fa, max_fb) -> list of edge curves
+    bend_angles_by_pair = {}  # (min_fa, max_fb) -> angle
+    for ei in range(nas.Edges.Count):
+        edge = nas.Edges[ei]
+        adj = edge.AdjacentFaces()
+        if len(adj) != 2:
+            continue
+        fa, fb = adj[0], adj[1]
+        if fa not in face_planes or fb not in face_planes:
+            continue
+        na = face_planes[fa].Normal
+        nb = face_planes[fb].Normal
+        dot_n = max(-1.0, min(1.0, Vector3d.Multiply(na, nb)))
+        if abs(dot_n) > 0.99:
+            continue  # coplanar, not a bend
+
+        pair_key = (min(fa, fb), max(fa, fb))
+        edge_crv = edge.DuplicateCurve()
+        bend_edges_by_pair.setdefault(pair_key, []).append(edge_crv)
+        if pair_key not in bend_angles_by_pair:
+            # use abs(dot) because NAS face normals in a joined polysurface
+            # may not be consistently oriented (some inward, some outward)
+            abs_dot = abs(dot_n)
+            bend_angle = round(180.0 - math.degrees(math.acos(abs_dot)), 1)
+            bend_angles_by_pair[pair_key] = bend_angle
+
+    # build adjacency (one entry per face pair, longest edge for rotation axis)
+    adjacency = {}
+    nas_edge_bends = []  # one entry per face pair (for labels)
+    all_bend_edges = []  # all edge curves grouped by pair (for flat output)
+    for (fa, fb), edges in bend_edges_by_pair.items():
+        # pick longest edge for rotation axis
+        longest = max(edges, key=lambda c: c.GetLength())
+        axis_line = Line(longest.PointAtStart, longest.PointAtEnd)
+        bend_angle = bend_angles_by_pair[(fa, fb)]
+
+        bend_entry = {
+            "edge_crv": longest,
+            "all_edges": edges,
+            "axis": axis_line,
+            "angle": bend_angle,
+            "fa": fa,
+            "fb": fb,
+        }
+        nas_edge_bends.append(bend_entry)
+        all_bend_edges.append(bend_entry)
+        adjacency.setdefault(fa, []).append((fb, bend_entry, axis_line))
+        adjacency.setdefault(fb, []).append((fa, bend_entry, axis_line))
+
+    print("  {} unique face-pair bends from NAS edges".format(len(nas_edge_bends)))
 
     # --- BFS: flatten faces onto XY ---
     transforms = {}  # face_idx -> Transform (3D -> flat XY)
@@ -1211,7 +1253,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     while queue:
         current = queue.pop(0)
         current_xform = transforms[current]
-        for neighbor, bi, axis_line in adjacency.get(current, []):
+        for neighbor, bend_entry, axis_line in adjacency.get(current, []):
             if neighbor in visited:
                 continue
             if neighbor not in face_planes:
@@ -1222,6 +1264,9 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
             p2 = Point3d(axis_line.To)
             p1.Transform(current_xform)
             p2.Transform(current_xform)
+            # store flat axis endpoints — these define the bend line in flat space
+            bend_entry["flat_p1"] = Point3d(p1)
+            bend_entry["flat_p2"] = Point3d(p2)
             axis_dir = Vector3d(p2 - p1)
             axis_dir.Unitize()
 
@@ -1278,6 +1323,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
 
     # --- transform face breps to flat ---
     flat_faces = []
+    flat_face_breps = {}  # NAS face index -> transformed Brep (for shared-edge extraction)
     fn = flat_normal
     print("  target normal: ({:.4f},{:.4f},{:.4f})".format(fn.X, fn.Y, fn.Z))
     for fi in range(n_faces):
@@ -1288,20 +1334,98 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
         flat_faces.append(face_brep)
+        flat_face_breps[fi] = face_brep
         amp = AreaMassProperties.Compute(face_brep)
         seed_tag = " (SEED)" if fi == seed else ""
         print("    face {}: n=({:.4f},{:.4f},{:.4f}) dot={:.4f} area={:.1f}{}".format(
             fi, result_n.X, result_n.Y, result_n.Z, dot,
             amp.Area if amp else 0, seed_tag))
 
-    # --- transform bend curves ---
+    # --- compute flat axes for non-BFS-traversed bends (cycle edges) ---
+    for entry in nas_edge_bends:
+        if "flat_p1" not in entry:
+            fa, fb = entry["fa"], entry["fb"]
+            xf = transforms.get(fa) or transforms.get(fb)
+            if xf:
+                cp1 = Point3d(entry["axis"].From)
+                cp2 = Point3d(entry["axis"].To)
+                cp1.Transform(xf)
+                cp2.Transform(xf)
+                entry["flat_p1"] = cp1
+                entry["flat_p2"] = cp2
+
+    # --- build flat bend lines: extend axes, project onto seed plane, trim by NAS outline ---
+    # join flat faces to get the NAS outline for trimming
+    joined = Brep.JoinBreps([fb for fb in flat_faces], tol * 10)
+    trim_brep = joined[0] if joined and len(joined) > 0 else flat_faces[0]
+    seed_plane_for_proj = face_planes[seed]
+    proj_xform = Transform.PlanarProjection(seed_plane_for_proj)
+
+    # DEBUG: bake bend axis points and lines to see where they actually land
+    debug_layer = "03 - Bake"
+    debug_li = sc.doc.Layers.FindByFullPath(debug_layer, -1)
     flat_bend_curves = []
-    for bi in bend_infos:
-        crv = bi["curve_na"].DuplicateCurve()
-        fa = bi.get("na_face_a", -1)
-        if fa >= 0 and fa in transforms:
-            crv.Transform(transforms[fa])
-        flat_bend_curves.append(crv)
+    for bi, entry in enumerate(nas_edge_bends):
+        fp1 = entry.get("flat_p1")
+        fp2 = entry.get("flat_p2")
+        if fp1 is None or fp2 is None:
+            print("  warning: bend {}↔{} has no flat axis".format(
+                entry["fa"], entry["fb"]))
+            continue
+
+        # DEBUG: print the raw axis points
+        print("  DEBUG bend {} ({}↔{}): fp1=({:.2f},{:.2f},{:.2f}) fp2=({:.2f},{:.2f},{:.2f})".format(
+            bi, entry["fa"], entry["fb"],
+            fp1.X, fp1.Y, fp1.Z, fp2.X, fp2.Y, fp2.Z))
+
+        # DEBUG: bake text dots at axis endpoints
+        d_attr = Rhino.DocObjects.ObjectAttributes()
+        d_attr.LayerIndex = debug_li
+        d_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+        d_attr.ObjectColor = System.Drawing.Color.Red
+        dot1 = Rhino.Geometry.TextDot("B{}a".format(bi), fp1)
+        dot1.FontHeight = 12
+        sc.doc.Objects.AddTextDot(dot1, d_attr)
+        dot2 = Rhino.Geometry.TextDot("B{}b".format(bi), fp2)
+        dot2.FontHeight = 12
+        sc.doc.Objects.AddTextDot(dot2, d_attr)
+
+        # DEBUG: bake the raw (untrimmed, unprojected) axis line
+        raw_line = LineCurve(fp1, fp2)
+        raw_attr = Rhino.DocObjects.ObjectAttributes()
+        raw_attr.LayerIndex = debug_li
+        raw_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+        raw_attr.ObjectColor = System.Drawing.Color.Red
+        sc.doc.Objects.AddCurve(raw_line, raw_attr)
+
+        # extend to long line through the flat pattern
+        direction = Vector3d(fp2 - fp1)
+        direction.Unitize()
+        long_p1 = fp1 - direction * 1000
+        long_p2 = fp2 + direction * 1000
+        long_line = LineCurve(long_p1, long_p2)
+
+        # project onto flat NAS plane
+        long_line.Transform(proj_xform)
+
+        # trim by NAS outline
+        rc_int = Intersection.CurveBrep(long_line, trim_brep, tol)
+        if rc_int and len(rc_int) >= 3:
+            overlap_curves = rc_int[1]
+            if overlap_curves and len(overlap_curves) > 0:
+                print("    CurveBrep: {} overlaps".format(len(overlap_curves)))
+                for oc in overlap_curves:
+                    flat_bend_curves.append(oc)
+                continue
+            else:
+                print("    CurveBrep: no overlaps (pts={})".format(
+                    len(rc_int[2]) if len(rc_int) > 2 else "?"))
+        else:
+            print("    CurveBrep failed: rc={}".format(rc_int[0] if rc_int else "None"))
+
+        # fallback: untrimmed line between the axis points
+        print("    using fallback line")
+        flat_bend_curves.append(LineCurve(fp1, fp2))
 
     # --- transform ink curves (same rotation as their NAS face, then project to flat plane) ---
     flat_ink_curves = []
@@ -1361,7 +1485,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, bend_infos, thickness=0.12
     if flat_brep is None:
         print("error: no flat geometry produced")
         return None
-    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal
+    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends, transforms
 
 
 def determine_bend_directions(bend_infos, picked_normal):
@@ -1454,21 +1578,33 @@ def ensure_sublayers():
 
 
 
-def create_bend_text_curves(bend_infos, unrolled_bend_curves, flat_normal):
+def create_bend_text_curves(bend_data, unrolled_bend_curves, flat_normal,
+                            picked_normal=None, aligned_normal=None):
     """create text as curve geometry for bend angle annotations.
-    flat_normal is the unrolled NAS plane normal (for correct text orientation).
-    returns list of curves."""
+    bend_data: list of dicts with 'angle' and 'direction' keys.
+    flat_normal: unrolled NAS plane normal (for text plane construction in flat space).
+    picked_normal: outward normal of user-selected face in 3D.
+    aligned_normal: flat_normal after alignment transform (for correct flip test).
+    text reads left-to-right when viewing from the picked face side."""
     all_text_curves = []
 
-    if len(unrolled_bend_curves) != len(bend_infos):
-        print("warning: bend curve count mismatch ({} vs {})".format(
-            len(unrolled_bend_curves), len(bend_infos)))
+    # only create text for bends that have corresponding flat curves
+    count = min(len(unrolled_bend_curves), len(bend_data))
+    if count == 0:
         return all_text_curves
 
-    for i, crv in enumerate(unrolled_bend_curves):
-        info = bend_infos[i]
+    # determine if text needs flipping to be readable from picked face side.
+    flip_text = False
+    check_normal = aligned_normal if aligned_normal is not None else flat_normal
+    if picked_normal is not None:
+        dot = Vector3d.Multiply(picked_normal, check_normal)
+        flip_text = dot < 0
+
+    for i in range(count):
+        crv = unrolled_bend_curves[i]
+        info = bend_data[i]
         angle = info["angle"]
-        direction = info["direction"]
+        direction = info.get("direction", "UP")
 
         angle_int = int(round(angle))
         text_content = "{} {}".format(angle_int, direction)
@@ -1477,6 +1613,9 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves, flat_normal):
         mid_pt = crv.PointAt(mid_t)
         tangent = crv.TangentAt(mid_t)
         tangent.Unitize()
+
+        if flip_text:
+            tangent = -tangent
 
         # perpendicular in the unrolled NAS plane
         perp = Vector3d.CrossProduct(flat_normal, tangent)
@@ -1505,65 +1644,69 @@ def create_bend_text_curves(bend_infos, unrolled_bend_curves, flat_normal):
     return all_text_curves
 
 
-def add_output(neutral_axis, unrolled_breps, outside_curves, inside_curves,
-               unrolled_bend, unrolled_ink, text_curves, sublayers,
-               brep=None, picked_face_index=0):
-    """add 2D curves to fabrication sublayers, aligned to the neutral axis
-    face plane. the flat pattern is in XY — we PlaneToPlane from the flat
-    face to the matching NA face. applied via sc.doc.Objects.Transform
-    (the only transform method that works reliably in CPython 3)."""
-    # compute alignment: PlaneToPlane from flat face to matching NA face
-    align_xform = None
-    if unrolled_breps and len(unrolled_breps) > 0 and brep is not None:
-        print("=== alignment ===")
-        # find NA face closest to picked face
-        picked_centroid, _ = get_face_outward_normal(brep, picked_face_index)
-        best_na_idx = 0
-        best_na_dist = float("inf")
-        if picked_centroid is not None:
-            for nfi in range(neutral_axis.Faces.Count):
-                nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
-                nf_amp = AreaMassProperties.Compute(nf_brep)
-                if nf_amp is not None:
-                    d = picked_centroid.DistanceTo(nf_amp.Centroid)
-                    if d < best_na_dist:
-                        best_na_dist = d
-                        best_na_idx = nfi
+def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_index):
+    """compute PlaneToPlane transform from flat pattern space to 3D NAS space.
+    returns Transform or None if alignment cannot be computed."""
+    if not unrolled_breps or len(unrolled_breps) == 0 or brep is None:
+        return None
 
-        # source: find flat face matching NA face by area
-        na_face = neutral_axis.Faces[best_na_idx]
-        na_brep = na_face.DuplicateFace(False)
-        amp_na = AreaMassProperties.Compute(na_brep)
-        na_area = amp_na.Area if amp_na else 0
+    print("=== alignment ===")
+    # find NA face closest to picked face
+    picked_centroid, _ = get_face_outward_normal(brep, picked_face_index)
+    best_na_idx = 0
+    best_na_dist = float("inf")
+    if picked_centroid is not None:
+        for nfi in range(neutral_axis.Faces.Count):
+            nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
+            nf_amp = AreaMassProperties.Compute(nf_brep)
+            if nf_amp is not None:
+                d = picked_centroid.DistanceTo(nf_amp.Centroid)
+                if d < best_na_dist:
+                    best_na_dist = d
+                    best_na_idx = nfi
 
-        best_uf_face = None
-        best_area_diff = float("inf")
-        amp_uf = None
-        flat = unrolled_breps[0]
-        for fi in range(flat.Faces.Count):
-            uf = flat.Faces[fi]
-            uf_b = uf.DuplicateFace(False)
-            uf_amp = AreaMassProperties.Compute(uf_b)
-            if uf_amp:
-                diff = abs(uf_amp.Area - na_area)
-                if diff < best_area_diff:
-                    best_area_diff = diff
-                    best_uf_face = uf
-                    amp_uf = uf_amp
+    # source: find flat face matching NA face by area
+    na_face = neutral_axis.Faces[best_na_idx]
+    na_brep = na_face.DuplicateFace(False)
+    amp_na = AreaMassProperties.Compute(na_brep)
+    na_area = amp_na.Area if amp_na else 0
 
-        if amp_uf and amp_na and best_uf_face is not None:
-            uf_centroid = amp_uf.Centroid
-            na_centroid = amp_na.Centroid
-            plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
-            rc_uf_plane, uf_plane = best_uf_face.TryGetPlane(plane_tol)
-            rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
-            if rc_uf_plane and rc_na_plane:
-                uf_plane.Origin = uf_centroid
-                na_plane.Origin = na_centroid
-                align_xform = Transform.PlaneToPlane(uf_plane, na_plane)
-                print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
-                    picked_face_index, best_na_idx, best_na_dist))
+    best_uf_face = None
+    best_area_diff = float("inf")
+    amp_uf = None
+    flat = unrolled_breps[0]
+    for fi in range(flat.Faces.Count):
+        uf = flat.Faces[fi]
+        uf_b = uf.DuplicateFace(False)
+        uf_amp = AreaMassProperties.Compute(uf_b)
+        if uf_amp:
+            diff = abs(uf_amp.Area - na_area)
+            if diff < best_area_diff:
+                best_area_diff = diff
+                best_uf_face = uf
+                amp_uf = uf_amp
 
+    if amp_uf and amp_na and best_uf_face is not None:
+        uf_centroid = amp_uf.Centroid
+        na_centroid = amp_na.Centroid
+        plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
+        rc_uf_plane, uf_plane = best_uf_face.TryGetPlane(plane_tol)
+        rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
+        if rc_uf_plane and rc_na_plane:
+            uf_plane.Origin = uf_centroid
+            na_plane.Origin = na_centroid
+            xform = Transform.PlaneToPlane(uf_plane, na_plane)
+            print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
+                picked_face_index, best_na_idx, best_na_dist))
+            return xform
+
+    return None
+
+
+def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
+               text_curves, sublayers, align_xform=None):
+    """add 2D curves to fabrication sublayers with optional alignment transform.
+    align_xform maps flat pattern space → 3D NAS space."""
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
     inside_idx = sc.doc.Layers.FindByFullPath(sublayers["inside"], -1)
@@ -1712,23 +1855,11 @@ def unfold_to_2d():
     print("  neutral axis: {} faces (other side had {})".format(
         neutral_axis.Faces.Count, min(count_a, count_b)))
 
-    # step 7: identify bends
-    print("=== bends ===")
-    bend_infos = identify_bends(ref_side)
-    print("  {} bends found".format(len(bend_infos)))
-    # step 8: project bend lines to neutral axis
-    project_bends_to_neutral_axis(bend_infos, neutral_axis)
-    # step 9: compute bend directions
-    determine_bend_directions(bend_infos, picked_normal)
-    for info in bend_infos:
-        print("  bend: {:.1f} {}".format(info["angle"], info["direction"]))
-    # step 10: find ink curves on ref_side (the surface they're drawn on)
+    # step 7: find ink curves
     ink_curves = find_ink_curves(ref_side)
     print("  ink curves: {}".format(len(ink_curves)))
-    # ink curves stay in their original 3D positions on ref_side.
-    # unroll_by_rotation applies each NAS face's rotation transform,
-    # then projects onto the flat NAS plane.
-    # find NAS face closest to picked face (needed for seed + alignment)
+
+    # step 8: find NAS face closest to picked face (for BFS seed + alignment)
     picked_centroid, _ = get_face_outward_normal(brep, face_index)
     picked_na_face = 0
     if picked_centroid is not None:
@@ -1741,24 +1872,58 @@ def unfold_to_2d():
                 if d < best_dist:
                     best_dist = d
                     picked_na_face = nfi
-    # step 11: unroll by face rotation
+
+    # step 9: unroll NAS (adjacency + bend lines derived from NAS edges directly)
     print("=== unroll ===")
-    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, bend_infos, thickness, picked_na_face)
+    unroll_result = unroll_by_rotation(neutral_axis, ink_curves, thickness, picked_na_face)
     if unroll_result is None:
         return
-    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal = unroll_result
+    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal, nas_edge_bends, transforms = unroll_result
     unrolled_breps = [flat_brep]
     print("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
-    # step 13: create bend angle text
-    text_curves = create_bend_text_curves(bend_infos, unrolled_bend, flat_normal)
+
+    # step 10: compute bend directions from NAS geometry
+    for entry in nas_edge_bends:
+        fa_centroid = AreaMassProperties.Compute(
+            neutral_axis.Faces[entry["fa"]].DuplicateFace(False))
+        fb_centroid = AreaMassProperties.Compute(
+            neutral_axis.Faces[entry["fb"]].DuplicateFace(False))
+        if fa_centroid and fb_centroid:
+            mid = entry["edge_crv"].PointAt(entry["edge_crv"].Domain.Mid)
+            inside_vec = Vector3d(fa_centroid.Centroid - mid) + Vector3d(fb_centroid.Centroid - mid)
+            inside_vec.Unitize()
+            dot = Vector3d.Multiply(inside_vec, picked_normal)
+            entry["direction"] = "UP" if dot > 0 else "DN"
+        else:
+            entry["direction"] = "UP"
+    print("=== bends ===")
+    for entry in nas_edge_bends:
+        print("  bend: {:.1f} {} (NAS faces {}↔{})".format(
+            entry["angle"], entry["direction"], entry["fa"], entry["fb"]))
+
+    # step 11: compute alignment transform (flat pattern → 3D NAS space)
+    align_xform = compute_alignment_xform(neutral_axis, unrolled_breps,
+                                           brep, face_index)
+
+    # step 12: compute aligned normal for text readability
+    aligned_normal = flat_normal
+    if align_xform is not None:
+        tip = Point3d(flat_normal.X, flat_normal.Y, flat_normal.Z)
+        org = Point3d(0, 0, 0)
+        tip.Transform(align_xform)
+        org.Transform(align_xform)
+        aligned_normal = Vector3d(tip - org)
+        aligned_normal.Unitize()
+
+    # step 13: bend angle text (skipped for now — focusing on bend lines first)
+    text_curves = []
     # step 14: add curves to sublayers
     sublayers = ensure_sublayers()
-    count = add_output(neutral_axis, unrolled_breps, outside_curves,
-                       inside_curves, unrolled_bend, unrolled_ink,
-                       text_curves, sublayers,
-                       brep=brep, picked_face_index=face_index)
+    count = add_output(outside_curves, inside_curves, unrolled_bend,
+                       unrolled_ink, text_curves, sublayers,
+                       align_xform=align_xform)
 
     sc.doc.Views.Redraw()
 
