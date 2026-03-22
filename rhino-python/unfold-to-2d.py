@@ -1361,70 +1361,30 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     seed_plane_for_proj = face_planes[seed]
     proj_xform = Transform.PlanarProjection(seed_plane_for_proj)
 
-    # DEBUG: bake bend axis points and lines to see where they actually land
-    debug_layer = "03 - Bake"
-    debug_li = sc.doc.Layers.FindByFullPath(debug_layer, -1)
     flat_bend_curves = []
     for bi, entry in enumerate(nas_edge_bends):
         fp1 = entry.get("flat_p1")
         fp2 = entry.get("flat_p2")
         if fp1 is None or fp2 is None:
-            print("  warning: bend {}↔{} has no flat axis".format(
-                entry["fa"], entry["fb"]))
             continue
 
-        # DEBUG: print the raw axis points
-        print("  DEBUG bend {} ({}↔{}): fp1=({:.2f},{:.2f},{:.2f}) fp2=({:.2f},{:.2f},{:.2f})".format(
-            bi, entry["fa"], entry["fb"],
-            fp1.X, fp1.Y, fp1.Z, fp2.X, fp2.Y, fp2.Z))
-
-        # DEBUG: bake text dots at axis endpoints
-        d_attr = Rhino.DocObjects.ObjectAttributes()
-        d_attr.LayerIndex = debug_li
-        d_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-        d_attr.ObjectColor = System.Drawing.Color.Red
-        dot1 = Rhino.Geometry.TextDot("B{}a".format(bi), fp1)
-        dot1.FontHeight = 12
-        sc.doc.Objects.AddTextDot(dot1, d_attr)
-        dot2 = Rhino.Geometry.TextDot("B{}b".format(bi), fp2)
-        dot2.FontHeight = 12
-        sc.doc.Objects.AddTextDot(dot2, d_attr)
-
-        # DEBUG: bake the raw (untrimmed, unprojected) axis line
-        raw_line = LineCurve(fp1, fp2)
-        raw_attr = Rhino.DocObjects.ObjectAttributes()
-        raw_attr.LayerIndex = debug_li
-        raw_attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-        raw_attr.ObjectColor = System.Drawing.Color.Red
-        sc.doc.Objects.AddCurve(raw_line, raw_attr)
-
-        # extend to long line through the flat pattern
+        # extend to long line, project onto seed plane, trim by NAS outline
         direction = Vector3d(fp2 - fp1)
         direction.Unitize()
         long_p1 = fp1 - direction * 1000
         long_p2 = fp2 + direction * 1000
         long_line = LineCurve(long_p1, long_p2)
-
-        # project onto flat NAS plane
         long_line.Transform(proj_xform)
 
-        # trim by NAS outline
         rc_int = Intersection.CurveBrep(long_line, trim_brep, tol)
         if rc_int and len(rc_int) >= 3:
             overlap_curves = rc_int[1]
             if overlap_curves and len(overlap_curves) > 0:
-                print("    CurveBrep: {} overlaps".format(len(overlap_curves)))
                 for oc in overlap_curves:
                     flat_bend_curves.append(oc)
                 continue
-            else:
-                print("    CurveBrep: no overlaps (pts={})".format(
-                    len(rc_int[2]) if len(rc_int) > 2 else "?"))
-        else:
-            print("    CurveBrep failed: rc={}".format(rc_int[0] if rc_int else "None"))
 
         # fallback: untrimmed line between the axis points
-        print("    using fallback line")
         flat_bend_curves.append(LineCurve(fp1, fp2))
 
     # --- transform ink curves (same rotation as their NAS face, then project to flat plane) ---
@@ -1921,9 +1881,24 @@ def unfold_to_2d():
     text_curves = []
     # step 14: add curves to sublayers
     sublayers = ensure_sublayers()
-    count = add_output(outside_curves, inside_curves, unrolled_bend,
-                       unrolled_ink, text_curves, sublayers,
-                       align_xform=align_xform)
+    # bend lines go directly to Mark layer WITHOUT align_xform —
+    # they're already in the correct flat space (same as baked faces on 03 - Bake)
+    mark_idx = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
+    mark_attr = Rhino.DocObjects.ObjectAttributes()
+    mark_attr.LayerIndex = mark_idx
+    bend_guids = []
+    for crv in unrolled_bend:
+        guid = sc.doc.Objects.AddCurve(crv, mark_attr)
+        if guid != System.Guid.Empty:
+            bend_guids.append(guid)
+    for crv in unrolled_ink:
+        guid = sc.doc.Objects.AddCurve(crv, mark_attr)
+        if guid != System.Guid.Empty:
+            bend_guids.append(guid)
+    print("  {} bend/ink curves added to Mark layer (no align_xform)".format(len(bend_guids)))
+    # other output (outside/inside cuts, text) still goes through add_output with alignment
+    count = add_output(outside_curves, inside_curves, [], [],
+                       text_curves, sublayers, align_xform=align_xform)
 
     sc.doc.Views.Redraw()
 
