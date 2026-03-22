@@ -48,7 +48,7 @@ from Rhino.DocObjects import ObjectType
 # constants
 # ---------------------------------------------------------------------------
 STANDARD_GAUGES = [0.100, 0.125, 0.160, 0.190]
-TEXT_HEIGHT = 0.25  # inches
+BEND_LABEL_HEIGHT = 1.0  # inches
 
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1365,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     for bi, entry in enumerate(nas_edge_bends):
         fp1 = entry.get("flat_p1")
         fp2 = entry.get("flat_p2")
+        entry["flat_curves"] = []
         if fp1 is None or fp2 is None:
             continue
 
@@ -1381,11 +1382,14 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             overlap_curves = rc_int[1]
             if overlap_curves and len(overlap_curves) > 0:
                 for oc in overlap_curves:
+                    entry["flat_curves"].append(oc)
                     flat_bend_curves.append(oc)
                 continue
 
         # fallback: untrimmed line between the axis points
-        flat_bend_curves.append(LineCurve(fp1, fp2))
+        fallback = LineCurve(fp1, fp2)
+        entry["flat_curves"].append(fallback)
+        flat_bend_curves.append(fallback)
 
     # --- transform ink curves (same rotation as their NAS face, then project to flat plane) ---
     flat_ink_curves = []
@@ -1537,71 +1541,6 @@ def ensure_sublayers():
     return sublayers
 
 
-
-def create_bend_text_curves(bend_data, unrolled_bend_curves, flat_normal,
-                            picked_normal=None, aligned_normal=None):
-    """create text as curve geometry for bend angle annotations.
-    bend_data: list of dicts with 'angle' and 'direction' keys.
-    flat_normal: unrolled NAS plane normal (for text plane construction in flat space).
-    picked_normal: outward normal of user-selected face in 3D.
-    aligned_normal: flat_normal after alignment transform (for correct flip test).
-    text reads left-to-right when viewing from the picked face side."""
-    all_text_curves = []
-
-    # only create text for bends that have corresponding flat curves
-    count = min(len(unrolled_bend_curves), len(bend_data))
-    if count == 0:
-        return all_text_curves
-
-    # determine if text needs flipping to be readable from picked face side.
-    flip_text = False
-    check_normal = aligned_normal if aligned_normal is not None else flat_normal
-    if picked_normal is not None:
-        dot = Vector3d.Multiply(picked_normal, check_normal)
-        flip_text = dot < 0
-
-    for i in range(count):
-        crv = unrolled_bend_curves[i]
-        info = bend_data[i]
-        angle = info["angle"]
-        direction = info.get("direction", "UP")
-
-        angle_int = int(round(angle))
-        text_content = "{} {}".format(angle_int, direction)
-
-        mid_t = crv.Domain.Mid
-        mid_pt = crv.PointAt(mid_t)
-        tangent = crv.TangentAt(mid_t)
-        tangent.Unitize()
-
-        if flip_text:
-            tangent = -tangent
-
-        # perpendicular in the unrolled NAS plane
-        perp = Vector3d.CrossProduct(flat_normal, tangent)
-        perp.Unitize()
-
-        text_origin = mid_pt + perp * TEXT_HEIGHT * 2
-
-        text_plane = Plane(text_origin, tangent, perp)
-
-        ds = sc.doc.DimStyles.Current
-        te = TextEntity.Create(text_content, text_plane, ds, False, 0, 0)
-        if te is None:
-            continue
-
-        te.TextHeight = TEXT_HEIGHT
-        # use Mecsoft_Font-1 (CNC single-stroke font)
-        mecsoft = Rhino.DocObjects.Font.FromQuartetProperties(
-            "Mecsoft_Font-1", False, False)
-        if mecsoft is not None:
-            te.Font = mecsoft
-
-        curves = te.CreateCurves(ds, False)
-        if curves and len(curves) > 0:
-            all_text_curves.extend(curves)
-
-    return all_text_curves
 
 
 def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_index):
@@ -1867,19 +1806,7 @@ def unfold_to_2d():
     align_xform = compute_alignment_xform(neutral_axis, unrolled_breps,
                                            brep, face_index)
 
-    # step 12: compute aligned normal for text readability
-    aligned_normal = flat_normal
-    if align_xform is not None:
-        tip = Point3d(flat_normal.X, flat_normal.Y, flat_normal.Z)
-        org = Point3d(0, 0, 0)
-        tip.Transform(align_xform)
-        org.Transform(align_xform)
-        aligned_normal = Vector3d(tip - org)
-        aligned_normal.Unitize()
-
-    # step 13: bend angle text (skipped for now — focusing on bend lines first)
-    text_curves = []
-    # step 14: add curves to sublayers
+    # step 12: add curves to sublayers
     sublayers = ensure_sublayers()
     # bend lines go directly to Mark layer WITHOUT align_xform —
     # they're already in the correct flat space (same as baked faces on 03 - Bake)
@@ -1896,9 +1823,62 @@ def unfold_to_2d():
         if guid != System.Guid.Empty:
             bend_guids.append(guid)
     print("  {} bend/ink curves added to Mark layer (no align_xform)".format(len(bend_guids)))
-    # other output (outside/inside cuts, text) still goes through add_output with alignment
+
+    # step 13: bend angle labels — in flat space, same as bend lines
+    label_ds = sc.doc.DimStyles.Current.Duplicate()
+    label_ds.TextHeight = BEND_LABEL_HEIGHT
+    mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
+    if mecsoft is not None:
+        label_ds.Font = mecsoft
+    flip_text = Vector3d.Multiply(flat_normal, picked_normal) < 0
+    for entry in nas_edge_bends:
+        flat_crvs = entry.get("flat_curves", [])
+        if not flat_crvs:
+            continue
+        # place label at midpoint of the longest output bend line for this bend
+        main_crv = max(flat_crvs, key=lambda c: c.GetLength())
+        mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
+
+        # tangent from the bend axis direction
+        fp1 = entry.get("flat_p1")
+        fp2 = entry.get("flat_p2")
+        if fp1 is None or fp2 is None:
+            continue
+        tangent = Vector3d(fp2 - fp1)
+        tangent.Unitize()
+        if flip_text:
+            tangent = -tangent
+
+        perp = Vector3d.CrossProduct(flat_normal, tangent)
+        perp.Unitize()
+        text_origin = mid_pt + perp * BEND_LABEL_HEIGHT * 0.25
+
+        angle_int = int(round(entry["angle"]))
+        direction = entry.get("direction", "UP")
+        text_content = "{} {}".format(angle_int, direction)
+
+        text_plane = Plane(text_origin, tangent, perp)
+        te = TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
+        if te is None:
+            continue
+        te.TextHeight = BEND_LABEL_HEIGHT
+        if mecsoft is not None:
+            te.Font = mecsoft
+        curves = te.CreateCurves(label_ds, False)
+        if curves and len(curves) > 0:
+            label_guids = []
+            for crv in curves:
+                guid = sc.doc.Objects.AddCurve(crv, mark_attr)
+                if guid != System.Guid.Empty:
+                    label_guids.append(guid)
+            if label_guids:
+                grp = sc.doc.Groups.Add()
+                for g in label_guids:
+                    sc.doc.Groups.AddToGroup(grp, g)
+
+    # step 14: other output (outside/inside cuts) through add_output with alignment
     count = add_output(outside_curves, inside_curves, [], [],
-                       text_curves, sublayers, align_xform=align_xform)
+                       [], sublayers, align_xform=align_xform)
 
     sc.doc.Views.Redraw()
 
