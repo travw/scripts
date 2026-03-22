@@ -23,23 +23,7 @@ import Rhino
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
 import math
-from Rhino.Geometry import (
-    AreaMassProperties,
-    Brep,
-    BrepLoopType,
-    Curve,
-    CurveSimplifyOptions,
-    LineCurve,
-    Line,
-    Plane,
-    Point3d,
-    PointContainment,
-    PointFaceRelation,
-    PolylineCurve,
-    TextEntity,
-    Transform,
-    Vector3d,
-)
+import Rhino.Geometry as rg
 from Rhino.Geometry.Intersect import Intersection
 from Rhino.Input.Custom import GetObject
 from Rhino.DocObjects import ObjectType
@@ -59,7 +43,7 @@ BEND_LABEL_HEIGHT = 1.0  # inches
 def _doc_translate(curve, dx, dy, dz):
     """translate a curve using doc round-trip (CPython 3 workaround).
     in-memory Curve.Translate() doesn't work reliably in CPython 3."""
-    xf = Transform.Translation(dx, dy, dz)
+    xf = rg.Transform.Translation(dx, dy, dz)
     temp_id = sc.doc.Objects.AddCurve(curve)
     new_id = sc.doc.Objects.Transform(temp_id, xf, True)
     obj = sc.doc.Objects.FindId(new_id)
@@ -113,7 +97,7 @@ def get_face_outward_normal(brep, face_index):
     face_brep = face.DuplicateFace(False)
     if face_brep is None:
         return None, None
-    amp = AreaMassProperties.Compute(face_brep)
+    amp = rg.AreaMassProperties.Compute(face_brep)
     if amp is None:
         return None, None
     centroid = amp.Centroid
@@ -142,11 +126,11 @@ def _untrim_face(face):
         return face_brep
     # try to create a planar brep from just the outer boundary
     tol = sc.doc.ModelAbsoluteTolerance
-    planar = Brep.CreatePlanarBreps([outer_crv], tol)
+    planar = rg.Brep.CreatePlanarBreps([outer_crv], tol)
     if planar and len(planar) > 0:
         return planar[0]
     # imperfect edges: retry with relaxed tolerance for slightly non-planar curves
-    planar = Brep.CreatePlanarBreps([outer_crv], tol * 100)
+    planar = rg.Brep.CreatePlanarBreps([outer_crv], tol * 100)
     if planar and len(planar) > 0:
         return planar[0]
     return face_brep
@@ -160,7 +144,7 @@ def _shoot_thickness_ray(brep, face_index, origin, normal, tol):
     for direction in [normal, -normal]:
         start = origin + direction * 0.001
         end = origin + direction * 2.0
-        ray = LineCurve(Line(start, end))
+        ray = rg.LineCurve(rg.Line(start, end))
         for fi in range(brep.Faces.Count):
             if fi == face_index:
                 continue
@@ -196,7 +180,7 @@ def detect_thickness(brep, face_index):
 
     # phase 1: try centroid ray (fast path)
     face_brep = face.DuplicateFace(False)
-    amp = AreaMassProperties.Compute(face_brep) if face_brep else None
+    amp = rg.AreaMassProperties.Compute(face_brep) if face_brep else None
     if amp is not None:
         centroid = amp.Centroid
         rc, u, v = face.ClosestPoint(centroid)
@@ -222,7 +206,7 @@ def detect_thickness(brep, face_index):
             # check if UV point is on trimmed face (not in a hole)
             # use int comparison for CPython 3 enum safety
             pfr = face.IsPointOnFace(u, v)
-            is_exterior = (pfr == PointFaceRelation.Exterior or int(pfr) == 2)
+            is_exterior = (pfr == rg.PointFaceRelation.Exterior or int(pfr) == 2)
             if is_exterior:
                 continue
             interior_count += 1
@@ -308,7 +292,7 @@ def classify_faces(brep, thickness):
                 break
             start = ci + direction * 0.001
             end = ci + direction * 2.0  # generous ray length
-            ray = LineCurve(Line(start, end))
+            ray = rg.LineCurve(rg.Line(start, end))
 
             for j in range(brep.Faces.Count):
                 if i == j:
@@ -327,7 +311,7 @@ def classify_faces(brep, thickness):
                         # use abs(dot) to handle breps with inconsistent face orientation
                         _, nj = face_data[j]
                         if nj is not None:
-                            dot = Vector3d.Multiply(ni, nj)
+                            dot = rg.Vector3d.Multiply(ni, nj)
                             if abs(dot) < 0.5:
                                 # track best rejected candidate
                                 if best_dist is None or abs(dist - thickness) < abs(best_dist - thickness):
@@ -350,7 +334,7 @@ def classify_faces(brep, thickness):
                             best_dist = dist
                             best_j = j
                             _, nj = face_data[j]
-                            best_dot = Vector3d.Multiply(ni, nj) if nj is not None else None
+                            best_dot = rg.Vector3d.Multiply(ni, nj) if nj is not None else None
                 if found:
                     break
         if not found and best_dist is not None:
@@ -416,12 +400,12 @@ def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
             return None
         if len(face_breps) == 1:
             return face_breps[0]
-        joined = Brep.JoinBreps(face_breps, tol)
+        joined = rg.Brep.JoinBreps(face_breps, tol)
         if joined and len(joined) == 1:
             return joined[0]
         elif joined and len(joined) > 1:
             # try looser tolerance
-            joined2 = Brep.JoinBreps(list(joined), tol * 10)
+            joined2 = rg.Brep.JoinBreps(list(joined), tol * 10)
             if joined2 and len(joined2) == 1:
                 return joined2[0]
             # force merge
@@ -460,9 +444,9 @@ def identify_reference_side(side_a, side_b, brep, picked_face_index):
 
 def _make_planar(curves, tol):
     """create planar brep from curves, trying normal then loose tolerance."""
-    result = Brep.CreatePlanarBreps(curves, tol)
+    result = rg.Brep.CreatePlanarBreps(curves, tol)
     if not result or len(result) == 0:
-        result = Brep.CreatePlanarBreps(curves, tol * 100)
+        result = rg.Brep.CreatePlanarBreps(curves, tol * 100)
     if result and len(result) > 0:
         return result[0]
     return None
@@ -481,7 +465,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
 
     returns a closed Curve on the NAP, or None."""
     normal = face_normals[fi]
-    offset_vec = Vector3d(-normal.X * offset_dist,
+    offset_vec = rg.Vector3d(-normal.X * offset_dist,
                            -normal.Y * offset_dist,
                            -normal.Z * offset_dist)
     nap_plane = face_planes[fi]
@@ -504,7 +488,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
 
     # step 1.5: compute face geometry for filtering and centroid
     face_brep = face.DuplicateFace(False)
-    amp = AreaMassProperties.Compute(face_brep)
+    amp = rg.AreaMassProperties.Compute(face_brep)
     if amp is None:
         return fallback
     centroid_nap = nap_plane.ClosestPoint(amp.Centroid)
@@ -521,7 +505,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     raw_curves_for_split = list(curves)
 
     # step 2: join intersection curves and find the closed loop for this face
-    joined = Curve.JoinCurves(curves, tol * 10)
+    joined = rg.Curve.JoinCurves(curves, tol * 10)
     if joined is None or len(joined) == 0:
         return fallback
 
@@ -530,13 +514,13 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         if not crv.IsClosed:
             continue
         contain = crv.Contains(centroid_nap, nap_plane, tol)
-        if contain == PointContainment.Inside:
+        if contain == rg.PointContainment.Inside:
             if raw_loop is None:
                 raw_loop = crv
             else:
                 # pick largest loop containing centroid (outer boundary, not window holes)
-                amp_new = AreaMassProperties.Compute(crv)
-                amp_old = AreaMassProperties.Compute(raw_loop)
+                amp_new = rg.AreaMassProperties.Compute(crv)
+                amp_old = rg.AreaMassProperties.Compute(raw_loop)
                 if amp_new and amp_old and amp_new.Area > amp_old.Area:
                     raw_loop = crv
     if raw_loop is None:
@@ -573,7 +557,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                 if cfi == fi or cfi in skipped_faces:
                     continue
                 cf_brep = ref_side.Faces[cfi].DuplicateFace(False)
-                cf_amp = AreaMassProperties.Compute(cf_brep)
+                cf_amp = rg.AreaMassProperties.Compute(cf_brep)
                 if cf_amp is not None:
                     d = edge_mid.DistanceTo(cf_amp.Centroid)
                     if d < best_d:
@@ -593,26 +577,26 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         return raw_loop
 
     # step 4: trim raw loop at PP planes using Brep.Trim
-    raw_breps = Brep.CreatePlanarBreps([raw_loop], tol)
+    raw_breps = rg.Brep.CreatePlanarBreps([raw_loop], tol)
     if not raw_breps or len(raw_breps) == 0:
-        raw_breps = Brep.CreatePlanarBreps([raw_loop], tol * 100)
+        raw_breps = rg.Brep.CreatePlanarBreps([raw_loop], tol * 100)
     if not raw_breps or len(raw_breps) == 0:
         return raw_loop
 
     trimmed_brep = raw_breps[0]
     for tgt, pp_line in bend_map.items():
-        pp_dir = Vector3d(pp_line.Direction)
+        pp_dir = rg.Vector3d(pp_line.Direction)
         pp_dir.Unitize()
-        trim_normal = Vector3d.CrossProduct(pp_dir, nap_plane.Normal)
+        trim_normal = rg.Vector3d.CrossProduct(pp_dir, nap_plane.Normal)
         trim_normal.Unitize()
         pp_mid = pp_line.PointAt(pp_line.ClosestParameter(centroid_nap))
-        if Vector3d.Multiply(centroid_nap - pp_mid, trim_normal) < 0:
+        if rg.Vector3d.Multiply(centroid_nap - pp_mid, trim_normal) < 0:
             trim_normal = -trim_normal
-        trim_plane = Plane(pp_mid, trim_normal)
+        trim_plane = rg.Plane(pp_mid, trim_normal)
 
         # trim both orientations and pick the piece containing the centroid
         pieces_pos = trimmed_brep.Trim(trim_plane, tol)
-        trim_plane_flip = Plane(pp_mid, -trim_normal)
+        trim_plane_flip = rg.Plane(pp_mid, -trim_normal)
         pieces_neg = trimmed_brep.Trim(trim_plane_flip, tol)
         all_pieces = list(pieces_pos or []) + list(pieces_neg or [])
         if all_pieces:
@@ -636,7 +620,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             best_area = 0
             for fi_s in range(split_brep.Faces.Count):
                 piece = split_brep.Faces[fi_s].DuplicateFace(False)
-                amp_s = AreaMassProperties.Compute(piece)
+                amp_s = rg.AreaMassProperties.Compute(piece)
                 if amp_s and amp_s.Area > best_area:
                     best_area = amp_s.Area
                     best_piece = piece
@@ -670,14 +654,14 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
     # near AND parallel to a PP line. corner/notch segments at angles are
     # preserved even if they're close to a PP line.
     for i in range(len(pts) - 1):
-        seg_dir = Vector3d(pts[i + 1].X - pts[i].X,
+        seg_dir = rg.Vector3d(pts[i + 1].X - pts[i].X,
                            pts[i + 1].Y - pts[i].Y,
                            pts[i + 1].Z - pts[i].Z)
         seg_len = seg_dir.Length
         if seg_len < tol:
             continue
         seg_dir.Unitize()
-        mid = Point3d((pts[i].X + pts[i + 1].X) / 2,
+        mid = rg.Point3d((pts[i].X + pts[i + 1].X) / 2,
                       (pts[i].Y + pts[i + 1].Y) / 2,
                       (pts[i].Z + pts[i + 1].Z) / 2)
         for tgt, pp_line in bend_map.items():
@@ -686,9 +670,9 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             if dist > tol * 10:
                 continue
             # check parallelism: segment must be nearly parallel to PP line
-            pp_dir = Vector3d(pp_line.Direction)
+            pp_dir = rg.Vector3d(pp_line.Direction)
             pp_dir.Unitize()
-            dot = abs(Vector3d.Multiply(seg_dir, pp_dir))
+            dot = abs(rg.Vector3d.Multiply(seg_dir, pp_dir))
             if dot < 0.999:
                 continue  # angled segment (corner/notch) — don't snap
             # material check: verify adjacent face has material at this location
@@ -696,7 +680,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
             adj_loop = adj_face.OuterLoop.To3dCurve()
             if adj_loop is not None:
                 adj_normal = face_normals[tgt]
-                adj_ov = Vector3d(-adj_normal.X * offset_dist,
+                adj_ov = rg.Vector3d(-adj_normal.X * offset_dist,
                                    -adj_normal.Y * offset_dist,
                                    -adj_normal.Z * offset_dist)
                 adj_loop_nap = _doc_translate(adj_loop, adj_ov.X, adj_ov.Y, adj_ov.Z)
@@ -704,7 +688,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                 mid_on_adj = adj_plane.ClosestPoint(mid)
                 if adj_loop_nap and adj_loop_nap.IsClosed:
                     contain = adj_loop_nap.Contains(mid_on_adj, adj_plane, tol)
-                    if contain != PointContainment.Inside:
+                    if contain != rg.PointContainment.Inside:
                         continue  # no material on adjacent face here — don't snap
             # snap both endpoints to PP line
             t0 = pp_line.ClosestParameter(pts[i])
@@ -718,7 +702,7 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         pts[i] = nap_plane.ClosestPoint(pts[i])
 
     # ensure closure
-    pts[-1] = Point3d(pts[0].X, pts[0].Y, pts[0].Z)
+    pts[-1] = rg.Point3d(pts[0].X, pts[0].Y, pts[0].Z)
 
     # remove consecutive duplicates and short segments (trim corner artifacts)
     cleaned = [pts[0]]
@@ -729,9 +713,9 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
         cleaned.pop()
     if len(cleaned) < 3:
         return boundary
-    cleaned.append(Point3d(cleaned[0].X, cleaned[0].Y, cleaned[0].Z))
+    cleaned.append(rg.Point3d(cleaned[0].X, cleaned[0].Y, cleaned[0].Z))
 
-    return PolylineCurve(cleaned)
+    return rg.PolylineCurve(cleaned)
 
 
 def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=None,
@@ -761,7 +745,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
             continue
         # get outward normal for this face in the ref_side context
         face_brep = face.DuplicateFace(False)
-        amp = AreaMassProperties.Compute(face_brep)
+        amp = rg.AreaMassProperties.Compute(face_brep)
         if amp is None:
             _log("warning: face {} AreaMassProperties failed, skipping".format(fi))
             continue
@@ -781,7 +765,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
             orig_fi = None
             # find original face index for this ref_side face
             face_brep_c = face.DuplicateFace(False)
-            amp_c = AreaMassProperties.Compute(face_brep_c)
+            amp_c = rg.AreaMassProperties.Compute(face_brep_c)
             if amp_c is not None:
                 best_oi = -1
                 best_od = float("inf")
@@ -801,7 +785,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
                     original_brep, partner_fi)
                 if partner_centroid is not None:
                     to_partner = partner_centroid - centroid
-                    if Vector3d.Multiply(to_partner, normal) > 0:
+                    if rg.Vector3d.Multiply(to_partner, normal) > 0:
                         normal = -normal  # normal was pointing toward partner (inward), flip to outward
                     direction_set = True
         if not direction_set:
@@ -819,7 +803,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
 
         # offset plane inward (opposite to outward normal)
         offset_origin = plane.Origin - normal * offset_dist
-        face_planes[fi] = Plane(offset_origin, plane.XAxis, plane.YAxis)
+        face_planes[fi] = rg.Plane(offset_origin, plane.XAxis, plane.YAxis)
         face_normals[fi] = normal
 
     if len(face_planes) < 1:
@@ -836,7 +820,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
     if original_brep is not None:
         for rfi in range(ref_side.Faces.Count):
             rf_brep = ref_side.Faces[rfi].DuplicateFace(False)
-            rf_amp = AreaMassProperties.Compute(rf_brep)
+            rf_amp = rg.AreaMassProperties.Compute(rf_brep)
             if rf_amp is None:
                 continue
             rc = rf_amp.Centroid
@@ -858,7 +842,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
     skipped_faces = set()
     for fi in face_planes:
         face_brep_check = ref_side.Faces[fi].DuplicateFace(False)
-        amp_check = AreaMassProperties.Compute(face_brep_check)
+        amp_check = rg.AreaMassProperties.Compute(face_brep_check)
         if amp_check is not None and amp_check.Area < min_area:
             skipped_faces.add(fi)
 
@@ -880,7 +864,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
         # but shouldn't generate their own NAS face)
         if fi in skipped_faces:
             face_brep_area = face.DuplicateFace(False)
-            amp_area = AreaMassProperties.Compute(face_brep_area)
+            amp_area = rg.AreaMassProperties.Compute(face_brep_area)
             area_val = amp_area.Area if amp_area else 0
             _log("  {}: area {:.4f} < {:.4f} min → SKIPPED (transition face)".format(
                 fl, area_val, min_area))
@@ -898,14 +882,14 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
             continue
 
         # collect inner loops (window openings) translated to offset plane
-        offset_vec = Vector3d(-normal.X * offset_dist,
+        offset_vec = rg.Vector3d(-normal.X * offset_dist,
                                -normal.Y * offset_dist,
                                -normal.Z * offset_dist)
         all_curves = [boundary]
         inner_count = 0
         for li in range(face.Loops.Count):
             lp = face.Loops[li]
-            if lp.LoopType == BrepLoopType.Outer:
+            if lp.LoopType == rg.BrepLoopType.Outer:
                 continue
             inner_3d = lp.To3dCurve()
             if inner_3d is None:
@@ -942,12 +926,12 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
     if len(neutral_faces) == 1:
         result = neutral_faces[0]
     else:
-        joined = Brep.JoinBreps(neutral_faces, tol)
+        joined = rg.Brep.JoinBreps(neutral_faces, tol)
         if joined and len(joined) == 1:
             result = joined[0]
         elif joined and len(joined) > 1:
             # faces didn't all join — try looser tolerance
-            joined2 = Brep.JoinBreps(joined, tol * 10)
+            joined2 = rg.Brep.JoinBreps(joined, tol * 10)
             if joined2 and len(joined2) == 1:
                 result = joined2[0]
             else:
@@ -983,8 +967,8 @@ def identify_bends(ref_side):
         face_a = ref_side.Faces[fa]
         face_b = ref_side.Faces[fb]
 
-        amp_a = AreaMassProperties.Compute(face_a)
-        amp_b = AreaMassProperties.Compute(face_b)
+        amp_a = rg.AreaMassProperties.Compute(face_a)
+        amp_b = rg.AreaMassProperties.Compute(face_b)
         if amp_a is None or amp_b is None:
             continue
 
@@ -1003,7 +987,7 @@ def identify_bends(ref_side):
         if face_b.OrientationIsReversed:
             nb = -nb
 
-        dot = Vector3d.Multiply(na, nb)
+        dot = rg.Vector3d.Multiply(na, nb)
         dot = max(-1.0, min(1.0, dot))
 
         if dot > 0.99:
@@ -1045,7 +1029,7 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
     for fi in range(nas.Faces.Count):
         face = nas.Faces[fi]
         face_brep = face.DuplicateFace(False)
-        amp = AreaMassProperties.Compute(face_brep)
+        amp = rg.AreaMassProperties.Compute(face_brep)
         if amp:
             nas_centroids[fi] = amp.Centroid
         plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
@@ -1116,20 +1100,20 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
                     # use internal edge endpoints projected onto PP line
                     t0 = pp_line.ClosestParameter(best_edge.PointAtStart)
                     t1 = pp_line.ClosestParameter(best_edge.PointAtEnd)
-                    axis_line = Line(pp_line.PointAt(t0), pp_line.PointAt(t1))
+                    axis_line = rg.Line(pp_line.PointAt(t0), pp_line.PointAt(t1))
                 else:
                     # use 3D bend curve extent projected onto PP line
                     crv = info["curve_3d"]
                     t0 = pp_line.ClosestParameter(crv.PointAtStart)
                     t1 = pp_line.ClosestParameter(crv.PointAtEnd)
-                    axis_line = Line(pp_line.PointAt(t0), pp_line.PointAt(t1))
+                    axis_line = rg.Line(pp_line.PointAt(t0), pp_line.PointAt(t1))
 
         if axis_line is None:
             # last resort fallback
             crv = info["curve_3d"]
-            axis_line = Line(crv.PointAtStart, crv.PointAtEnd)
+            axis_line = rg.Line(crv.PointAtStart, crv.PointAtEnd)
 
-        info["curve_na"] = LineCurve(axis_line)
+        info["curve_na"] = rg.LineCurve(axis_line)
         info["na_axis"] = axis_line
 
         print("  bend {}: {:.1f}° → NAS faces {}↔{}, axis len={:.2f}\"".format(
@@ -1153,16 +1137,16 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         plane_tol = max(tol * 100, 0.1)
         rc, plane = face.TryGetPlane(plane_tol)
         if rc:
-            amp = AreaMassProperties.Compute(face.DuplicateFace(False))
+            amp = rg.AreaMassProperties.Compute(face.DuplicateFace(False))
             if amp:
                 mid_u = face.Domain(0).Mid
                 mid_v = face.Domain(1).Mid
                 n = face.NormalAt(mid_u, mid_v)
                 if face.OrientationIsReversed:
                     n.Reverse()
-                plane = Plane(amp.Centroid, plane.XAxis, plane.YAxis)
-                if Vector3d.Multiply(plane.Normal, n) < 0:
-                    plane = Plane(plane.Origin, plane.XAxis, -plane.YAxis)
+                plane = rg.Plane(amp.Centroid, plane.XAxis, plane.YAxis)
+                if rg.Vector3d.Multiply(plane.Normal, n) < 0:
+                    plane = rg.Plane(plane.Origin, plane.XAxis, -plane.YAxis)
             face_planes[fi] = plane
 
     if len(face_planes) < n_faces:
@@ -1185,7 +1169,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             continue
         na = face_planes[fa].Normal
         nb = face_planes[fb].Normal
-        dot_n = max(-1.0, min(1.0, Vector3d.Multiply(na, nb)))
+        dot_n = max(-1.0, min(1.0, rg.Vector3d.Multiply(na, nb)))
         if abs(dot_n) > 0.99:
             continue  # coplanar, not a bend
 
@@ -1206,7 +1190,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     for (fa, fb), edges in bend_edges_by_pair.items():
         # pick longest edge for rotation axis
         longest = max(edges, key=lambda c: c.GetLength())
-        axis_line = Line(longest.PointAtStart, longest.PointAtEnd)
+        axis_line = rg.Line(longest.PointAtStart, longest.PointAtEnd)
         bend_angle = bend_angles_by_pair[(fa, fb)]
 
         bend_entry = {
@@ -1235,17 +1219,17 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             seed = fi
             break
     seed_plane = face_planes[seed]
-    transforms[seed] = Transform.Identity
+    transforms[seed] = rg.Transform.Identity
     flat_normal = seed_plane.Normal  # target normal for all flattened faces
     visited.add(seed)
 
     # helper: transform a direction vector through a transform
     def xform_normal(n, xf):
-        tip = Point3d(n.X, n.Y, n.Z)
-        org = Point3d(0, 0, 0)
+        tip = rg.Point3d(n.X, n.Y, n.Z)
+        org = rg.Point3d(0, 0, 0)
         tip.Transform(xf)
         org.Transform(xf)
-        v = Vector3d(tip - org)
+        v = rg.Vector3d(tip - org)
         v.Unitize()
         return v
 
@@ -1261,14 +1245,14 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 continue
 
             # transform the bend axis to the flattened state
-            p1 = Point3d(axis_line.From)
-            p2 = Point3d(axis_line.To)
+            p1 = rg.Point3d(axis_line.From)
+            p2 = rg.Point3d(axis_line.To)
             p1.Transform(current_xform)
             p2.Transform(current_xform)
             # store flat axis endpoints — these define the bend line in flat space
-            bend_entry["flat_p1"] = Point3d(p1)
-            bend_entry["flat_p2"] = Point3d(p2)
-            axis_dir = Vector3d(p2 - p1)
+            bend_entry["flat_p1"] = rg.Point3d(p1)
+            bend_entry["flat_p2"] = rg.Point3d(p2)
+            axis_dir = rg.Vector3d(p2 - p1)
             axis_dir.Unitize()
 
             # direct rotation: compute exact angle to align neighbor
@@ -1276,39 +1260,39 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             nei_n = xform_normal(face_planes[neighbor].Normal, current_xform)
 
             # project both normals onto plane perpendicular to bend axis
-            nei_proj = nei_n - axis_dir * Vector3d.Multiply(nei_n, axis_dir)
-            flat_proj = flat_normal - axis_dir * Vector3d.Multiply(flat_normal, axis_dir)
+            nei_proj = nei_n - axis_dir * rg.Vector3d.Multiply(nei_n, axis_dir)
+            flat_proj = flat_normal - axis_dir * rg.Vector3d.Multiply(flat_normal, axis_dir)
             nei_proj.Unitize()
             flat_proj.Unitize()
 
             # signed angle from nei_proj to flat_proj around axis_dir
-            dot_val = Vector3d.Multiply(nei_proj, flat_proj)
-            cross = Vector3d.CrossProduct(nei_proj, flat_proj)
-            sin_val = Vector3d.Multiply(cross, axis_dir)
+            dot_val = rg.Vector3d.Multiply(nei_proj, flat_proj)
+            cross = rg.Vector3d.CrossProduct(nei_proj, flat_proj)
+            sin_val = rg.Vector3d.Multiply(cross, axis_dir)
             flatten_angle = math.atan2(sin_val, dot_val)
 
-            rot = Transform.Rotation(flatten_angle, axis_dir, p1)
-            best_combined = Transform.Multiply(rot, current_xform)
+            rot = rg.Transform.Rotation(flatten_angle, axis_dir, p1)
+            best_combined = rg.Transform.Multiply(rot, current_xform)
             chosen_angle = flatten_angle
 
             # verify neighbor unfolds to opposite side of bend edge
-            cur_amp = AreaMassProperties.Compute(nas.Faces[current].DuplicateFace(False))
-            cur_c = Point3d(cur_amp.Centroid)
+            cur_amp = rg.AreaMassProperties.Compute(nas.Faces[current].DuplicateFace(False))
+            cur_c = rg.Point3d(cur_amp.Centroid)
             cur_c.Transform(current_xform)
-            nei_amp = AreaMassProperties.Compute(nas.Faces[neighbor].DuplicateFace(False))
-            nei_c = Point3d(nei_amp.Centroid)
+            nei_amp = rg.AreaMassProperties.Compute(nas.Faces[neighbor].DuplicateFace(False))
+            nei_c = rg.Point3d(nei_amp.Centroid)
             nei_c.Transform(best_combined)
 
             # side test: cross(axis, centroid_vec) · flat_normal gives signed side
-            cur_side = Vector3d.Multiply(
-                Vector3d.CrossProduct(axis_dir, Vector3d(cur_c - p1)), flat_normal)
-            nei_side = Vector3d.Multiply(
-                Vector3d.CrossProduct(axis_dir, Vector3d(nei_c - p1)), flat_normal)
+            cur_side = rg.Vector3d.Multiply(
+                rg.Vector3d.CrossProduct(axis_dir, rg.Vector3d(cur_c - p1)), flat_normal)
+            nei_side = rg.Vector3d.Multiply(
+                rg.Vector3d.CrossProduct(axis_dir, rg.Vector3d(nei_c - p1)), flat_normal)
 
             if cur_side * nei_side > 0:
                 # same side — flip by adding pi
-                rot2 = Transform.Rotation(flatten_angle + math.pi, axis_dir, p1)
-                best_combined = Transform.Multiply(rot2, current_xform)
+                rot2 = rg.Transform.Rotation(flatten_angle + math.pi, axis_dir, p1)
+                best_combined = rg.Transform.Multiply(rot2, current_xform)
                 chosen_angle = flatten_angle + math.pi
 
             transforms[neighbor] = best_combined
@@ -1331,12 +1315,12 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         if fi not in transforms:
             continue
         result_n = xform_normal(face_planes[fi].Normal, transforms[fi])
-        dot = Vector3d.Multiply(result_n, flat_normal)
+        dot = rg.Vector3d.Multiply(result_n, flat_normal)
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
         flat_faces.append(face_brep)
         flat_face_breps[fi] = face_brep
-        amp = AreaMassProperties.Compute(face_brep)
+        amp = rg.AreaMassProperties.Compute(face_brep)
         seed_tag = " (SEED)" if fi == seed else ""
         print("    face {}: n=({:.4f},{:.4f},{:.4f}) dot={:.4f} area={:.1f}{}".format(
             fi, result_n.X, result_n.Y, result_n.Z, dot,
@@ -1348,8 +1332,8 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             fa, fb = entry["fa"], entry["fb"]
             xf = transforms.get(fa) or transforms.get(fb)
             if xf:
-                cp1 = Point3d(entry["axis"].From)
-                cp2 = Point3d(entry["axis"].To)
+                cp1 = rg.Point3d(entry["axis"].From)
+                cp2 = rg.Point3d(entry["axis"].To)
                 cp1.Transform(xf)
                 cp2.Transform(xf)
                 entry["flat_p1"] = cp1
@@ -1357,10 +1341,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
 
     # --- build flat bend lines: extend axes, project onto seed plane, trim by NAS outline ---
     # join flat faces to get the NAS outline for trimming
-    joined = Brep.JoinBreps([fb for fb in flat_faces], tol * 10)
+    joined = rg.Brep.JoinBreps([fb for fb in flat_faces], tol * 10)
     trim_brep = joined[0] if joined and len(joined) > 0 else flat_faces[0]
     seed_plane_for_proj = face_planes[seed]
-    proj_xform = Transform.PlanarProjection(seed_plane_for_proj)
+    proj_xform = rg.Transform.PlanarProjection(seed_plane_for_proj)
 
     flat_bend_curves = []
     for bi, entry in enumerate(nas_edge_bends):
@@ -1371,11 +1355,11 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             continue
 
         # extend to long line, project onto seed plane, trim by NAS outline
-        direction = Vector3d(fp2 - fp1)
+        direction = rg.Vector3d(fp2 - fp1)
         direction.Unitize()
         long_p1 = fp1 - direction * 1000
         long_p2 = fp2 + direction * 1000
-        long_line = LineCurve(long_p1, long_p2)
+        long_line = rg.LineCurve(long_p1, long_p2)
         long_line.Transform(proj_xform)
 
         rc_int = Intersection.CurveBrep(long_line, trim_brep, tol)
@@ -1383,10 +1367,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             overlap_curves = rc_int[1]
             if overlap_curves and len(overlap_curves) > 0:
                 # join collinear segments that CurveBrep splits unnecessarily
-                joined = Curve.JoinCurves(overlap_curves, tol)
+                joined = rg.Curve.JoinCurves(overlap_curves, tol)
                 result = []
                 for jc in (joined if joined else overlap_curves):
-                    simplified = jc.Simplify(CurveSimplifyOptions.All, tol, tol * 10)
+                    simplified = jc.Simplify(rg.CurveSimplifyOptions.All, tol, tol * 10)
                     result.append(simplified if simplified else jc)
                 for oc in result:
                     entry["flat_curves"].append(oc)
@@ -1394,14 +1378,14 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 continue
 
         # fallback: untrimmed line between the axis points
-        fallback = LineCurve(fp1, fp2)
+        fallback = rg.LineCurve(fp1, fp2)
         entry["flat_curves"].append(fallback)
         flat_bend_curves.append(fallback)
 
     # --- transform ink curves (same rotation as their NAS face, then project to flat plane) ---
     flat_ink_curves = []
     seed_plane = face_planes[seed]
-    proj_to_plane = Transform.PlanarProjection(seed_plane)
+    proj_to_plane = rg.Transform.PlanarProjection(seed_plane)
     for guid, crv in ink_curves:
         mid = crv.PointAt(crv.Domain.Mid)
         best_fi = None
@@ -1473,7 +1457,7 @@ def determine_bend_directions(bend_infos, picked_normal):
         inside_vec = (ca - mid) + (cb - mid)
         inside_vec.Unitize()
 
-        dot = Vector3d.Multiply(inside_vec, picked_normal)
+        dot = rg.Vector3d.Multiply(inside_vec, picked_normal)
         info["direction"] = "UP" if dot > 0 else "DN"
 
 
@@ -1564,7 +1548,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
     if picked_centroid is not None:
         for nfi in range(neutral_axis.Faces.Count):
             nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
-            nf_amp = AreaMassProperties.Compute(nf_brep)
+            nf_amp = rg.AreaMassProperties.Compute(nf_brep)
             if nf_amp is not None:
                 d = picked_centroid.DistanceTo(nf_amp.Centroid)
                 if d < best_na_dist:
@@ -1574,7 +1558,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
     # source: find flat face matching NA face by area
     na_face = neutral_axis.Faces[best_na_idx]
     na_brep = na_face.DuplicateFace(False)
-    amp_na = AreaMassProperties.Compute(na_brep)
+    amp_na = rg.AreaMassProperties.Compute(na_brep)
     na_area = amp_na.Area if amp_na else 0
 
     best_uf_face = None
@@ -1584,7 +1568,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
     for fi in range(flat.Faces.Count):
         uf = flat.Faces[fi]
         uf_b = uf.DuplicateFace(False)
-        uf_amp = AreaMassProperties.Compute(uf_b)
+        uf_amp = rg.AreaMassProperties.Compute(uf_b)
         if uf_amp:
             diff = abs(uf_amp.Area - na_area)
             if diff < best_area_diff:
@@ -1601,7 +1585,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
         if rc_uf_plane and rc_na_plane:
             uf_plane.Origin = uf_centroid
             na_plane.Origin = na_centroid
-            xform = Transform.PlaneToPlane(uf_plane, na_plane)
+            xform = rg.Transform.PlaneToPlane(uf_plane, na_plane)
             print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
                 picked_face_index, best_na_idx, best_na_dist))
             return xform
@@ -1772,7 +1756,7 @@ def unfold_to_2d():
         best_dist = float("inf")
         for nfi in range(neutral_axis.Faces.Count):
             nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
-            nf_amp = AreaMassProperties.Compute(nf_brep)
+            nf_amp = rg.AreaMassProperties.Compute(nf_brep)
             if nf_amp is not None:
                 d = picked_centroid.DistanceTo(nf_amp.Centroid)
                 if d < best_dist:
@@ -1792,15 +1776,15 @@ def unfold_to_2d():
 
     # step 10: compute bend directions from NAS geometry
     for entry in nas_edge_bends:
-        fa_centroid = AreaMassProperties.Compute(
+        fa_centroid = rg.AreaMassProperties.Compute(
             neutral_axis.Faces[entry["fa"]].DuplicateFace(False))
-        fb_centroid = AreaMassProperties.Compute(
+        fb_centroid = rg.AreaMassProperties.Compute(
             neutral_axis.Faces[entry["fb"]].DuplicateFace(False))
         if fa_centroid and fb_centroid:
             mid = entry["edge_crv"].PointAt(entry["edge_crv"].Domain.Mid)
-            inside_vec = Vector3d(fa_centroid.Centroid - mid) + Vector3d(fb_centroid.Centroid - mid)
+            inside_vec = rg.Vector3d(fa_centroid.Centroid - mid) + rg.Vector3d(fb_centroid.Centroid - mid)
             inside_vec.Unitize()
-            dot = Vector3d.Multiply(inside_vec, picked_normal)
+            dot = rg.Vector3d.Multiply(inside_vec, picked_normal)
             entry["direction"] = "UP" if dot > 0 else "DN"
         else:
             entry["direction"] = "UP"
@@ -1837,7 +1821,7 @@ def unfold_to_2d():
     mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
     if mecsoft is not None:
         label_ds.Font = mecsoft
-    flip_text = Vector3d.Multiply(flat_normal, picked_normal) < 0
+    flip_text = rg.Vector3d.Multiply(flat_normal, picked_normal) < 0
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
@@ -1851,12 +1835,12 @@ def unfold_to_2d():
         fp2 = entry.get("flat_p2")
         if fp1 is None or fp2 is None:
             continue
-        tangent = Vector3d(fp2 - fp1)
+        tangent = rg.Vector3d(fp2 - fp1)
         tangent.Unitize()
         if flip_text:
             tangent = -tangent
 
-        perp = Vector3d.CrossProduct(flat_normal, tangent)
+        perp = rg.Vector3d.CrossProduct(flat_normal, tangent)
         perp.Unitize()
         text_origin = mid_pt + perp * BEND_LABEL_HEIGHT * 0.25
 
@@ -1864,8 +1848,8 @@ def unfold_to_2d():
         direction = entry.get("direction", "UP")
         text_content = "{} {}".format(angle_int, direction)
 
-        text_plane = Plane(text_origin, tangent, perp)
-        te = TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
+        text_plane = rg.Plane(text_origin, tangent, perp)
+        te = rg.TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
         if te is None:
             continue
         te.TextHeight = BEND_LABEL_HEIGHT
