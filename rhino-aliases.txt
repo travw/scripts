@@ -1,25 +1,9 @@
-﻿Z '_Zoom
-ze '_Zoom _Extents
-ZT '_Zoom _Target
-ZEA '_Zoom _All _Extents
+﻿ze '_Zoom _Extents
 zs '_Zoom _Selected
-ZSA '_Zoom _All _Selected
 s '_scale1d
 o offset
 P '_Polyline
 M ! _Move
-U _Undo
-POn ! _PointsOn
-POff ! _PointsOff
-c _copy
-W '_SelWindow
-COn '_CurvatureGraph
-COff '_CurvatureGraphOff
-PlugInManager ! _OptionsPage _PlugIns
-AdvancedDisplay ! _OptionsPage _DisplayModes
-DisplayAttrsMgr ! _OptionsPage _DisplayModes
-Break ! _DeleteSubCrv
-SelPolysurface _SelPolysrf
 d _dim
 mf moveface
 l line
@@ -36,6 +20,7 @@ le length
 sn '_selname
 r '_Rectangle _p
 pl plane p
+n nameobjects
 f _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd _Dim _Pause _Pause 1/4"
 ff _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd _Dim _Pause _Pause 1/2"
 dd _dimdiameter
@@ -115,6 +100,12 @@ sev '_setview
 cd _ClippingDrawings
 ud _updateclippingdrawings
 ce _chamferedge
+c _copy
+POn ! _PointsOn
+POff ! _PointsOff
+COn '_CurvatureGraph
+COff '_CurvatureGraphOff
+Break ! _DeleteSubCrv
 GR '_gumballrelocate
 ar _arrowhead
 clp _clippingplane
@@ -130,35 +121,46 @@ dr _dimradius
 sp _setpt
 sep _setview _w _p
 sec _plan
+d3 _-runpythonscript "C:\Sites\scripts\rhino-python\dim-3d.py"
 sl _sellast
 c1 _cplane _world _top
 c3 _cplane _3point
+za '_zoom _all
+Z '_Zoom
+ZT '_Zoom _Target
+ZEA '_Zoom _All _Extents
+ZSA '_Zoom _All _Selected
+W '_SelWindow
+PlugInManager ! _OptionsPage _PlugIns
+AdvancedDisplay ! _OptionsPage _DisplayModes
+DisplayAttrsMgr ! _OptionsPage _DisplayModes
 mip _mirror _3point
 co _cplane _object
 rad _radius
 dia _diameter
 ul _unlock
-de _NoEcho ! -_Layer _Current "01 - Default" _EnterEnd
-za '_zoom _all
 dv '_setdisplaymode _darkmonochrome
+de _NoEcho ! -_Layer _Current "01 - Default" _EnterEnd
 ws _worksession
 cdv '_setdisplaymode _coloreddarkmode
 q _history _record _enter
 cv '_setdisplaymode _coloredview
+brfr _-runpythonscript "C:\Sites\scripts\rhino-python\toggle-layout-darkmode.py"
 cl _-runpythonscript "C:\Sites\scripts\rhino-python\collapse-layers.py"
 el _-runpythonscript "C:\Sites\scripts\rhino-python\expand-layers.py"
 oc _offsetcrvonsrf
 cb _curveboolean
 di _distribute _d
-d3 _-runpythonscript "C:\Sites\scripts\rhino-python\dim-3d.py"
-brfr _-runpythonscript "C:\Sites\scripts\rhino-python\toggle-layout-darkmode.py"
 re _NoEcho ! -_Layer _Current "02 - Reference" _EnterEnd
 pt _point
 a _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd
 il _invert _lock
+ocs _offsetcrvonsrf
+2ds _-runpythonscript "C:\Sites\scripts\rhino-python\2D-geo-sublayers.py" build
+lf _-runpythonscript "C:\Sites\scripts\rhino-python\lay-flat.py"
+u _-runpythonscript "C:\Sites\scripts\rhino-python\unfold-to-2d.py"
+nas _-runpythonscript "C:\Sites\scripts\rhino-python\neutral-axis-surfaces.py"
+SelPolysurface _SelPolysrf
 can _curvatureanalysis
 rc _rotatecamera
-ocs _offsetcrvonsrf
 ae _-runpythonscript "G:\My Drive\RaiderDrive\MACK\Python Scripts\Anglev2w-txt.py"
-2ds _-runpythonscript "C:\Sites\scripts\rhino-python\2D-geo-sublayers.py" build
-nas _-runpythonscript "C:\Sites\scripts\rhino-python\neutral-axis-surfaces.py"
