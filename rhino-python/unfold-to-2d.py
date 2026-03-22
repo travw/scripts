@@ -1392,9 +1392,19 @@ def find_ink_curves(brep):
     tol = sc.doc.ModelAbsoluteTolerance * 10
     result = []
 
-    all_objects = sc.doc.Objects.FindByLayer(ink_layer)
-    if all_objects is None:
+    # collect objects from main layer AND all sublayers (e.g. 09 - Ink lines::Cabin sides)
+    all_objects = []
+    layer_idx = sc.doc.Layers.FindByFullPath(ink_layer, -1)
+    if layer_idx < 0:
         return []
+    layers_to_search = [layer_idx]
+    children = sc.doc.Layers[layer_idx].GetChildren()
+    if children:
+        layers_to_search.extend([ch.Index for ch in children])
+    for li in layers_to_search:
+        objs = sc.doc.Objects.FindByLayer(sc.doc.Layers[li])
+        if objs:
+            all_objects.extend(objs)
 
     for obj in all_objects:
         if obj.ObjectType != ObjectType.Curve:
