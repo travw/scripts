@@ -2707,9 +2707,44 @@ def unfold_to_2d():
                 bbox_center2 = rg.Point3d(
                     (bbox2.Min.X + bbox2.Max.X) / 2,
                     (bbox2.Min.Y + bbox2.Max.Y) / 2, 0)
-                # get user placement point
-                user_pt = rs.GetPoint("Place flat pattern (bbox center)")
-                if user_pt is not None:
+                # collect geometry for dynamic preview
+                preview_crvs = []
+                for guid in all_output_guids:
+                    obj = sc.doc.Objects.FindId(guid)
+                    if obj is not None and hasattr(obj.Geometry, 'DuplicateCurve'):
+                        preview_crvs.append(obj.Geometry.DuplicateCurve())
+                    elif obj is not None:
+                        # polylinecurve or other curve types
+                        geo = obj.Geometry
+                        if isinstance(geo, rg.Curve):
+                            preview_crvs.append(geo.DuplicateCurve())
+                # hide originals during placement
+                for guid in all_output_guids:
+                    sc.doc.Objects.Hide(guid, True)
+                sc.doc.Views.Redraw()
+
+                # dynamic preview GetPoint
+                gp = Rhino.Input.Custom.GetPoint()
+                gp.SetCommandPrompt("Place flat pattern (bbox center)")
+                preview_color = System.Drawing.Color.FromArgb(0, 127, 0)
+
+                def _draw_preview(sender, args):
+                    pt = args.CurrentPoint
+                    move = rg.Transform.Translation(rg.Vector3d(pt - bbox_center2))
+                    for crv in preview_crvs:
+                        moved = crv.DuplicateCurve()
+                        moved.Transform(move)
+                        args.Display.DrawCurve(moved, preview_color, 1)
+
+                gp.DynamicDraw += _draw_preview
+                result = gp.Get()
+
+                # show originals again
+                for guid in all_output_guids:
+                    sc.doc.Objects.Show(guid)
+
+                if result == Rhino.Input.GetResult.Point:
+                    user_pt = gp.Point()
                     move = rg.Transform.Translation(rg.Vector3d(user_pt - bbox_center2))
                     for guid in all_output_guids:
                         sc.doc.Objects.Transform(guid, move, True)
