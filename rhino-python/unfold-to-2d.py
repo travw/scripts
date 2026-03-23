@@ -2372,8 +2372,11 @@ def unfold_to_2d():
         n = rg.Vector3d(fplane.Normal)
         n.Unitize()
         test_pt = famp.Centroid + n * thickness
-        if brep.IsPointInside(test_pt, tol, False):
-            n = -n
+        is_inside = brep.IsPointInside(test_pt, tol, False)
+        if is_inside:
+            n = -n  # test pt inside brep → n pointed inward → flip to outward
+        dbg("    orient face {}: inside={} → n=({:.4f},{:.4f},{:.4f})".format(
+            fi, is_inside, n.X, n.Y, n.Z))
         oriented_normals[fi] = n
 
     # recompute bend angles with signed dot product
