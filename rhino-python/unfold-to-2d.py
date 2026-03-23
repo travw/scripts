@@ -2673,7 +2673,23 @@ def unfold_to_2d():
     all_output_guids.extend(output_guids)
     dbg("  {} curves added to sublayers".format(count))
 
-    # step 14: apply placement transform if not "inplace"
+    # step 14: copy original polysrf to Fab 3D sublayer
+    fab3d_parent = "10 - Fab 3D"
+    part_name = obj_layer.split("::")[-1].strip() if obj_layer else ""
+    fab3d_layer = "{}::{}".format(fab3d_parent, part_name) if part_name else fab3d_parent
+    if not rs.IsLayer(fab3d_parent):
+        rs.AddLayer(fab3d_parent)
+    if part_name and not rs.IsLayer(fab3d_layer):
+        rs.AddLayer(fab3d_layer)
+    fab3d_idx = sc.doc.Layers.FindByFullPath(fab3d_layer, -1)
+    fab3d_attr = Rhino.DocObjects.ObjectAttributes()
+    fab3d_attr.LayerIndex = fab3d_idx
+    fab3d_guid = sc.doc.Objects.AddBrep(brep.DuplicateBrep(), fab3d_attr)
+    if fab3d_guid != System.Guid.Empty:
+        all_output_guids.append(fab3d_guid)
+        dbg("  3D copy added to '{}'".format(fab3d_layer))
+
+    # step 15: apply placement transform if not "inplace"
     if location != "inplace" and all_output_guids:
         # orient source plane so picked face ends up facing +Z
         # flat_plane.Normal may oppose picked_normal — flip if needed
