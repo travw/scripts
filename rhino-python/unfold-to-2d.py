@@ -512,6 +512,9 @@ def _build_nas_boundary(face, fi, face_planes, face_normals, offset_dist,
                         ref_side, skipped_faces, tol, original_brep=None):
     """build the NAS face boundary by intersecting the offset plane with the
     original polysurface, then trimming at PP axes (bend lines).
+    NOTE: this approach is fragile for some geometries (e.g. windshield).
+    see docs/neutral-axis-surfaces_plan.md for a planned rewrite using
+    ref_side face loops directly instead of BrepPlane intersection.
 
     the NAP (neutral axis plane, offset t/2 from the face) is parallel to
     the sheet face and cuts through the edge/transition faces of the original
