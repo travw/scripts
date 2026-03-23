@@ -19,6 +19,7 @@ alias: unfold-to-2d -> _-RunPythonScript "path/to/unfold-to-2d.py"
 
 import System
 import System.Drawing
+import System.Windows.Forms
 import Rhino
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
@@ -34,6 +35,56 @@ from Rhino.DocObjects import ObjectType
 # ---------------------------------------------------------------------------
 STANDARD_GAUGES = [0.100, 0.125, 0.160, 0.190]
 BEND_LABEL_HEIGHT = 1.0  # inches
+
+# debug log — collects all print output, optionally copies to clipboard or file
+_debug_log = []
+_debug_enabled = False
+DEBUG_MODES = ["off", "clipboard", "file"]
+
+
+def dbg(msg):
+    """print to rhino command line and collect for debug output."""
+    print(msg)
+    _debug_log.append(msg)
+
+
+def prompt_debug_mode():
+    """command-line option for debug output. remembers last choice via sc.sticky."""
+    global _debug_enabled
+    prev = sc.sticky.get("unfold_debug_mode", "off")
+    go = Rhino.Input.Custom.GetOption()
+    go.SetCommandPrompt("Debug output")
+    go.SetDefaultString(prev)
+    for m in DEBUG_MODES:
+        go.AddOption(m)
+    go.AcceptNothing(True)
+    result = go.Get()
+    if result == Rhino.Input.GetResult.Option:
+        choice = go.Option().EnglishName.lower()
+    else:
+        choice = prev
+    sc.sticky["unfold_debug_mode"] = choice
+    _debug_enabled = choice != "off"
+
+
+def flush_debug_log():
+    """output collected debug log per user preference."""
+    if not _debug_enabled or not _debug_log:
+        return
+    mode = sc.sticky.get("unfold_debug_mode", "off")
+    text = "\n".join(_debug_log)
+    if mode == "clipboard":
+        System.Windows.Forms.Clipboard.SetText(text)
+        print("debug log ({} lines) copied to clipboard".format(len(_debug_log)))
+    elif mode == "file":
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = rs.SaveFileName("Save debug log", "Text files (*.txt)|*.txt||",
+                               filename="unfold_debug_{}.txt".format(ts))
+        if path:
+            with open(path, "w") as f:
+                f.write(text)
+            print("debug log saved to {}".format(path))
 
 
 # ---------------------------------------------------------------------------
@@ -72,11 +123,11 @@ def pick_part_and_face():
     objref = go.Object(0)
     brep = objref.Brep()
     if brep is None:
-        print("error: not a brep/polysurface")
+        dbg("error: not a brep/polysurface")
         return None
 
     if not brep.IsSolid:
-        print("error: part must be a closed polysurface (solid)")
+        dbg("error: part must be a closed polysurface (solid)")
         return None
 
     face = objref.Face()
@@ -84,7 +135,7 @@ def pick_part_and_face():
         if brep.Faces.Count == 1:
             face = brep.Faces[0]
         else:
-            print("error: click a face (ctrl+shift+click for sub-face)")
+            dbg("error: click a face (ctrl+shift+click for sub-face)")
             return None
 
     return brep, face.FaceIndex, objref.ObjectId
@@ -189,7 +240,7 @@ def detect_thickness(brep, face_index):
             if face.OrientationIsReversed:
                 normal = -normal
             hits = _shoot_thickness_ray(brep, face_index, centroid, normal, tol)
-            print("  thickness phase 1: centroid hits={}".format(
+            dbg("  thickness phase 1: centroid hits={}".format(
                 ["{:.4f}".format(h) for h in hits]))
             result = _snap_hits_to_gauge(hits)
             if result is not None:
@@ -217,9 +268,9 @@ def detect_thickness(brep, face_index):
             hits = _shoot_thickness_ray(brep, face_index, pt, normal, tol)
             result = _snap_hits_to_gauge(hits)
             if result is not None:
-                print("  thickness phase 2: found at sample ({},{})".format(ui, vi))
+                dbg("  thickness phase 2: found at sample ({},{})".format(ui, vi))
                 return result
-    print("  thickness phase 2: {} interior samples, no gauge hits".format(interior_count))
+    dbg("  thickness phase 2: {} interior samples, no gauge hits".format(interior_count))
 
     return _detect_thickness_min_edge(brep, face_index)
 
@@ -279,7 +330,7 @@ def classify_faces(brep, thickness):
             continue
         ci, ni = face_data[i]
         if ci is None or ni is None:
-            print("  face {}: no centroid/normal, skipping".format(i))
+            dbg("  face {}: no centroid/normal, skipping".format(i))
             continue
 
         found = False
@@ -325,7 +376,7 @@ def classify_faces(brep, thickness):
                             partners[i] = j
                         if j not in partners:
                             partners[j] = i
-                        print("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
+                        dbg("  face {} <-> face {}: partner at {:.4f}\"".format(i, j, dist))
                         found = True
                         break
                     else:
@@ -338,11 +389,11 @@ def classify_faces(brep, thickness):
                 if found:
                     break
         if not found and best_dist is not None:
-            print("  face {}: no partner (best: face {} dist={:.4f}\" dot={})".format(
+            dbg("  face {}: no partner (best: face {} dist={:.4f}\" dot={})".format(
                 i, best_j, best_dist,
                 "{:.2f}".format(best_dot) if best_dot is not None else "?"))
         elif not found:
-            print("  face {}: no partner (no ray hits)".format(i))
+            dbg("  face {}: no partner (no ray hits)".format(i))
 
     sheet_faces = sorted(sheet_set)
     edge_faces = [i for i in range(brep.Faces.Count) if i not in sheet_set]
@@ -371,7 +422,7 @@ def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
             partner = partners[current]
             if partner in color:
                 if color[partner] == color[current]:
-                    print("warning: conflict coloring face {} and {} (both side {})".format(
+                    dbg("warning: conflict coloring face {} and {} (both side {})".format(
                         current, partner, color[current]))
                 continue
             color[partner] = 1 - color[current]
@@ -381,11 +432,11 @@ def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
     ref_color = color.get(picked_face_index, 0)
     side_a_indices = [fi for fi in sheet_faces if color.get(fi, 0) == ref_color]
     side_b_indices = [fi for fi in sheet_faces if color.get(fi, 0) != ref_color]
-    print("  side A (ref): {} ({} faces)".format(side_a_indices, len(side_a_indices)))
-    print("  side B:       {} ({} faces)".format(side_b_indices, len(side_b_indices)))
+    dbg("  side A (ref): {} ({} faces)".format(side_a_indices, len(side_a_indices)))
+    dbg("  side B:       {} ({} faces)".format(side_b_indices, len(side_b_indices)))
 
     if not side_a_indices or not side_b_indices:
-        print("error: could not split sheet faces into 2 sides (A={}, B={})".format(
+        dbg("error: could not split sheet faces into 2 sides (A={}, B={})".format(
             len(side_a_indices), len(side_b_indices)))
         return None, None
 
@@ -420,7 +471,7 @@ def join_sheet_faces(brep, sheet_faces, partners, picked_face_index):
     side_b = _join_side(side_b_indices)
 
     if side_a is None or side_b is None:
-        print("error: failed to join sheet faces into sides")
+        dbg("error: failed to join sheet faces into sides")
         return None, None
 
     return side_a, side_b
@@ -731,7 +782,7 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
 
     def _log(msg):
         if not quiet:
-            print(msg)
+            dbg(msg)
 
     # step 1: compute offset plane for each face
     face_planes = {}
@@ -1116,7 +1167,7 @@ def project_bends_to_neutral_axis(bend_infos, neutral_axis_brep):
         info["curve_na"] = rg.LineCurve(axis_line)
         info["na_axis"] = axis_line
 
-        print("  bend {}: {:.1f}° → NAS faces {}↔{}, axis len={:.2f}\"".format(
+        dbg("  bend {}: {:.1f}° → NAS faces {}↔{}, axis len={:.2f}\"".format(
             i, info["angle"], fa, fb, axis_line.Length))
 
 
@@ -1150,7 +1201,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             face_planes[fi] = plane
 
     if len(face_planes) < n_faces:
-        print("  warning: only {} of {} faces have planes".format(
+        dbg("  warning: only {} of {} faces have planes".format(
             len(face_planes), n_faces))
 
     # --- build adjacency directly from NAS internal edges ---
@@ -1206,7 +1257,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         adjacency.setdefault(fa, []).append((fb, bend_entry, axis_line))
         adjacency.setdefault(fb, []).append((fa, bend_entry, axis_line))
 
-    print("  {} unique face-pair bends from NAS edges".format(len(nas_edge_bends)))
+    dbg("  {} unique face-pair bends from NAS edges".format(len(nas_edge_bends)))
 
     # --- BFS: flatten faces onto XY ---
     transforms = {}  # face_idx -> Transform (3D -> flat XY)
@@ -1319,7 +1370,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 # faces are coaxial (centroids on same axis-perp line), fallback
                 shift_vec = rg.Vector3d(0, 0, 0)
             face_shifts[neighbor] = face_shifts[current] + shift_vec
-            print("    shift {}->{}: vec=({:.4f},{:.4f},{:.4f}) cumulative=({:.4f},{:.4f},{:.4f})".format(
+            dbg("    shift {}->{}: vec=({:.4f},{:.4f},{:.4f}) cumulative=({:.4f},{:.4f},{:.4f})".format(
                 current, neighbor, shift_vec.X, shift_vec.Y, shift_vec.Z,
                 face_shifts[neighbor].X, face_shifts[neighbor].Y, face_shifts[neighbor].Z))
 
@@ -1329,9 +1380,9 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             bfs_path.append("face {} ({:.1f}°)".format(
                 neighbor, math.degrees(chosen_angle)))
 
-    print("  BFS: {}".format(" → ".join(bfs_path)))
+    dbg("  BFS: {}".format(" → ".join(bfs_path)))
     if len(transforms) < n_faces:
-        print("  warning: BFS reached {} of {} faces".format(
+        dbg("  warning: BFS reached {} of {} faces".format(
             len(transforms), n_faces))
 
     # --- compute flat axes for non-BFS-traversed bends ---
@@ -1368,7 +1419,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     flat_faces = []
     flat_face_breps = {}
     fn = flat_normal
-    print("  target normal: ({:.4f},{:.4f},{:.4f})".format(fn.X, fn.Y, fn.Z))
+    dbg("  target normal: ({:.4f},{:.4f},{:.4f})".format(fn.X, fn.Y, fn.Z))
     for fi in range(n_faces):
         if fi not in transforms:
             continue
@@ -1385,7 +1436,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         flat_face_breps[fi] = face_brep
         amp = rg.AreaMassProperties.Compute(face_brep)
         seed_tag = " (SEED)" if fi == seed else ""
-        print("    face {}: area={:.1f}{}".format(fi, amp.Area if amp else 0, seed_tag))
+        dbg("    face {}: area={:.1f}{}".format(fi, amp.Area if amp else 0, seed_tag))
 
     # --- detect cross-bend holes via un-shifted face merge ---
     # un-shifted face breps (rotation only, no deduction shift) tile perfectly
@@ -1452,7 +1503,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                     if not is_existing:
                         cross_bend_holes.append(hc)
             else:
-                print("  warning: MergeCoplanarFaces failed, skipping cross-bend hole detection")
+                dbg("  warning: MergeCoplanarFaces failed, skipping cross-bend hole detection")
 
     # shift cross-bend hole curves to match deducted pattern
     shifted_cross_bend_holes = []
@@ -1526,7 +1577,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             shifted_cross_bend_holes.append(hc)
 
     if cross_bend_holes:
-        print("  cross-bend holes: {} detected, {} shifted".format(
+        dbg("  cross-bend holes: {} detected, {} shifted".format(
             len(cross_bend_holes), len(shifted_cross_bend_holes)))
 
     # --- merge overlapping faces into single outline, preserving inner loops ---
@@ -1550,7 +1601,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             joined = rg.Curve.JoinCurves(edges, tol * 10)
             if joined:
                 boundary_by_fi[fi] = max(joined, key=lambda c: c.GetLength())
-    print("  extracted {} outer boundaries, {} inner loops (holes)".format(
+    dbg("  extracted {} outer boundaries, {} inner loops (holes)".format(
         len(boundary_by_fi), len(inner_loop_curves)))
 
     # iterative pairwise union in BFS order — each face overlaps its parent
@@ -1574,8 +1625,8 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                     merged = True
                     break
             if not merged:
-                print("  warning: pairwise union failed for face {}".format(fi))
-        print("  boundary union: {} of {} faces merged (BFS iterative)".format(
+                dbg("  warning: pairwise union failed for face {}".format(fi))
+        dbg("  boundary union: {} of {} faces merged (BFS iterative)".format(
             merge_count, len(boundary_by_fi)))
 
     # create merged brep: outer boundary + inner loop holes
@@ -1593,7 +1644,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             n_holes = sum(1 for fi2 in range(merged_brep.Faces.Count)
                          for li2 in range(merged_brep.Faces[fi2].Loops.Count)
                          if merged_brep.Faces[fi2].Loops[li2].LoopType == rg.BrepLoopType.Inner)
-            print("  merged flat pattern: area={:.1f}, {} holes".format(
+            dbg("  merged flat pattern: area={:.1f}, {} holes".format(
                 amp_merged.Area if amp_merged else 0, n_holes))
 
     # --- apply deduction shifts to bend axis endpoints ---
@@ -1712,14 +1763,14 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     guid = sc.doc.Objects.AddBrep(bake_target, a)
     if guid != System.Guid.Empty:
         baked_guids.append(guid)
-    print("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
+    dbg("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
 
     # extract outside/inside cut curves from merged brep
     outside_curves = []
     inside_curves = []
     source_brep = merged_brep if merged_brep is not None else (flat_faces[0] if flat_faces else None)
     if source_brep is None:
-        print("error: no flat geometry produced")
+        dbg("error: no flat geometry produced")
         return None
     for fi2 in range(source_brep.Faces.Count):
         face2 = source_brep.Faces[fi2]
@@ -1732,7 +1783,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 outside_curves.append(loop_crv)
             elif loop.LoopType == rg.BrepLoopType.Inner:
                 inside_curves.append(loop_crv)
-    print("  output curves: {} outside, {} inside (holes)".format(
+    dbg("  output curves: {} outside, {} inside (holes)".format(
         len(outside_curves), len(inside_curves)))
     flat_brep = source_brep
     return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends, transforms, face_shifts
@@ -1835,7 +1886,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
     if not unrolled_breps or len(unrolled_breps) == 0 or brep is None:
         return None
 
-    print("=== alignment ===")
+    dbg("=== alignment ===")
     # find NA face closest to picked face
     picked_centroid, _ = get_face_outward_normal(brep, picked_face_index)
     best_na_idx = 0
@@ -1881,7 +1932,7 @@ def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_inde
             uf_plane.Origin = uf_centroid
             na_plane.Origin = na_centroid
             xform = rg.Transform.PlaneToPlane(uf_plane, na_plane)
-            print("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
+            dbg("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
                 picked_face_index, best_na_idx, best_na_dist))
             return xform
 
@@ -1949,29 +2000,40 @@ def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
 # ---------------------------------------------------------------------------
 
 def unfold_to_2d():
+    global _debug_log
+    _debug_log = []  # reset each run
     # step 1: select part and pick face
     result = pick_part_and_face()
     if result is None:
         return
     brep, face_index, obj_id = result
-    print("picked face: index {}".format(face_index))
+    obj_name = rs.ObjectName(obj_id) or "(unnamed)"
+    obj_layer = rs.ObjectLayer(obj_id) or ""
+    dbg("=== unfold-to-2d ===")
+    dbg("  part: {} [layer: {}]".format(obj_name, obj_layer))
+    dbg("  {} faces total, picked face: index {}".format(brep.Faces.Count, face_index))
 
-    _, picked_normal = get_face_outward_normal(brep, face_index)
+    picked_centroid, picked_normal = get_face_outward_normal(brep, face_index)
     if picked_normal is None:
-        print("error: could not compute face normal")
+        dbg("error: could not compute face normal")
         return
+    dbg("  picked_normal: ({:.4f},{:.4f},{:.4f})".format(
+        picked_normal.X, picked_normal.Y, picked_normal.Z))
 
     # step 2: detect thickness
     auto_thickness = detect_thickness(brep, face_index)
     thickness = prompt_thickness(auto_thickness)
     if thickness is None:
         return
-    print("thickness: {}".format(thickness))
+    dbg("thickness: {}".format(thickness))
+
+    # debug output option
+    prompt_debug_mode()
 
     # step 3: classify faces
-    print("=== face classification ===")
+    dbg("=== face classification ===")
     sheet_faces, edge_faces, partners = classify_faces(brep, thickness)
-    print("  {} sheet faces, {} edge faces".format(len(sheet_faces), len(edge_faces)))
+    dbg("  {} sheet faces, {} edge faces".format(len(sheet_faces), len(edge_faces)))
 
     # print compact partner list
     seen_pairs = set()
@@ -1981,7 +2043,7 @@ def unfold_to_2d():
         if pair not in seen_pairs:
             seen_pairs.add(pair)
             pair_strs.append("{}↔{}".format(pair[0], pair[1]))
-    print("  partners: {}".format(", ".join(pair_strs)))
+    dbg("  partners: {}".format(", ".join(pair_strs)))
 
     # add face index text dots for visual identification
     sheet_set = set(sheet_faces)
@@ -2006,7 +2068,7 @@ def unfold_to_2d():
     sc.doc.Views.Redraw()
 
     if len(sheet_faces) < 2:
-        print("error: need at least 2 sheet faces")
+        dbg("error: need at least 2 sheet faces")
         return
 
     # step 4: join sheet faces -> 2 polysurfaces (graph-colored by partner pairs)
@@ -2015,7 +2077,7 @@ def unfold_to_2d():
     if side_a is None:
         return
 
-    print("  side A: {} faces, side B: {} faces".format(
+    dbg("  side A: {} faces, side B: {} faces".format(
         side_a.Faces.Count, side_b.Faces.Count))
 
     # try NAS from both sides, use whichever produces more faces
@@ -2037,12 +2099,12 @@ def unfold_to_2d():
                                           partners=partners)
     if neutral_axis is None:
         return
-    print("  neutral axis: {} faces (other side had {})".format(
+    dbg("  neutral axis: {} faces (other side had {})".format(
         neutral_axis.Faces.Count, min(count_a, count_b)))
 
     # step 7: find ink curves
     ink_curves = find_ink_curves(ref_side)
-    print("  ink curves: {}".format(len(ink_curves)))
+    dbg("  ink curves: {}".format(len(ink_curves)))
 
     # step 8: find NAS face closest to picked face (for BFS seed + alignment)
     picked_centroid, _ = get_face_outward_normal(brep, face_index)
@@ -2059,13 +2121,13 @@ def unfold_to_2d():
                     picked_na_face = nfi
 
     # step 9: unroll NAS (adjacency + bend lines derived from NAS edges directly)
-    print("=== unroll ===")
+    dbg("=== unroll ===")
     unroll_result = unroll_by_rotation(neutral_axis, ink_curves, thickness, picked_na_face)
     if unroll_result is None:
         return
     flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal, nas_edge_bends, transforms, face_shifts = unroll_result
     unrolled_breps = [flat_brep]
-    print("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
+    dbg("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
 
@@ -2083,9 +2145,9 @@ def unfold_to_2d():
             entry["direction"] = "UP" if dot > 0 else "DN"
         else:
             entry["direction"] = "UP"
-    print("=== bends ===")
+    dbg("=== bends ===")
     for entry in nas_edge_bends:
-        print("  bend: {:.1f} {} (NAS faces {}↔{})".format(
+        dbg("  bend: {:.1f} {} (NAS faces {}↔{})".format(
             entry["angle"], entry["direction"], entry["fa"], entry["fb"]))
 
     # step 11: compute alignment transform (flat pattern → 3D NAS space)
@@ -2108,23 +2170,33 @@ def unfold_to_2d():
         guid = sc.doc.Objects.AddCurve(crv, mark_attr)
         if guid != System.Guid.Empty:
             bend_guids.append(guid)
-    print("  {} bend/ink curves added to Mark layer (no align_xform)".format(len(bend_guids)))
+    dbg("  {} bend/ink curves added to Mark layer (no align_xform)".format(len(bend_guids)))
 
-    # step 13: bend angle labels — in flat space, same as bend lines
+    # step 13: bend angle labels — derive orientation from baked merged_brep plane
+    # (all previous approaches using flat_normal / picked_normal cross products failed)
     label_ds = sc.doc.DimStyles.Current.Duplicate()
     label_ds.TextHeight = BEND_LABEL_HEIGHT
     mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
     if mecsoft is not None:
         label_ds.Font = mecsoft
-    # viewer frame: derive entirely from picked_normal (reliable, from solid brep)
-    # no flat_normal, no desired_normal, no seed_plane — those all proved unreliable
-    viewer_dir = -picked_normal
-    viewer_right = rg.Vector3d.CrossProduct(viewer_dir, rg.Vector3d(0, 0, 1))
-    if viewer_right.Length < 0.01:
-        viewer_right = rg.Vector3d.CrossProduct(viewer_dir, rg.Vector3d(0, 1, 0))
-    viewer_right.Unitize()
-    viewer_up = rg.Vector3d.CrossProduct(viewer_right, viewer_dir)
-    viewer_up.Unitize()
+    # get the ACTUAL plane of the baked flat pattern
+    tol_label = sc.doc.ModelAbsoluteTolerance
+    bake_source = flat_brep  # flat_brep = merged_brep returned from unroll_by_rotation
+    text_normal = rg.Vector3d(0, 0, 1)  # fallback
+    bake_plane = None
+    if bake_source is not None and bake_source.Faces.Count > 0:
+        rc_bp, bp = bake_source.Faces[0].TryGetPlane(max(tol_label * 100, 0.1))
+        if rc_bp:
+            bake_plane = bp
+            # determine which side faces the picked "UP" face
+            signed_dist = bp.DistanceTo(picked_centroid)
+            text_normal = rg.Vector3d(bp.Normal) if signed_dist > 0 else -bp.Normal
+            dbg("  label plane: normal=({:.4f},{:.4f},{:.4f}) signed_dist={:.4f}".format(
+                bp.Normal.X, bp.Normal.Y, bp.Normal.Z, signed_dist))
+            dbg("  text_normal: ({:.4f},{:.4f},{:.4f})".format(
+                text_normal.X, text_normal.Y, text_normal.Z))
+    if bake_plane is None:
+        dbg("  warning: could not get bake plane, labels may be misoriented")
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
@@ -2133,24 +2205,21 @@ def unfold_to_2d():
         main_crv = max(flat_crvs, key=lambda c: c.GetLength())
         mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
 
-        # tangent from the bend axis direction
-        fp1 = entry.get("flat_p1")
-        fp2 = entry.get("flat_p2")
-        if fp1 is None or fp2 is None:
-            continue
-        tangent = rg.Vector3d(fp2 - fp1)
+        # tangent from the actual bend curve (not arbitrary fp2-fp1 direction)
+        tangent = main_crv.TangentAt(main_crv.Domain.Mid)
         tangent.Unitize()
-        # normalize tangent to readable direction from viewer's perspective
-        dot_right = rg.Vector3d.Multiply(tangent, viewer_right)
-        if abs(dot_right) > 0.1:
-            if dot_right < 0:
-                tangent = -tangent
-        else:
-            # near-vertical bend: ensure upward
-            if rg.Vector3d.Multiply(tangent, viewer_up) < 0:
-                tangent = -tangent
+        # normalize tangent to readable direction using bake plane axes
+        if bake_plane is not None:
+            dot_x = rg.Vector3d.Multiply(tangent, bake_plane.XAxis)
+            dot_y = rg.Vector3d.Multiply(tangent, bake_plane.YAxis)
+            if abs(dot_x) >= abs(dot_y):
+                if dot_x < 0:
+                    tangent = -tangent
+            else:
+                if dot_y < 0:
+                    tangent = -tangent
 
-        perp = rg.Vector3d.CrossProduct(picked_normal, tangent)
+        perp = rg.Vector3d.CrossProduct(text_normal, tangent)
         perp.Unitize()
         text_origin = mid_pt + perp * BEND_LABEL_HEIGHT * 0.25
 
@@ -2159,8 +2228,15 @@ def unfold_to_2d():
         text_content = "{} {}".format(angle_int, direction)
 
         text_plane = rg.Plane(text_origin, tangent, perp)
+        dbg("    label '{}': mid=({:.2f},{:.2f},{:.2f}) tangent=({:.4f},{:.4f},{:.4f}) perp=({:.4f},{:.4f},{:.4f}) plane_n=({:.4f},{:.4f},{:.4f})".format(
+            text_content,
+            mid_pt.X, mid_pt.Y, mid_pt.Z,
+            tangent.X, tangent.Y, tangent.Z,
+            perp.X, perp.Y, perp.Z,
+            text_plane.Normal.X, text_plane.Normal.Y, text_plane.Normal.Z))
         te = rg.TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
         if te is None:
+            dbg("    warning: TextEntity.Create returned None for '{}'".format(text_content))
             continue
         te.TextHeight = BEND_LABEL_HEIGHT
         if mecsoft is not None:
@@ -2176,6 +2252,8 @@ def unfold_to_2d():
                 grp = sc.doc.Groups.Add()
                 for g in label_guids:
                     sc.doc.Groups.AddToGroup(grp, g)
+        else:
+            dbg("    warning: CreateCurves returned no curves for '{}'".format(text_content))
 
     # step 14: outside/inside cuts — output in flat space (no align_xform)
     # align_xform adds slight error, same issue that broke bend line placement
@@ -2183,6 +2261,7 @@ def unfold_to_2d():
                        [], sublayers, align_xform=None)
 
     sc.doc.Views.Redraw()
+    flush_debug_log()
 
 
 if __name__ == "__main__":
