@@ -180,6 +180,24 @@ key geometric concepts:
   don't use centroid position as a proxy for face normal direction — the
   lateral shift can overpower the normal-direction offset (t/2) and flip
   the sign of geometric checks.
+- unfold-to-2d bend direction detection: the only reliable method is
+  `fold_z` — the perpendicular distance of the neighbor centroid from the
+  flat plane BEFORE the flatten rotation (transformed by current_xform
+  only, not best_combined). cross-product tests, centroid averaging, and
+  rotation angle sign interpretation all fail due to edge tangent direction
+  ambiguity and face ordering dependencies. `Rotation(-A, -dir)` =
+  `Rotation(A, dir)`, so the BFS unfolding works without normalizing
+  axis_dir, but extracting direction FROM the angle is not possible.
+- unfold-to-2d bend angle: use `180 - abs(chosen_angle normalized to
+  [-180, 180])` from the BFS. the `abs(dot)` formula in unroll_by_rotation
+  can't distinguish acute (e.g. 70 deg) from obtuse (110 deg) bends
+  because abs() destroys the sign. the BFS chosen_angle encodes the exact
+  rotation and gives correct angles for all cases.
+- `brep.IsPointInside` for normal orientation on NAS faces: unreliable
+  for thin parts. NAS centroids are t/2 from both surfaces. offsetting by
+  t in the normal direction overshoots through the part (t/2 past the far
+  surface), landing outside on the wrong side. IsPointInside returns False
+  for both directions, making orientation impossible.
 - git: large files (.3dm models) in ANY commit in history will block push
   to github, even if deleted later. use `git filter-repo` or BFG to purge
   from history. adding to .gitignore only prevents future commits.
