@@ -1314,6 +1314,9 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             sign = 1.0 if rg.Vector3d.Multiply(to_current, perp) > 0 else -1.0
             shift_vec = perp * sign * deduction
             face_shifts[neighbor] = face_shifts[current] + shift_vec
+            print("    shift {}->{}: vec=({:.4f},{:.4f},{:.4f}) cumulative=({:.4f},{:.4f},{:.4f})".format(
+                current, neighbor, shift_vec.X, shift_vec.Y, shift_vec.Z,
+                face_shifts[neighbor].X, face_shifts[neighbor].Y, face_shifts[neighbor].Z))
 
             visited.add(neighbor)
             queue.append(neighbor)
@@ -1355,7 +1358,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         entry["_axis_dir"] = axis_dir
         entry["_perp"] = perp
 
-    # --- transform face breps to flat, trim at deduction boundaries, then shift ---
+    # --- transform face breps to flat, apply deduction shift (faces will overlap) ---
     flat_faces = []
     flat_face_breps = {}
     fn = flat_normal
@@ -1367,52 +1370,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         dot = rg.Vector3d.Multiply(result_n, flat_normal)
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
-
-        # trim at each adjacent bend's deduction boundary (before shifting)
-        # compute centroid ONCE before any trimming (sequential trims change the brep)
-        orig_amp = rg.AreaMassProperties.Compute(face_brep)
-        orig_centroid = orig_amp.Centroid if orig_amp else None
-        for entry in nas_edge_bends:
-            if fi != entry["fa"] and fi != entry["fb"]:
-                continue
-            fp1 = entry.get("_pre_shift_p1")
-            axis_dir = entry.get("_axis_dir")
-            perp = entry.get("_perp")
-            if fp1 is None or perp is None or axis_dir is None or orig_centroid is None:
-                continue
-            # side test using ORIGINAL centroid (stable across sequential trims)
-            to_face = rg.Vector3d(orig_centroid - fp1)
-            side = 1.0 if rg.Vector3d.Multiply(to_face, perp) > 0 else -1.0
-            offset_pt = fp1 + perp * side * half_deduction
-            # create splitting surface: large line along axis, extruded through flat plane
-            split_line = rg.LineCurve(
-                offset_pt - axis_dir * 500,
-                offset_pt + axis_dir * 500)
-            extrude_dir = flat_normal * 10
-            split_srf = rg.Surface.CreateExtrusion(split_line, extrude_dir)
-            if split_srf is None:
-                continue
-            splitter = split_srf.ToBrep()
-            if splitter is None:
-                continue
-            pieces = face_brep.Split(splitter, tol)
-            if pieces is not None and len(pieces) > 0:
-                # keep the piece whose centroid is on the face's side (away from axis)
-                best = None
-                best_dot = -float("inf")
-                for p in pieces:
-                    pa = rg.AreaMassProperties.Compute(p)
-                    if pa is None:
-                        continue
-                    to_piece = rg.Vector3d(pa.Centroid - fp1)
-                    piece_side = rg.Vector3d.Multiply(to_piece, perp) * side
-                    if piece_side > best_dot:
-                        best_dot = piece_side
-                        best = p
-                if best is not None:
-                    face_brep = best
-
-        # apply bend deduction shift
+        # apply bend deduction shift (no trimming — union resolves overlaps)
         if fi in face_shifts:
             shift = face_shifts[fi]
             if shift.Length > 0.0001:
@@ -1421,9 +1379,34 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         flat_face_breps[fi] = face_brep
         amp = rg.AreaMassProperties.Compute(face_brep)
         seed_tag = " (SEED)" if fi == seed else ""
-        print("    face {}: n=({:.4f},{:.4f},{:.4f}) dot={:.4f} area={:.1f}{}".format(
-            fi, result_n.X, result_n.Y, result_n.Z, dot,
-            amp.Area if amp else 0, seed_tag))
+        print("    face {}: area={:.1f}{}".format(fi, amp.Area if amp else 0, seed_tag))
+
+    # --- merge overlapping faces into single outline via curve boolean union ---
+    boundary_curves = []
+    for fb in flat_faces:
+        edges = [fb.Edges[ei].DuplicateCurve() for ei in range(fb.Edges.Count)]
+        joined = rg.Curve.JoinCurves(edges, tol * 10)
+        if joined:
+            # keep the longest joined curve (outer boundary)
+            boundary_curves.append(max(joined, key=lambda c: c.GetLength()))
+    merged_outline = None
+    if len(boundary_curves) > 1:
+        union_result = rg.Curve.CreateBooleanUnion(boundary_curves, tol)
+        if union_result and len(union_result) > 0:
+            merged_outline = max(union_result, key=lambda c: c.GetLength())
+            print("  boundary union: {} input curves → {} result curves".format(
+                len(boundary_curves), len(union_result)))
+    elif len(boundary_curves) == 1:
+        merged_outline = boundary_curves[0]
+    # create merged brep from outline
+    merged_brep = None
+    if merged_outline is not None:
+        merged_breps = rg.Brep.CreatePlanarBreps(merged_outline, tol)
+        if merged_breps and len(merged_breps) > 0:
+            merged_brep = merged_breps[0]
+            print("  merged flat pattern: area={:.1f}".format(
+                rg.AreaMassProperties.Compute(merged_brep).Area
+                if rg.AreaMassProperties.Compute(merged_brep) else 0))
 
     # --- apply deduction shifts to bend axis endpoints ---
     # the bend line goes where the two trimmed faces meet:
@@ -1455,9 +1438,12 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             entry["flat_p2"] += bend_shift
 
     # --- build flat bend lines: extend axes, project onto seed plane, trim by NAS outline ---
-    # join flat faces to get the NAS outline for trimming
-    joined = rg.Brep.JoinBreps([fb for fb in flat_faces], tol * 10)
-    trim_brep = joined[0] if joined and len(joined) > 0 else flat_faces[0]
+    # use merged brep for trimming (no overlaps), fall back to joined faces
+    if merged_brep is not None:
+        trim_brep = merged_brep
+    else:
+        joined = rg.Brep.JoinBreps([fb for fb in flat_faces], tol * 10)
+        trim_brep = joined[0] if joined and len(joined) > 0 else flat_faces[0]
     seed_plane_for_proj = face_planes[seed]
     proj_xform = rg.Transform.PlanarProjection(seed_plane_for_proj)
 
@@ -1524,32 +1510,20 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 ink_copy.Transform(rg.Transform.Translation(shift))
             flat_ink_curves.append(ink_copy)
 
-    # --- bake flat faces directly for visual verification ---
+    # --- bake flat pattern to visual verification layer ---
     bake_layer = "03 - Bake"
     if not rs.IsLayer(bake_layer):
         rs.AddLayer(bake_layer)
-    colors = [
-        System.Drawing.Color.FromArgb(255, 100, 100),  # red
-        System.Drawing.Color.FromArgb(100, 255, 100),  # green
-        System.Drawing.Color.FromArgb(100, 100, 255),  # blue
-        System.Drawing.Color.FromArgb(255, 255, 100),  # yellow
-        System.Drawing.Color.FromArgb(255, 100, 255),  # magenta
-        System.Drawing.Color.FromArgb(100, 255, 255),  # cyan
-        System.Drawing.Color.FromArgb(255, 180, 100),  # orange
-        System.Drawing.Color.FromArgb(180, 100, 255),  # purple
-    ]
-    attr = Rhino.DocObjects.ObjectAttributes()
-    attr.LayerIndex = sc.doc.Layers.FindByFullPath(bake_layer, -1)
-    baked_guids = []
     layer_idx = sc.doc.Layers.FindByFullPath(bake_layer, -1)
-    for i, fb in enumerate(flat_faces):
-        a = Rhino.DocObjects.ObjectAttributes()
-        a.LayerIndex = layer_idx
-        a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-        a.ObjectColor = colors[i % len(colors)]
-        guid = sc.doc.Objects.AddBrep(fb, a)
-        if guid != System.Guid.Empty:
-            baked_guids.append(guid)
+    baked_guids = []
+    bake_target = merged_brep if merged_brep is not None else flat_faces[0]
+    a = Rhino.DocObjects.ObjectAttributes()
+    a.LayerIndex = layer_idx
+    a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+    a.ObjectColor = System.Drawing.Color.FromArgb(100, 255, 100)
+    guid = sc.doc.Objects.AddBrep(bake_target, a)
+    if guid != System.Guid.Empty:
+        baked_guids.append(guid)
     print("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
 
     # still return expected tuple so caller doesn't crash
