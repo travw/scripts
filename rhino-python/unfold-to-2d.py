@@ -1887,9 +1887,22 @@ def find_ink_curves(brep):
     return result
 
 
-def ensure_sublayers():
-    """ensure 11 - 2D geo sublayers exist. returns dict of layer names."""
-    parent = "11 - 2D geo"
+def ensure_sublayers(part_layer=""):
+    """ensure 11 - 2D geo sublayers exist, nested under the part's layer name.
+    part_layer: full layer path of the source part (last segment used as group name).
+    returns dict of layer full paths."""
+    root = "11 - 2D geo"
+    # extract last segment of part layer path as the group name
+    if part_layer:
+        group = part_layer.split("::")[-1].strip()
+    else:
+        group = ""
+
+    if group:
+        parent = "{}::{}".format(root, group)
+    else:
+        parent = root
+
     sublayers = {
         "outside": "{}::Outside cut".format(parent),
         "inside": "{}::Inside cut".format(parent),
@@ -1901,7 +1914,9 @@ def ensure_sublayers():
         "mark": System.Drawing.Color.FromArgb(0, 127, 0),
     }
 
-    if not rs.IsLayer(parent):
+    if not rs.IsLayer(root):
+        rs.AddLayer(root)
+    if group and not rs.IsLayer(parent):
         rs.AddLayer(parent)
 
     for key, name in sublayers.items():
@@ -2537,7 +2552,7 @@ def unfold_to_2d():
             entry["angle"], entry["direction"], entry["fa"], entry["fb"]))
 
     # step 11: add curves to sublayers (all output is in flat space)
-    sublayers = ensure_sublayers()
+    sublayers = ensure_sublayers(obj_layer)
 
     # step 12: bend angle labels — placed on solid material with fallback chain
     mark_idx = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
