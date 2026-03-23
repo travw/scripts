@@ -140,7 +140,10 @@ key geometric concepts:
 - `rs.ObjectType()` returns different values than `ObjectType` enum -- don't mix
 - `sc.doc` vs `ghdoc`: in grasshopper scripts, `sc.doc` is the rhino doc.
   set `sc.doc = ghdoc` only if you need to operate on GH geometry.
-- brep face normals: check `OrientationIsReversed` before trusting `NormalAt`
+- brep face normals: in CPython 3, `BrepFace.NormalAt` may ALREADY account
+  for `OrientationIsReversed`. manually flipping on that flag can double-reverse
+  the normal. safest approach: get raw `NormalAt`, then use a geometric check
+  (e.g. partner face centroid direction) to determine the correct sign.
 - `sc.sticky` persists across script runs in the same rhino session.
   use it for toggle state, cached values, etc. keys should be namespaced.
 - when working with layers, always check `rs.IsLayer()` before creating
@@ -154,10 +157,6 @@ key geometric concepts:
   for sharp corners, build offset geometry from plane math instead.
 - `Intersection.PlanePlane` returns `(bool, Line)` — an infinite Line.
   `Line.ClosestParameter` returns a double, not a tuple.
-- prefer rhino API classification over heuristics. use `BrepFace.OuterLoop`
-  not "longest curve". use `Edge.AdjacentFaces()` not centroid matching.
-  use `BrepLoopType.Inner` not area comparison. the API already knows
-  the topology — reinventing it with geometric heuristics is fragile.
 - joined polysurface face normals are NOT consistently oriented.
   use `abs(dot)` when computing angles between faces in a joined brep.
 - unfold-to-2d coordinate spaces: the BFS unroll produces geometry in the
@@ -166,3 +165,20 @@ key geometric concepts:
   for the 11 - 2D geo output. bend lines and ink curves should be output
   directly in flat space (same as bake), NOT through align_xform.
   align_xform was the source of persistent bend line placement bugs.
+- `TextEntity.CreateCurves` text-facing direction is NOT consistent relative
+  to the text plane Normal. for some plane orientations text reads from
+  +Normal side, for others from -Normal side. workaround: create text on
+  `Plane.WorldXY` (known: readable from +Z), then `PlaneToPlane` transform
+  to the target plane. this guarantees text faces the target plane's +Normal.
+- `Curve.CreateBooleanUnion` requires overlapping closed curves. if bend
+  deduction shifts push faces apart (wrong shift direction), the union fails
+  silently or drops faces. use BFS-iterative pairwise union instead of
+  all-at-once union for robustness.
+- `AreaMassProperties.Compute` centroid on a face with holes (inner loops)
+  shifts laterally from the centroid of the equivalent face without holes.
+  don't use centroid position as a proxy for face normal direction — the
+  lateral shift can overpower the normal-direction offset (t/2) and flip
+  the sign of geometric checks.
+- git: large files (.3dm models) in ANY commit in history will block push
+  to github, even if deleted later. use `git filter-repo` or BFG to purge
+  from history. adding to .gitignore only prevents future commits.
