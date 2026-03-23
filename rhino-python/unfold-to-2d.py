@@ -1916,10 +1916,16 @@ def _label_fits(label_curves, outside_crv, inside_crvs, plane, tol):
     return True
 
 
-def _make_label_curves(text_content, text_height, xy_plane, target_plane,
-                       label_ds, mecsoft):
-    """create text curves on World XY and transform to target plane.
+def _make_label_curves(text_content, text_height, mid_pt, tang_proj, target_y,
+                       pn, side_sign, gap, slide_offset, label_ds, mecsoft):
+    """create centered text curves offset from bend line midpoint.
+
+    approach: create text at World XY origin, bbox-center it, then transform
+    to the target position. offset = side_sign * (0.5*text_height + gap) in
+    the target_y direction. text is centered along the bend line.
+
     returns list of transformed curves, or [] on failure."""
+    xy_plane = rg.Plane.WorldXY
     ds = label_ds.Duplicate()
     ds.TextHeight = text_height
     if mecsoft is not None:
@@ -1933,26 +1939,39 @@ def _make_label_curves(text_content, text_height, xy_plane, target_plane,
     curves = te.CreateCurves(ds, False)
     if not curves or len(curves) == 0:
         return []
-    xform = rg.Transform.PlaneToPlane(xy_plane, target_plane)
+    curves = list(curves)
+
+    # step 1: compute bbox at origin and center it
+    bbox = rg.BoundingBox.Empty
     for crv in curves:
-        crv.Transform(xform)
-    return list(curves)
+        bbox.Union(crv.GetBoundingBox(True))
+    if not bbox.IsValid:
+        return []
+    bbox_center = rg.Point3d(
+        (bbox.Min.X + bbox.Max.X) / 2,
+        (bbox.Min.Y + bbox.Max.Y) / 2,
+        0)
+    center_xform = rg.Transform.Translation(-rg.Vector3d(bbox_center))
 
+    # step 2: build target plane at offset position
+    # offset perpendicular to bend line: half the text height + gap
+    perp_offset = side_sign * (0.5 * text_height + gap)
+    # slide along bend line for collision avoidance
+    target_origin = mid_pt + target_y * perp_offset + tang_proj * slide_offset
 
-def _build_target_plane(mid_pt, tang_proj, target_y, side_sign, gap):
-    """build a text placement plane offset from mid_pt.
-    side_sign: +1 = text above bend line (in +target_y direction),
-               -1 = text below bend line (in -target_y direction).
-    gap is measured from bend line to nearest text edge."""
-    if side_sign >= 0:
-        # text grows in +target_y, origin is at bottom edge
-        text_origin = mid_pt + target_y * gap
-        return rg.Plane(text_origin, tang_proj, target_y)
-    else:
-        # text below: flip Y so text grows away from bend line
-        # origin at top edge (closest to bend), offset downward by gap
-        text_origin = mid_pt - target_y * gap
-        return rg.Plane(text_origin, tang_proj, -target_y)
+    # build plane: X = along bend (tang_proj), Y = perpendicular (target_y)
+    # ensure plane normal faces picked_normal direction
+    target_plane = rg.Plane(target_origin, tang_proj, target_y)
+    if rg.Vector3d.Multiply(target_plane.Normal, pn) < 0:
+        # flip X axis to reverse normal direction
+        target_plane = rg.Plane(target_origin, -tang_proj, target_y)
+
+    # step 3: compose centering + placement transform
+    place_xform = rg.Transform.PlaneToPlane(xy_plane, target_plane)
+    combined = place_xform * center_xform
+    for crv in curves:
+        crv.Transform(combined)
+    return curves
 
 
 def _get_label_bbox(curves):
@@ -1964,14 +1983,12 @@ def _get_label_bbox(curves):
 
 
 def _try_label_at(text_content, text_height, mid_pt, tang_proj, target_y,
-                  side_sign, gap, slide_offset, outside_crv, inside_crvs,
+                  pn, side_sign, gap, slide_offset, outside_crv, inside_crvs,
                   flat_plane, label_ds, mecsoft, placed_bboxes, tol):
     """try placing a label at a specific position. returns (curves, bbox) or (None, None).
     slide_offset shifts the label along tang_proj (for collision avoidance)."""
-    xy_plane = rg.Plane.WorldXY
-    shifted_mid = mid_pt + tang_proj * slide_offset
-    plane = _build_target_plane(shifted_mid, tang_proj, target_y, side_sign, gap)
-    curves = _make_label_curves(text_content, text_height, xy_plane, plane,
+    curves = _make_label_curves(text_content, text_height, mid_pt, tang_proj,
+                                target_y, pn, side_sign, gap, slide_offset,
                                 label_ds, mecsoft)
     if not curves:
         return None, None
@@ -1987,7 +2004,6 @@ def _try_label_at(text_content, text_height, mid_pt, tang_proj, target_y,
             rg.Point3d(bbox.Min.X - BEND_LABEL_GAP, bbox.Min.Y - BEND_LABEL_GAP, bbox.Min.Z),
             rg.Point3d(bbox.Max.X + BEND_LABEL_GAP, bbox.Max.Y + BEND_LABEL_GAP, bbox.Max.Z))
         for other in placed_bboxes:
-            # axis-aligned overlap test
             if (expanded.Min.X < other.Max.X and expanded.Max.X > other.Min.X and
                     expanded.Min.Y < other.Max.Y and expanded.Max.Y > other.Min.Y):
                 return None, None
@@ -2049,7 +2065,7 @@ def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
     for height, tp, ty, side_sign in strategies:
         for slide in slide_offsets:
             curves, bbox = _try_label_at(
-                text_content, height, mid_pt, tp, ty, side_sign,
+                text_content, height, mid_pt, tp, ty, pn, side_sign,
                 BEND_LABEL_GAP, slide, outside_crv, inside_crvs,
                 flat_plane, label_ds, mecsoft, placed_bboxes, tol)
             if curves is not None:
@@ -2061,10 +2077,9 @@ def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
     dbg("    warning: '{}' could not fit on solid material, marking suspect".format(
         text_content))
     suspect_text = text_content + "?"
-    xy_plane = rg.Plane.WorldXY
-    plane = _build_target_plane(mid_pt, tang_proj, target_y, +1, BEND_LABEL_GAP)
-    curves = _make_label_curves(suspect_text, BEND_LABEL_HEIGHT, xy_plane, plane,
-                                label_ds, mecsoft)
+    curves = _make_label_curves(suspect_text, BEND_LABEL_HEIGHT, mid_pt,
+                                tang_proj, target_y, pn, +1, BEND_LABEL_GAP,
+                                0.0, label_ds, mecsoft)
     if curves:
         guids = _add_label_curves(curves, mark_attr)
         bbox = _get_label_bbox(curves)
