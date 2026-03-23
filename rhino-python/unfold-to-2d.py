@@ -2045,6 +2045,25 @@ def unfold_to_2d():
             pair_strs.append("{}↔{}".format(pair[0], pair[1]))
     dbg("  partners: {}".format(", ".join(pair_strs)))
 
+    # recompute picked_normal sign from partner geometry (OrientationIsReversed
+    # is unreliable in Rhino 8 CPython 3 -- double-flips some faces).
+    # centroid-to-centroid gives reliable DIRECTION hint (which side is out),
+    # then we apply that sign to the true geometric face normal.
+    if face_index in partners:
+        partner_fi = partners[face_index]
+        partner_centroid, _ = get_face_outward_normal(brep, partner_fi)
+        if partner_centroid is not None and picked_centroid is not None:
+            outward_hint = rg.Vector3d(picked_centroid - partner_centroid)
+            face = brep.Faces[face_index]
+            rc, u, v = face.ClosestPoint(picked_centroid)
+            if rc:
+                raw_normal = face.NormalAt(u, v)
+                if rg.Vector3d.Multiply(raw_normal, outward_hint) < 0:
+                    raw_normal = -raw_normal
+                picked_normal = raw_normal
+                dbg("  picked_normal (partner-corrected): ({:.4f},{:.4f},{:.4f})".format(
+                    picked_normal.X, picked_normal.Y, picked_normal.Z))
+
     # add face index text dots for visual identification
     sheet_set = set(sheet_faces)
     dot_ids = []
@@ -2182,80 +2201,61 @@ def unfold_to_2d():
     # get the ACTUAL plane of the baked flat pattern
     tol_label = sc.doc.ModelAbsoluteTolerance
     bake_source = flat_brep  # flat_brep = merged_brep returned from unroll_by_rotation
-    text_normal = rg.Vector3d(0, 0, 1)  # fallback
-    bake_plane = None
-    if bake_source is not None and bake_source.Faces.Count > 0:
-        rc_bp, bp = bake_source.Faces[0].TryGetPlane(max(tol_label * 100, 0.1))
-        if rc_bp:
-            bake_plane = bp
-            # determine which side faces the picked "UP" face
-            # use picked_normal dot bp.Normal (not signed_dist from centroid,
-            # which disagrees with normal direction when picked face is angled
-            # relative to seed face)
-            dot_pn = rg.Vector3d.Multiply(picked_normal, bp.Normal)
-            text_normal = -rg.Vector3d(bp.Normal) if dot_pn > 0 else rg.Vector3d(bp.Normal)
-            dbg("  label plane: normal=({:.4f},{:.4f},{:.4f}) dot_pn={:.4f}".format(
-                bp.Normal.X, bp.Normal.Y, bp.Normal.Z, dot_pn))
-            dbg("  text_normal: ({:.4f},{:.4f},{:.4f})".format(
-                text_normal.X, text_normal.Y, text_normal.Z))
-    if bake_plane is None:
-        dbg("  warning: could not get bake plane, labels may be misoriented")
+    # build label text on World XY (known orientation: readable from +Z,
+    # flows along +X, ascenders along +Y), then PlaneToPlane transform
+    # to target location. bypasses Rhino TextEntity rendering inconsistency
+    # where text is readable from +Normal on some planes and -Normal on others.
+    xy_plane = rg.Plane.WorldXY
+    pn = rg.Vector3d(picked_normal)
+    pn.Unitize()
+    dbg("  label picked_normal: ({:.4f},{:.4f},{:.4f})".format(pn.X, pn.Y, pn.Z))
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
             continue
-        # place label at midpoint of the longest output bend line for this bend
         main_crv = max(flat_crvs, key=lambda c: c.GetLength())
         mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
 
-        # tangent from the actual bend curve (not arbitrary fp2-fp1 direction)
+        # tangent from bend curve, normalized to consistent direction
         tangent = main_crv.TangentAt(main_crv.Domain.Mid)
         tangent.Unitize()
-        # normalize tangent to readable direction using bake plane axes
-        if bake_plane is not None:
-            dot_x = rg.Vector3d.Multiply(tangent, bake_plane.XAxis)
-            dot_y = rg.Vector3d.Multiply(tangent, bake_plane.YAxis)
-            if abs(dot_x) >= abs(dot_y):
-                if dot_x < 0:
-                    tangent = -tangent
-            else:
-                if dot_y < 0:
-                    tangent = -tangent
+        # normalize: pick the direction with positive dot against a reference
+        # use world Y as primary (most bend lines run along Y), fallback to X
+        if abs(tangent.Y) >= abs(tangent.X) and abs(tangent.Y) >= abs(tangent.Z):
+            if tangent.Y < 0:
+                tangent = -tangent
+        elif abs(tangent.X) >= abs(tangent.Z):
+            if tangent.X < 0:
+                tangent = -tangent
+        else:
+            if tangent.Z < 0:
+                tangent = -tangent
 
-        perp = rg.Vector3d.CrossProduct(text_normal, tangent)
-        perp.Unitize()
-        text_origin = mid_pt + perp * BEND_LABEL_HEIGHT * 0.25
+        # project tangent perpendicular to picked_normal
+        tang_proj = tangent - pn * rg.Vector3d.Multiply(tangent, pn)
+        if tang_proj.Length < 1e-6:
+            tang_proj = tangent  # fallback if tangent is parallel to pn
+        tang_proj.Unitize()
+
+        # build target frame: +Z = picked_normal (readable-from direction)
+        target_y = rg.Vector3d.CrossProduct(pn, tang_proj)
+        target_y.Unitize()
+        # offset text origin slightly above bend line (in target_y direction)
+        text_origin = mid_pt + target_y * BEND_LABEL_HEIGHT * 0.25
+        target_plane = rg.Plane(text_origin, tang_proj, target_y)
+        # target_plane.Normal should = picked_normal
 
         angle_int = int(round(entry["angle"]))
         direction = entry.get("direction", "UP")
         text_content = "{} {}".format(angle_int, direction)
 
-        text_plane = rg.Plane(text_origin, tangent, perp)
-        dbg("    label '{}': mid=({:.2f},{:.2f},{:.2f}) tangent=({:.4f},{:.4f},{:.4f}) perp=({:.4f},{:.4f},{:.4f}) plane_n=({:.4f},{:.4f},{:.4f})".format(
-            text_content,
-            mid_pt.X, mid_pt.Y, mid_pt.Z,
-            tangent.X, tangent.Y, tangent.Z,
-            perp.X, perp.Y, perp.Z,
-            text_plane.Normal.X, text_plane.Normal.Y, text_plane.Normal.Z))
+        dbg("    label '{}': mid=({:.2f},{:.2f},{:.2f}) tang=({:.4f},{:.4f},{:.4f}) target_n=({:.4f},{:.4f},{:.4f})".format(
+            text_content, mid_pt.X, mid_pt.Y, mid_pt.Z,
+            tang_proj.X, tang_proj.Y, tang_proj.Z,
+            target_plane.Normal.X, target_plane.Normal.Y, target_plane.Normal.Z))
 
-        # DEBUG: 12" arrow showing text_normal direction
-        arrow_len = 12.0
-        arrow_tip = mid_pt + text_normal * arrow_len
-        shaft = rg.LineCurve(rg.Point3d(mid_pt), rg.Point3d(arrow_tip))
-        sc.doc.Objects.AddCurve(shaft, mark_attr)
-        arrow_dir = rg.Vector3d(text_normal)
-        arrow_dir.Unitize()
-        barb1_dir = arrow_dir * (-1) + tangent * 0.4
-        barb1_dir.Unitize()
-        barb1 = rg.LineCurve(rg.Point3d(arrow_tip), rg.Point3d(arrow_tip) + barb1_dir * 2.0)
-        sc.doc.Objects.AddCurve(barb1, mark_attr)
-        barb2_dir = arrow_dir * (-1) + tangent * (-0.4)
-        barb2_dir.Unitize()
-        barb2 = rg.LineCurve(rg.Point3d(arrow_tip), rg.Point3d(arrow_tip) + barb2_dir * 2.0)
-        sc.doc.Objects.AddCurve(barb2, mark_attr)
-        dbg("    DEBUG ARROW: tip=({:.2f},{:.2f},{:.2f})".format(arrow_tip.X, arrow_tip.Y, arrow_tip.Z))
-
-        te = rg.TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
+        # create text on World XY (known: readable from +Z)
+        te = rg.TextEntity.Create(text_content, xy_plane, label_ds, False, 0, 0)
         if te is None:
             dbg("    warning: TextEntity.Create returned None for '{}'".format(text_content))
             continue
@@ -2264,8 +2264,11 @@ def unfold_to_2d():
             te.Font = mecsoft
         curves = te.CreateCurves(label_ds, False)
         if curves and len(curves) > 0:
+            # transform from World XY to target plane
+            xform = rg.Transform.PlaneToPlane(xy_plane, target_plane)
             label_guids = []
             for crv in curves:
+                crv.Transform(xform)
                 guid = sc.doc.Objects.AddCurve(crv, mark_attr)
                 if guid != System.Guid.Empty:
                     label_guids.append(guid)
