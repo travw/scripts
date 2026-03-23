@@ -35,6 +35,8 @@ from Rhino.DocObjects import ObjectType
 # ---------------------------------------------------------------------------
 STANDARD_GAUGES = [0.100, 0.125, 0.160, 0.190]
 BEND_LABEL_HEIGHT = 1.0  # inches
+BEND_LABEL_GAP = 0.125   # 1/8" gap between bend line and label edge
+BEND_LABEL_MIN_HEIGHT = 0.3  # minimum shrink height for fallback placement
 
 # debug log — collects all print output, optionally copies to clipboard or file
 _debug_log = []
@@ -1881,6 +1883,151 @@ def ensure_sublayers():
 
 
 
+def _label_fits(label_curves, outside_crv, inside_crvs, plane, tol):
+    """test whether all label curves sit on solid material.
+    checks bbox corners + center against outside boundary (must be inside)
+    and all inside holes (must not be inside any)."""
+    if not label_curves or outside_crv is None:
+        return False
+    # compute bounding box of all label curves
+    bbox = rg.BoundingBox.Empty
+    for crv in label_curves:
+        bbox.Union(crv.GetBoundingBox(True))
+    if not bbox.IsValid:
+        return False
+    # test 5 points: 4 corners + center
+    mn = bbox.Min
+    mx = bbox.Max
+    test_pts = [
+        rg.Point3d(mn.X, mn.Y, mn.Z),
+        rg.Point3d(mx.X, mn.Y, mn.Z),
+        rg.Point3d(mx.X, mx.Y, mn.Z),
+        rg.Point3d(mn.X, mx.Y, mn.Z),
+        rg.Point3d((mn.X + mx.X) / 2, (mn.Y + mx.Y) / 2, (mn.Z + mx.Z) / 2),
+    ]
+    for pt in test_pts:
+        # must be inside outside boundary
+        if outside_crv.Contains(pt, plane, tol) != rg.PointContainment.Inside:
+            return False
+        # must not be inside any hole
+        for hole in inside_crvs:
+            if hole.Contains(pt, plane, tol) == rg.PointContainment.Inside:
+                return False
+    return True
+
+
+def _make_label_curves(text_content, text_height, xy_plane, target_plane,
+                       label_ds, mecsoft):
+    """create text curves on World XY and transform to target plane.
+    returns list of transformed curves, or [] on failure."""
+    ds = label_ds.Duplicate()
+    ds.TextHeight = text_height
+    if mecsoft is not None:
+        ds.Font = mecsoft
+    te = rg.TextEntity.Create(text_content, xy_plane, ds, False, 0, 0)
+    if te is None:
+        return []
+    te.TextHeight = text_height
+    if mecsoft is not None:
+        te.Font = mecsoft
+    curves = te.CreateCurves(ds, False)
+    if not curves or len(curves) == 0:
+        return []
+    xform = rg.Transform.PlaneToPlane(xy_plane, target_plane)
+    for crv in curves:
+        crv.Transform(xform)
+    return list(curves)
+
+
+def _build_target_plane(mid_pt, tang_proj, target_y, offset_dir, gap):
+    """build a text placement plane offset from mid_pt in offset_dir."""
+    text_origin = mid_pt + offset_dir * gap
+    return rg.Plane(text_origin, tang_proj, target_y)
+
+
+def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
+                      flat_plane, label_ds, mecsoft, mark_attr):
+    """place bend label on solid material with fallback chain.
+    returns list of added guids, or [] if placement fails entirely."""
+    tol = sc.doc.ModelAbsoluteTolerance
+    xy_plane = rg.Plane.WorldXY
+
+    mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
+
+    # compute tangent direction (normalized to consistent orientation)
+    tangent = main_crv.TangentAt(main_crv.Domain.Mid)
+    tangent.Unitize()
+    if abs(tangent.Y) >= abs(tangent.X) and abs(tangent.Y) >= abs(tangent.Z):
+        if tangent.Y < 0:
+            tangent = -tangent
+    elif abs(tangent.X) >= abs(tangent.Z):
+        if tangent.X < 0:
+            tangent = -tangent
+    else:
+        if tangent.Z < 0:
+            tangent = -tangent
+
+    # project tangent perpendicular to picked_normal
+    tang_proj = tangent - pn * rg.Vector3d.Multiply(tangent, pn)
+    if tang_proj.Length < 1e-6:
+        tang_proj = tangent
+    tang_proj.Unitize()
+
+    # perpendicular direction (across bend line)
+    target_y = rg.Vector3d.CrossProduct(pn, tang_proj)
+    target_y.Unitize()
+
+    # rotated 90 degrees: swap tang_proj and target_y
+    tang_proj_rot = rg.Vector3d(target_y)
+    target_y_rot = rg.Vector3d(-tang_proj)
+
+    # try placement strategies in order
+    strategies = []
+    for height in [BEND_LABEL_HEIGHT, 0.75, 0.5, BEND_LABEL_MIN_HEIGHT]:
+        # normal orientation: side A, side B
+        strategies.append((height, tang_proj, target_y, target_y, False))
+        strategies.append((height, tang_proj, target_y, -target_y, False))
+        # rotated 90: side A, side B
+        if height == BEND_LABEL_HEIGHT:
+            strategies.append((height, tang_proj_rot, target_y_rot, target_y, False))
+            strategies.append((height, tang_proj_rot, target_y_rot, -target_y, False))
+
+    for height, tp, ty, offset_dir, is_fallback in strategies:
+        plane = _build_target_plane(mid_pt, tp, ty, offset_dir, BEND_LABEL_GAP)
+        curves = _make_label_curves(text_content, height, xy_plane, plane,
+                                    label_ds, mecsoft)
+        if not curves:
+            continue
+        if _label_fits(curves, outside_crv, inside_crvs, flat_plane, tol):
+            return _add_label_curves(curves, mark_attr)
+
+    # fallback: place at default position with "?" appended
+    dbg("    warning: '{}' could not fit on solid material, marking suspect".format(
+        text_content))
+    suspect_text = text_content + "?"
+    plane = _build_target_plane(mid_pt, tang_proj, target_y, target_y,
+                                BEND_LABEL_GAP)
+    curves = _make_label_curves(suspect_text, BEND_LABEL_HEIGHT, xy_plane, plane,
+                                label_ds, mecsoft)
+    if curves:
+        return _add_label_curves(curves, mark_attr)
+    return []
+
+
+def _add_label_curves(curves, mark_attr):
+    """add label curves to doc, group them, return guids."""
+    guids = []
+    for crv in curves:
+        guid = sc.doc.Objects.AddCurve(crv, mark_attr)
+        if guid != System.Guid.Empty:
+            guids.append(guid)
+    if guids:
+        grp = sc.doc.Groups.Add()
+        for g in guids:
+            sc.doc.Groups.AddToGroup(grp, g)
+    return guids
+
+
 def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
                text_curves, sublayers):
     """add 2D curves to fabrication sublayers. all geometry is in flat space."""
@@ -2135,8 +2282,7 @@ def unfold_to_2d():
     # step 11: add curves to sublayers (all output is in flat space)
     sublayers = ensure_sublayers()
 
-    # step 12: bend angle labels — derive orientation from baked merged_brep plane
-    # (all previous approaches using flat_normal / picked_normal cross products failed)
+    # step 12: bend angle labels — placed on solid material with fallback chain
     mark_idx = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
     mark_attr = Rhino.DocObjects.ObjectAttributes()
     mark_attr.LayerIndex = mark_idx
@@ -2145,83 +2291,48 @@ def unfold_to_2d():
     mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
     if mecsoft is not None:
         label_ds.Font = mecsoft
-    # build label text on World XY (known orientation: readable from +Z,
-    # flows along +X, ascenders along +Y), then PlaneToPlane transform
-    # to target location. bypasses Rhino TextEntity rendering inconsistency
-    # where text is readable from +Normal on some planes and -Normal on others.
-    xy_plane = rg.Plane.WorldXY
+
+    # join boundary curves for containment testing
+    tol = sc.doc.ModelAbsoluteTolerance
+    outside_crv = None
+    if outside_curves:
+        joined = rg.Curve.JoinCurves(outside_curves, tol)
+        if joined:
+            outside_crv = max(joined, key=lambda c: c.GetLength())
+    inside_holes = []
+    if inside_curves:
+        joined_inner = rg.Curve.JoinCurves(inside_curves, tol)
+        if joined_inner:
+            inside_holes = [c for c in joined_inner if c.IsClosed]
+
+    # get flat plane for containment (from flat_brep or picked_normal)
+    flat_plane = None
+    if flat_brep and flat_brep.Faces.Count > 0:
+        ok, fp = flat_brep.Faces[0].TryGetPlane(max(tol * 100, 0.1))
+        if ok:
+            flat_plane = fp
+    if flat_plane is None:
+        flat_plane = rg.Plane(rg.Point3d.Origin, picked_normal)
+
     pn = rg.Vector3d(picked_normal)
     pn.Unitize()
     dbg("  label picked_normal: ({:.4f},{:.4f},{:.4f})".format(pn.X, pn.Y, pn.Z))
+    dbg("  outside boundary: {}, {} holes".format(
+        "found" if outside_crv else "MISSING", len(inside_holes)))
+
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
             continue
         main_crv = max(flat_crvs, key=lambda c: c.GetLength())
-        mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
-
-        # tangent from bend curve, normalized to consistent direction
-        tangent = main_crv.TangentAt(main_crv.Domain.Mid)
-        tangent.Unitize()
-        # normalize: pick the direction with positive dot against a reference
-        # use world Y as primary (most bend lines run along Y), fallback to X
-        if abs(tangent.Y) >= abs(tangent.X) and abs(tangent.Y) >= abs(tangent.Z):
-            if tangent.Y < 0:
-                tangent = -tangent
-        elif abs(tangent.X) >= abs(tangent.Z):
-            if tangent.X < 0:
-                tangent = -tangent
-        else:
-            if tangent.Z < 0:
-                tangent = -tangent
-
-        # project tangent perpendicular to picked_normal
-        tang_proj = tangent - pn * rg.Vector3d.Multiply(tangent, pn)
-        if tang_proj.Length < 1e-6:
-            tang_proj = tangent  # fallback if tangent is parallel to pn
-        tang_proj.Unitize()
-
-        # build target frame: +Z = picked_normal (readable-from direction)
-        target_y = rg.Vector3d.CrossProduct(pn, tang_proj)
-        target_y.Unitize()
-        # offset text origin slightly above bend line (in target_y direction)
-        text_origin = mid_pt + target_y * BEND_LABEL_HEIGHT * 0.25
-        target_plane = rg.Plane(text_origin, tang_proj, target_y)
-        # target_plane.Normal should = picked_normal
-
         angle_int = int(round(entry["angle"]))
         direction = entry.get("direction", "UP")
         text_content = "{} {}".format(angle_int, direction)
 
-        dbg("    label '{}': mid=({:.2f},{:.2f},{:.2f}) tang=({:.4f},{:.4f},{:.4f}) target_n=({:.4f},{:.4f},{:.4f})".format(
-            text_content, mid_pt.X, mid_pt.Y, mid_pt.Z,
-            tang_proj.X, tang_proj.Y, tang_proj.Z,
-            target_plane.Normal.X, target_plane.Normal.Y, target_plane.Normal.Z))
-
-        # create text on World XY (known: readable from +Z)
-        te = rg.TextEntity.Create(text_content, xy_plane, label_ds, False, 0, 0)
-        if te is None:
-            dbg("    warning: TextEntity.Create returned None for '{}'".format(text_content))
-            continue
-        te.TextHeight = BEND_LABEL_HEIGHT
-        if mecsoft is not None:
-            te.Font = mecsoft
-        curves = te.CreateCurves(label_ds, False)
-        if curves and len(curves) > 0:
-            # transform from World XY to target plane
-            xform = rg.Transform.PlaneToPlane(xy_plane, target_plane)
-            label_guids = []
-            for crv in curves:
-                crv.Transform(xform)
-                guid = sc.doc.Objects.AddCurve(crv, mark_attr)
-                if guid != System.Guid.Empty:
-                    label_guids.append(guid)
-            if label_guids:
-                grp = sc.doc.Groups.Add()
-                for g in label_guids:
-                    sc.doc.Groups.AddToGroup(grp, g)
-        else:
-            dbg("    warning: CreateCurves returned no curves for '{}'".format(text_content))
+        guids = _place_bend_label(text_content, main_crv, pn, outside_crv,
+                                  inside_holes, flat_plane, label_ds, mecsoft,
+                                  mark_attr)
+        dbg("    label '{}': {} curves placed".format(text_content, len(guids)))
 
     # step 13: output cuts + bend/ink curves to sublayers
     count = add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
