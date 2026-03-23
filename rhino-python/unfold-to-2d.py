@@ -1305,14 +1305,18 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             # recompute nei_c with final transform
             nei_c2 = rg.Point3d(nei_amp.Centroid)
             nei_c2.Transform(best_combined)
-            # perpendicular to bend axis in the flat plane
-            perp = rg.Vector3d.CrossProduct(flat_normal, axis_dir)
-            perp.Unitize()
-            # direction from neighbor toward current (closing the gap)
+            # shift direction: project (cur_c - nei_c2) onto plane perp to axis
+            # this directly gives the "toward current" direction, no sign guessing
             to_current = rg.Vector3d(cur_c - nei_c2)
-            # project onto perp to get the sign
-            sign = 1.0 if rg.Vector3d.Multiply(to_current, perp) > 0 else -1.0
-            shift_vec = perp * sign * deduction
+            # remove axis-parallel component
+            axis_comp = rg.Vector3d.Multiply(to_current, axis_dir)
+            shift_dir = to_current - axis_dir * axis_comp
+            if shift_dir.Length > tol:
+                shift_dir.Unitize()
+                shift_vec = shift_dir * deduction
+            else:
+                # faces are coaxial (centroids on same axis-perp line), fallback
+                shift_vec = rg.Vector3d(0, 0, 0)
             face_shifts[neighbor] = face_shifts[current] + shift_vec
             print("    shift {}->{}: vec=({:.4f},{:.4f},{:.4f}) cumulative=({:.4f},{:.4f},{:.4f})".format(
                 current, neighbor, shift_vec.X, shift_vec.Y, shift_vec.Z,
@@ -1381,32 +1385,206 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         seed_tag = " (SEED)" if fi == seed else ""
         print("    face {}: area={:.1f}{}".format(fi, amp.Area if amp else 0, seed_tag))
 
-    # --- merge overlapping faces into single outline via curve boolean union ---
-    boundary_curves = []
+    # --- detect cross-bend holes via un-shifted face merge ---
+    # un-shifted face breps (rotation only, no deduction shift) tile perfectly
+    # at bend edges. joining + MergeCoplanarFaces turns paired notches into
+    # inner loops, revealing through-holes that cross bend lines.
+    cross_bend_holes = []
+    unshifted_face_breps = []
+    unshifted_fi_list = []
+    proj_to_seed = rg.Transform.PlanarProjection(face_planes[seed])
+    for fi in range(n_faces):
+        if fi not in transforms:
+            continue
+        fb_us = nas.Faces[fi].DuplicateFace(False)
+        fb_us.Transform(transforms[fi])
+        fb_us.Transform(proj_to_seed)  # kill FP drift from sequential rotations
+        unshifted_face_breps.append(fb_us)
+        unshifted_fi_list.append(fi)
+
+    if len(unshifted_face_breps) > 1:
+        # collect single-face inner loop centroids for filtering
+        individual_hole_centroids = []
+        for fb_us in unshifted_face_breps:
+            if fb_us.Faces.Count > 0:
+                for li in range(fb_us.Faces[0].Loops.Count):
+                    lp = fb_us.Faces[0].Loops[li]
+                    if lp.LoopType == rg.BrepLoopType.Inner:
+                        lc = lp.To3dCurve()
+                        if lc:
+                            lc_amp = rg.AreaMassProperties.Compute(lc)
+                            if lc_amp:
+                                individual_hole_centroids.append(lc_amp.Centroid)
+
+        joined_us = rg.Brep.JoinBreps(unshifted_face_breps, tol * 10)
+        if joined_us and len(joined_us) >= 1:
+            merged_us = joined_us[0]
+            # try merging coplanar faces with increasing tolerance
+            merge_ok = False
+            for merge_tol in [tol, tol * 10, tol * 100]:
+                if merged_us.MergeCoplanarFaces(merge_tol):
+                    merge_ok = True
+                    break
+            if merge_ok:
+                # extract inner loops from merged result
+                all_merged_holes = []
+                for fi2 in range(merged_us.Faces.Count):
+                    face2 = merged_us.Faces[fi2]
+                    for li2 in range(face2.Loops.Count):
+                        lp2 = face2.Loops[li2]
+                        if lp2.LoopType == rg.BrepLoopType.Inner:
+                            hc = lp2.To3dCurve()
+                            if hc is not None:
+                                all_merged_holes.append(hc)
+                # filter: keep only holes NOT already found on individual faces
+                for hc in all_merged_holes:
+                    hc_amp = rg.AreaMassProperties.Compute(hc)
+                    if hc_amp is None:
+                        continue
+                    hc_centroid = hc_amp.Centroid
+                    is_existing = False
+                    for ec in individual_hole_centroids:
+                        if hc_centroid.DistanceTo(ec) < tol * 100:
+                            is_existing = True
+                            break
+                    if not is_existing:
+                        cross_bend_holes.append(hc)
+            else:
+                print("  warning: MergeCoplanarFaces failed, skipping cross-bend hole detection")
+
+    # shift cross-bend hole curves to match deducted pattern
+    shifted_cross_bend_holes = []
+    for hc in cross_bend_holes:
+        # split at bend lines (un-shifted positions)
+        split_params = []
+        for entry in nas_edge_bends:
+            pre_p1 = entry.get("_pre_shift_p1")
+            pre_p2 = entry.get("_pre_shift_p2")
+            if pre_p1 is None or pre_p2 is None:
+                continue
+            bend_dir = rg.Vector3d(pre_p2 - pre_p1)
+            bend_dir.Unitize()
+            ext_line = rg.LineCurve(pre_p1 - bend_dir * 500, pre_p2 + bend_dir * 500)
+            ccx = Intersection.CurveCurve(hc, ext_line, tol, tol)
+            if ccx:
+                for ix in range(ccx.Count):
+                    evt = ccx[ix]
+                    if evt.IsPoint:
+                        split_params.append(evt.ParameterA)
+
+        if not split_params:
+            # doesn't cross any bend -- add as-is
+            shifted_cross_bend_holes.append(hc)
+            continue
+
+        split_params.sort()
+        # remove duplicate params (from nearly-coincident bend lines)
+        unique_params = [split_params[0]]
+        for sp in split_params[1:]:
+            if abs(sp - unique_params[-1]) > tol:
+                unique_params.append(sp)
+
+        segments = hc.Split(unique_params)
+        if not segments or len(segments) < 2:
+            # split failed, add un-shifted
+            shifted_cross_bend_holes.append(hc)
+            continue
+
+        # shift each segment by its face's deduction
+        shifted_segs = []
+        for seg in segments:
+            mid = seg.PointAt(seg.Domain.Mid)
+            best_fi = None
+            best_dist = float("inf")
+            for idx, fb_us in enumerate(unshifted_face_breps):
+                cp = fb_us.ClosestPoint(mid)
+                d = mid.DistanceTo(cp)
+                if d < best_dist:
+                    best_dist = d
+                    best_fi = unshifted_fi_list[idx]
+            seg_copy = seg.DuplicateCurve()
+            if best_fi is not None:
+                shift = face_shifts.get(best_fi, rg.Vector3d(0, 0, 0))
+                if shift.Length > 0.0001:
+                    seg_copy.Transform(rg.Transform.Translation(shift))
+            shifted_segs.append(seg_copy)
+
+        # rejoin into closed curve
+        rejoined = rg.Curve.JoinCurves(shifted_segs, tol * 100)
+        if rejoined:
+            for rc in rejoined:
+                if rc.IsClosed:
+                    shifted_cross_bend_holes.append(rc)
+                else:
+                    rc2 = rc.DuplicateCurve()
+                    if rc2.MakeClosed(tol * 100):
+                        shifted_cross_bend_holes.append(rc2)
+        else:
+            # rejoin failed, add un-shifted
+            shifted_cross_bend_holes.append(hc)
+
+    if cross_bend_holes:
+        print("  cross-bend holes: {} detected, {} shifted".format(
+            len(cross_bend_holes), len(shifted_cross_bend_holes)))
+
+    # --- merge overlapping faces into single outline, preserving inner loops ---
+    boundary_curves = []  # outer boundaries only
+    inner_loop_curves = shifted_cross_bend_holes[:]  # start with cross-bend holes
     for fb in flat_faces:
-        edges = [fb.Edges[ei].DuplicateCurve() for ei in range(fb.Edges.Count)]
-        joined = rg.Curve.JoinCurves(edges, tol * 10)
-        if joined:
-            # keep the longest joined curve (outer boundary)
-            boundary_curves.append(max(joined, key=lambda c: c.GetLength()))
+        # extract loops by type: outer vs inner
+        if fb.Faces.Count > 0:
+            face0 = fb.Faces[0]
+            for li in range(face0.Loops.Count):
+                loop = face0.Loops[li]
+                loop_crv = loop.To3dCurve()
+                if loop_crv is None:
+                    continue
+                if loop.LoopType == rg.BrepLoopType.Outer:
+                    boundary_curves.append(loop_crv)
+                elif loop.LoopType == rg.BrepLoopType.Inner:
+                    inner_loop_curves.append(loop_crv)
+        else:
+            # fallback: join edges, keep longest as outer
+            edges = [fb.Edges[ei].DuplicateCurve() for ei in range(fb.Edges.Count)]
+            joined = rg.Curve.JoinCurves(edges, tol * 10)
+            if joined:
+                boundary_curves.append(max(joined, key=lambda c: c.GetLength()))
+    print("  extracted {} outer boundaries, {} inner loops (holes)".format(
+        len(boundary_curves), len(inner_loop_curves)))
+
     merged_outline = None
     if len(boundary_curves) > 1:
         union_result = rg.Curve.CreateBooleanUnion(boundary_curves, tol)
         if union_result and len(union_result) > 0:
             merged_outline = max(union_result, key=lambda c: c.GetLength())
-            print("  boundary union: {} input curves → {} result curves".format(
+            print("  boundary union: {} input curves -> {} result curves".format(
                 len(boundary_curves), len(union_result)))
+        else:
+            # union failed -- try joining all boundaries as fallback
+            print("  warning: boundary union failed, falling back to join")
+            joined_all = rg.Curve.JoinCurves(boundary_curves, tol * 10)
+            if joined_all:
+                merged_outline = max(joined_all, key=lambda c: c.GetLength())
     elif len(boundary_curves) == 1:
         merged_outline = boundary_curves[0]
-    # create merged brep from outline
+
+    # create merged brep: outer boundary + inner loop holes
     merged_brep = None
     if merged_outline is not None:
-        merged_breps = rg.Brep.CreatePlanarBreps(merged_outline, tol)
+        # collect all curves for CreatePlanarBreps: outer + inner loops
+        all_planar_curves = [merged_outline] + inner_loop_curves
+        merged_breps = rg.Brep.CreatePlanarBreps(all_planar_curves, tol)
         if merged_breps and len(merged_breps) > 0:
-            merged_brep = merged_breps[0]
-            print("  merged flat pattern: area={:.1f}".format(
-                rg.AreaMassProperties.Compute(merged_brep).Area
-                if rg.AreaMassProperties.Compute(merged_brep) else 0))
+            # pick the brep that contains the outer boundary (largest area)
+            merged_brep = max(merged_breps, key=lambda b:
+                rg.AreaMassProperties.Compute(b).Area
+                if rg.AreaMassProperties.Compute(b) else 0)
+            amp_merged = rg.AreaMassProperties.Compute(merged_brep)
+            n_holes = sum(1 for fi2 in range(merged_brep.Faces.Count)
+                         for li2 in range(merged_brep.Faces[fi2].Loops.Count)
+                         if merged_brep.Faces[fi2].Loops[li2].LoopType == rg.BrepLoopType.Inner)
+            print("  merged flat pattern: area={:.1f}, {} holes".format(
+                amp_merged.Area if amp_merged else 0, n_holes))
 
     # --- apply deduction shifts to bend axis endpoints ---
     # the bend line goes where the two trimmed faces meet:
@@ -1526,13 +1704,27 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         baked_guids.append(guid)
     print("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
 
-    # still return expected tuple so caller doesn't crash
+    # extract outside/inside cut curves from merged brep
     outside_curves = []
     inside_curves = []
-    flat_brep = flat_faces[0] if flat_faces else None
-    if flat_brep is None:
+    source_brep = merged_brep if merged_brep is not None else (flat_faces[0] if flat_faces else None)
+    if source_brep is None:
         print("error: no flat geometry produced")
         return None
+    for fi2 in range(source_brep.Faces.Count):
+        face2 = source_brep.Faces[fi2]
+        for li2 in range(face2.Loops.Count):
+            loop = face2.Loops[li2]
+            loop_crv = loop.To3dCurve()
+            if loop_crv is None:
+                continue
+            if loop.LoopType == rg.BrepLoopType.Outer:
+                outside_curves.append(loop_crv)
+            elif loop.LoopType == rg.BrepLoopType.Inner:
+                inside_curves.append(loop_crv)
+    print("  output curves: {} outside, {} inside (holes)".format(
+        len(outside_curves), len(inside_curves)))
+    flat_brep = source_brep
     return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends, transforms, face_shifts
 
 
@@ -1960,9 +2152,10 @@ def unfold_to_2d():
                 for g in label_guids:
                     sc.doc.Groups.AddToGroup(grp, g)
 
-    # step 14: other output (outside/inside cuts) through add_output with alignment
+    # step 14: outside/inside cuts — output in flat space (no align_xform)
+    # align_xform adds slight error, same issue that broke bend line placement
     count = add_output(outside_curves, inside_curves, [], [],
-                       [], sublayers, align_xform=align_xform)
+                       [], sublayers, align_xform=None)
 
     sc.doc.Views.Redraw()
 

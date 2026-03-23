@@ -154,6 +154,10 @@ key geometric concepts:
   for sharp corners, build offset geometry from plane math instead.
 - `Intersection.PlanePlane` returns `(bool, Line)` — an infinite Line.
   `Line.ClosestParameter` returns a double, not a tuple.
+- prefer rhino API classification over heuristics. use `BrepFace.OuterLoop`
+  not "longest curve". use `Edge.AdjacentFaces()` not centroid matching.
+  use `BrepLoopType.Inner` not area comparison. the API already knows
+  the topology — reinventing it with geometric heuristics is fragile.
 - joined polysurface face normals are NOT consistently oriented.
   use `abs(dot)` when computing angles between faces in a joined brep.
 - unfold-to-2d coordinate spaces: the BFS unroll produces geometry in the
