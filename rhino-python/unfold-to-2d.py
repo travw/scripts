@@ -45,6 +45,7 @@ BEND_DIAMOND_WIDTH = 0.5   # inches, across bend line
 _debug_log = []
 _debug_enabled = False
 DEBUG_MODES = ["off", "clipboard", "file"]
+LOCATION_MODES = ["inplace", "origin", "select"]
 
 
 def dbg(msg):
@@ -70,6 +71,24 @@ def prompt_debug_mode():
         choice = prev
     sc.sticky["unfold_debug_mode"] = choice
     _debug_enabled = choice != "off"
+
+
+def prompt_location():
+    """command-line option for output placement. remembers last choice via sc.sticky."""
+    prev = sc.sticky.get("unfold_location", "inplace")
+    go = Rhino.Input.Custom.GetOption()
+    go.SetCommandPrompt("Output location")
+    go.SetDefaultString(prev)
+    for m in LOCATION_MODES:
+        go.AddOption(m)
+    go.AcceptNothing(True)
+    result = go.Get()
+    if result == Rhino.Input.GetResult.Option:
+        choice = go.Option().EnglishName.lower()
+    else:
+        choice = prev
+    sc.sticky["unfold_location"] = choice
+    return choice
 
 
 def flush_debug_log():
@@ -1782,21 +1801,21 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 ink_copy.Transform(rg.Transform.Translation(shift))
             flat_ink_curves.append(ink_copy)
 
-    # --- bake flat pattern to visual verification layer ---
-    bake_layer = "03 - Bake"
-    if not rs.IsLayer(bake_layer):
-        rs.AddLayer(bake_layer)
-    layer_idx = sc.doc.Layers.FindByFullPath(bake_layer, -1)
-    baked_guids = []
-    bake_target = merged_brep if merged_brep is not None else flat_faces[0]
-    a = Rhino.DocObjects.ObjectAttributes()
-    a.LayerIndex = layer_idx
-    a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-    a.ObjectColor = System.Drawing.Color.FromArgb(100, 255, 100)
-    guid = sc.doc.Objects.AddBrep(bake_target, a)
-    if guid != System.Guid.Empty:
-        baked_guids.append(guid)
-    dbg("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
+    # # debug: bake flat pattern to visual verification layer
+    # bake_layer = "03 - Bake"
+    # if not rs.IsLayer(bake_layer):
+    #     rs.AddLayer(bake_layer)
+    # layer_idx = sc.doc.Layers.FindByFullPath(bake_layer, -1)
+    # baked_guids = []
+    # bake_target = merged_brep if merged_brep is not None else flat_faces[0]
+    # a = Rhino.DocObjects.ObjectAttributes()
+    # a.LayerIndex = layer_idx
+    # a.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+    # a.ObjectColor = System.Drawing.Color.FromArgb(100, 255, 100)
+    # guid = sc.doc.Objects.AddBrep(bake_target, a)
+    # if guid != System.Guid.Empty:
+    #     baked_guids.append(guid)
+    # dbg("  baked {} flat faces to '{}'".format(len(flat_faces), bake_layer))
 
     # extract outside/inside cut curves from merged brep
     outside_curves = []
@@ -2320,7 +2339,7 @@ def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
         for g in guids:
             sc.doc.Groups.AddToGroup(group_idx, g)
 
-    return count
+    return count, guids
 
 
 # ---------------------------------------------------------------------------
@@ -2385,6 +2404,10 @@ def unfold_to_2d():
 
     # debug output option
     prompt_debug_mode()
+
+    # output location option
+    location = prompt_location()
+    dbg("  location: {}".format(location))
 
     # step 3: classify faces
     dbg("=== face classification ===")
@@ -2626,6 +2649,7 @@ def unfold_to_2d():
     dbg("  processed bend lines: {} curves (from {} raw)".format(
         len(processed_bend), len(unrolled_bend)))
 
+    all_output_guids = []
     placed_bboxes = []
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
@@ -2636,16 +2660,63 @@ def unfold_to_2d():
         direction = entry.get("direction", "UP")
         text_content = "{} {}".format(angle_int, direction)
 
-        guids, bbox = _place_bend_label(text_content, main_crv, pn, outside_crv,
-                                        inside_holes, flat_plane, label_ds, mecsoft,
-                                        mark_attr, placed_bboxes,
-                                        dash_inner_pts=entry.get("dash_inner_pts"))
-        dbg("    label '{}': {} curves placed".format(text_content, len(guids)))
+        label_guids, bbox = _place_bend_label(text_content, main_crv, pn, outside_crv,
+                                              inside_holes, flat_plane, label_ds, mecsoft,
+                                              mark_attr, placed_bboxes,
+                                              dash_inner_pts=entry.get("dash_inner_pts"))
+        all_output_guids.extend(label_guids)
+        dbg("    label '{}': {} curves placed".format(text_content, len(label_guids)))
 
     # step 13: output cuts + processed bend/ink curves to sublayers
-    count = add_output(outside_curves, inside_curves, processed_bend, unrolled_ink,
-                       [], sublayers)
+    count, output_guids = add_output(outside_curves, inside_curves, processed_bend,
+                                     unrolled_ink, [], sublayers)
+    all_output_guids.extend(output_guids)
     dbg("  {} curves added to sublayers".format(count))
+
+    # step 14: apply placement transform if not "inplace"
+    if location != "inplace" and all_output_guids:
+        if location == "origin":
+            # PlaneToPlane from flat_plane to World XY
+            xform = rg.Transform.PlaneToPlane(flat_plane, rg.Plane.WorldXY)
+            for guid in all_output_guids:
+                sc.doc.Objects.Transform(guid, xform, True)
+            dbg("  moved to origin (World XY)")
+        elif location == "select":
+            # compute bbox center of all output, then let user place it
+            bbox = rg.BoundingBox.Empty
+            for guid in all_output_guids:
+                obj = sc.doc.Objects.FindId(guid)
+                if obj is not None:
+                    bbox.Union(obj.Geometry.GetBoundingBox(True))
+            if bbox.IsValid:
+                bbox_center = rg.Point3d(
+                    (bbox.Min.X + bbox.Max.X) / 2,
+                    (bbox.Min.Y + bbox.Max.Y) / 2,
+                    (bbox.Min.Z + bbox.Max.Z) / 2)
+                # first move to origin so user sees it flat
+                xform_to_origin = rg.Transform.PlaneToPlane(flat_plane, rg.Plane.WorldXY)
+                for guid in all_output_guids:
+                    sc.doc.Objects.Transform(guid, xform_to_origin, True)
+                sc.doc.Views.Redraw()
+                # recompute bbox center after transform
+                bbox2 = rg.BoundingBox.Empty
+                for guid in all_output_guids:
+                    obj = sc.doc.Objects.FindId(guid)
+                    if obj is not None:
+                        bbox2.Union(obj.Geometry.GetBoundingBox(True))
+                bbox_center2 = rg.Point3d(
+                    (bbox2.Min.X + bbox2.Max.X) / 2,
+                    (bbox2.Min.Y + bbox2.Max.Y) / 2, 0)
+                # get user placement point
+                user_pt = rs.GetPoint("Place flat pattern (bbox center)")
+                if user_pt is not None:
+                    move = rg.Transform.Translation(rg.Vector3d(user_pt - bbox_center2))
+                    for guid in all_output_guids:
+                        sc.doc.Objects.Transform(guid, move, True)
+                    dbg("  placed at user point ({:.2f},{:.2f},{:.2f})".format(
+                        user_pt.X, user_pt.Y, user_pt.Z))
+                else:
+                    dbg("  placement cancelled, output at origin")
 
     sc.doc.Views.Redraw()
     flush_debug_log()
