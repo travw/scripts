@@ -2391,27 +2391,27 @@ def unfold_to_2d():
                 dbg("  picked_normal (partner-corrected): ({:.4f},{:.4f},{:.4f})".format(
                     picked_normal.X, picked_normal.Y, picked_normal.Z))
 
-    # add face index text dots for visual identification
-    sheet_set = set(sheet_faces)
-    dot_ids = []
-    for i in range(brep.Faces.Count):
-        centroid, _ = get_face_outward_normal(brep, i)
-        if centroid is None:
-            continue
-        dot = Rhino.Geometry.TextDot(str(i), centroid)
-        dot.FontHeight = 14
-        attr = Rhino.DocObjects.ObjectAttributes()
-        if i in sheet_set:
-            attr.ObjectColor = System.Drawing.Color.FromArgb(0, 180, 0)
-        else:
-            attr.ObjectColor = System.Drawing.Color.FromArgb(220, 0, 0)
-        attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
-        dot_ids.append(sc.doc.Objects.AddTextDot(dot, attr))
-    if dot_ids:
-        group_idx = sc.doc.Groups.Add("unfold_face_dots")
-        for did in dot_ids:
-            sc.doc.Groups.AddToGroup(group_idx, did)
-    sc.doc.Views.Redraw()
+    # # debug: face index text dots for visual identification
+    # sheet_set = set(sheet_faces)
+    # dot_ids = []
+    # for i in range(brep.Faces.Count):
+    #     centroid, _ = get_face_outward_normal(brep, i)
+    #     if centroid is None:
+    #         continue
+    #     dot = Rhino.Geometry.TextDot(str(i), centroid)
+    #     dot.FontHeight = 14
+    #     attr = Rhino.DocObjects.ObjectAttributes()
+    #     if i in sheet_set:
+    #         attr.ObjectColor = System.Drawing.Color.FromArgb(0, 180, 0)
+    #     else:
+    #         attr.ObjectColor = System.Drawing.Color.FromArgb(220, 0, 0)
+    #     attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+    #     dot_ids.append(sc.doc.Objects.AddTextDot(dot, attr))
+    # if dot_ids:
+    #     group_idx = sc.doc.Groups.Add("unfold_face_dots")
+    #     for did in dot_ids:
+    #         sc.doc.Groups.AddToGroup(group_idx, did)
+    # sc.doc.Views.Redraw()
 
     if len(sheet_faces) < 2:
         dbg("error: need at least 2 sheet faces")
