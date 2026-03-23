@@ -37,6 +37,9 @@ STANDARD_GAUGES = [0.100, 0.125, 0.160, 0.190]
 BEND_LABEL_HEIGHT = 1.0  # inches
 BEND_LABEL_GAP = 0.125   # 1/8" gap between bend line and label edge
 BEND_LABEL_MIN_HEIGHT = 0.3  # minimum shrink height for fallback placement
+BEND_DASH_LENGTH = 3.0   # inches, max continuous bend line segment at each end
+BEND_DIAMOND_LENGTH = 1.0  # inches, along bend line
+BEND_DIAMOND_WIDTH = 0.5   # inches, across bend line
 
 # debug log — collects all print output, optionally copies to clipboard or file
 _debug_log = []
@@ -1897,6 +1900,116 @@ def ensure_sublayers():
 
 
 
+def _make_diamond(tip, along, perp):
+    """create a closed diamond polyline at a bend line endpoint.
+    tip = point at the outside-cut intersection.
+    along = unit vector pointing INWARD along the bend line.
+    perp = unit vector perpendicular to the bend line."""
+    half_w = BEND_DIAMOND_WIDTH / 2
+    half_l = BEND_DIAMOND_LENGTH / 2
+    p0 = tip  # tip at outside cut
+    p1 = tip + along * half_l + perp * half_w
+    p2 = tip + along * BEND_DIAMOND_LENGTH
+    p3 = tip + along * half_l - perp * half_w
+    pts = [p0, p1, p2, p3, p0]
+    return rg.PolylineCurve([rg.Point3d(p) for p in pts])
+
+
+def _process_bend_lines(nas_edge_bends, outside_crv, tol):
+    """convert raw bend lines to diamonds + 3-inch dashes at outside-cut ends.
+    returns (all_processed_curves, per-entry dash_inner_pts for label placement).
+    stores entry["dash_inner_pts"] = list of inner endpoints of the 3" dashes."""
+    all_curves = []
+    if outside_crv is None:
+        # no outside boundary — return raw bend lines unchanged
+        for entry in nas_edge_bends:
+            for crv in entry.get("flat_curves", []):
+                all_curves.append(crv)
+        return all_curves
+
+    for entry in nas_edge_bends:
+        flat_crvs = entry.get("flat_curves", [])
+        if not flat_crvs:
+            continue
+        entry["dash_inner_pts"] = []
+        for crv in flat_crvs:
+            # find intersections with outside boundary
+            ix = Intersection.CurveCurve(crv, outside_crv, tol, tol)
+            if ix is None or ix.Count == 0:
+                # no intersection — keep raw curve
+                all_curves.append(crv)
+                continue
+
+            # collect intersection points with parameters on the bend curve
+            ix_params = []
+            for i in range(ix.Count):
+                evt = ix[i]
+                ix_params.append((evt.ParameterA, evt.PointA))
+            ix_params.sort(key=lambda x: x[0])
+
+            if len(ix_params) < 2:
+                # only one intersection — keep raw + diamond at that end
+                t0, pt0 = ix_params[0]
+                mid_t = crv.Domain.Mid
+                along = crv.TangentAt(t0)
+                along.Unitize()
+                # point inward (away from the intersection toward the curve interior)
+                if t0 < mid_t:
+                    along_in = along if crv.TangentAt(mid_t).X * along.X + crv.TangentAt(mid_t).Y * along.Y + crv.TangentAt(mid_t).Z * along.Z > 0 else -along
+                else:
+                    along_in = -along if crv.TangentAt(mid_t).X * along.X + crv.TangentAt(mid_t).Y * along.Y + crv.TangentAt(mid_t).Z * along.Z > 0 else along
+                perp = rg.Vector3d.CrossProduct(along_in, rg.Vector3d(0, 0, 1))
+                if perp.Length < 1e-6:
+                    perp = rg.Vector3d.CrossProduct(along_in, rg.Vector3d(0, 1, 0))
+                perp.Unitize()
+                all_curves.append(_make_diamond(pt0, along_in, perp))
+                all_curves.append(crv)
+                continue
+
+            # two intersection points: start and end of bend line within part
+            t_start, pt_start = ix_params[0]
+            t_end, pt_end = ix_params[-1]
+
+            # direction vectors pointing inward from each end
+            tangent = crv.TangentAt(t_start)
+            tangent.Unitize()
+            span_vec = rg.Vector3d(pt_end - pt_start)
+            if rg.Vector3d.Multiply(tangent, span_vec) < 0:
+                tangent = -tangent
+            along_from_start = rg.Vector3d(tangent)  # points from start toward end
+            along_from_end = -along_from_start  # points from end toward start
+
+            # perpendicular (in the flat plane, cross with flat_normal approximated as Z)
+            perp = rg.Vector3d.CrossProduct(along_from_start, rg.Vector3d(0, 0, 1))
+            if perp.Length < 1e-6:
+                perp = rg.Vector3d.CrossProduct(along_from_start, rg.Vector3d(0, 1, 0))
+            perp.Unitize()
+
+            # total span between intersections
+            span_length = pt_start.DistanceTo(pt_end)
+
+            # diamonds at both ends
+            all_curves.append(_make_diamond(pt_start, along_from_start, perp))
+            all_curves.append(_make_diamond(pt_end, along_from_end, perp))
+
+            if span_length <= BEND_DASH_LENGTH:
+                # short bend — keep full line between intersections
+                line = rg.LineCurve(pt_start, pt_end)
+                all_curves.append(line)
+                # inner pts = both ends (for label positioning)
+                entry["dash_inner_pts"].extend([pt_end, pt_start])
+            else:
+                # 3" dashes at each end
+                dash_end_from_start = pt_start + along_from_start * BEND_DASH_LENGTH
+                dash_end_from_end = pt_end + along_from_end * BEND_DASH_LENGTH
+                all_curves.append(rg.LineCurve(pt_start, dash_end_from_start))
+                all_curves.append(rg.LineCurve(pt_end, dash_end_from_end))
+                # inner pts = the inner endpoints of the dashes
+                entry["dash_inner_pts"].extend([dash_end_from_start, dash_end_from_end])
+
+    return all_curves
+
+
 def _label_fits(label_curves, outside_crv, inside_crvs, plane, tol):
     """test whether all label curves sit on solid material.
     checks bbox corners + center against outside boundary (must be inside)
@@ -2025,8 +2138,10 @@ def _try_label_at(text_content, text_height, mid_pt, tang_proj, target_y,
 
 
 def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
-                      flat_plane, label_ds, mecsoft, mark_attr, placed_bboxes):
-    """place bend label on solid material with fallback chain.
+                      flat_plane, label_ds, mecsoft, mark_attr, placed_bboxes,
+                      dash_inner_pts=None):
+    """place bend label on solid material, next to a dash inner endpoint.
+    label is centered on the bend axis, with bbox edge 1/8" from the dash end.
     returns (guids, bbox) or ([], None). appends bbox to placed_bboxes on success."""
     tol = sc.doc.ModelAbsoluteTolerance
 
@@ -2055,39 +2170,45 @@ def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
     target_y = rg.Vector3d.CrossProduct(pn, tang_proj)
     target_y.Unitize()
 
-    # rotated 90 degrees: swap tang_proj and target_y
-    tang_proj_rot = rg.Vector3d(target_y)
-    target_y_rot = rg.Vector3d(-tang_proj)
+    # build placement candidates from dash inner points
+    # for each dash inner pt, try placing label with bbox edge 1/8" from it
+    # label is centered on bend axis (side_sign=0 means no perpendicular offset)
+    # the slide_offset positions the label along the bend line
+    if dash_inner_pts and len(dash_inner_pts) > 0:
+        for height in [BEND_LABEL_HEIGHT, 0.75, 0.5, BEND_LABEL_MIN_HEIGHT]:
+            for dip in dash_inner_pts:
+                # vector from midpoint to dash inner point
+                to_dip = rg.Vector3d(dip - mid_pt)
+                along_dist = rg.Vector3d.Multiply(to_dip, tang_proj)
+                # try label on the inward side of the dash (away from the outside cut)
+                # bbox edge at dip + gap along tang_proj direction
+                for sign in [1.0, -1.0]:
+                    # the label center will be offset from dip by gap + half the text width
+                    # we don't know the text width yet, so use slide_offset from mid_pt
+                    # to position the label such that its nearest edge is gap from dip
+                    slide = along_dist + sign * BEND_LABEL_GAP
+                    curves, bbox = _try_label_at(
+                        text_content, height, mid_pt, tang_proj, target_y,
+                        pn, 0, 0, slide, outside_crv, inside_crvs,
+                        flat_plane, label_ds, mecsoft, placed_bboxes, tol)
+                    if curves is not None:
+                        guids = _add_label_curves(curves, mark_attr)
+                        placed_bboxes.append(bbox)
+                        return guids, bbox
 
-    # try placement strategies in order
-    # each: (height, tang_proj, target_y, side_sign)
-    strategies = []
+    # fallback: try the old approach (centered on midpoint, offset perpendicular)
     for height in [BEND_LABEL_HEIGHT, 0.75, 0.5, BEND_LABEL_MIN_HEIGHT]:
-        strategies.append((height, tang_proj, target_y, +1))
-        strategies.append((height, tang_proj, target_y, -1))
-        if height == BEND_LABEL_HEIGHT:
-            strategies.append((height, tang_proj_rot, target_y_rot, +1))
-            strategies.append((height, tang_proj_rot, target_y_rot, -1))
-
-    # for each strategy, try centered first, then slide along bend line
-    bend_len = main_crv.GetLength()
-    slide_offsets = [0.0]
-    for s in [0.25, 0.5]:
-        d = bend_len * s
-        slide_offsets.extend([d, -d])
-
-    for height, tp, ty, side_sign in strategies:
-        for slide in slide_offsets:
+        for side_sign in [+1, -1]:
             curves, bbox = _try_label_at(
-                text_content, height, mid_pt, tp, ty, pn, side_sign,
-                BEND_LABEL_GAP, slide, outside_crv, inside_crvs,
+                text_content, height, mid_pt, tang_proj, target_y,
+                pn, side_sign, BEND_LABEL_GAP, 0.0, outside_crv, inside_crvs,
                 flat_plane, label_ds, mecsoft, placed_bboxes, tol)
             if curves is not None:
                 guids = _add_label_curves(curves, mark_attr)
                 placed_bboxes.append(bbox)
                 return guids, bbox
 
-    # fallback: place at default position with "?" appended
+    # last resort: place with "?" appended
     dbg("    warning: '{}' could not fit on solid material, marking suspect".format(
         text_content))
     suspect_text = text_content + "?"
@@ -2407,15 +2528,15 @@ def unfold_to_2d():
     if mecsoft is not None:
         label_ds.Font = mecsoft
 
-    # join boundary curves for containment testing
+    # join boundary curves for containment testing and bend line processing
     tol = sc.doc.ModelAbsoluteTolerance
+    raw_outside = None
     outside_crv = None
     if outside_curves:
         joined = rg.Curve.JoinCurves(outside_curves, tol)
         if joined:
             raw_outside = max(joined, key=lambda c: c.GetLength())
             # inset outside boundary by 1/8" so labels have cushion from edge
-            # try both offset directions, pick the one with smaller area (= inset)
             raw_amp = rg.AreaMassProperties.Compute(raw_outside)
             raw_area = raw_amp.Area if raw_amp else float("inf")
             outside_crv = raw_outside  # fallback
@@ -2464,6 +2585,11 @@ def unfold_to_2d():
     dbg("  outside boundary: {}, {} holes".format(
         "found" if outside_crv else "MISSING", len(inside_holes)))
 
+    # process bend lines: convert raw lines to diamonds + 3" dashes
+    processed_bend = _process_bend_lines(nas_edge_bends, raw_outside, tol)
+    dbg("  processed bend lines: {} curves (from {} raw)".format(
+        len(processed_bend), len(unrolled_bend)))
+
     placed_bboxes = []
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
@@ -2476,11 +2602,12 @@ def unfold_to_2d():
 
         guids, bbox = _place_bend_label(text_content, main_crv, pn, outside_crv,
                                         inside_holes, flat_plane, label_ds, mecsoft,
-                                        mark_attr, placed_bboxes)
+                                        mark_attr, placed_bboxes,
+                                        dash_inner_pts=entry.get("dash_inner_pts"))
         dbg("    label '{}': {} curves placed".format(text_content, len(guids)))
 
-    # step 13: output cuts + bend/ink curves to sublayers
-    count = add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
+    # step 13: output cuts + processed bend/ink curves to sublayers
+    count = add_output(outside_curves, inside_curves, processed_bend, unrolled_ink,
                        [], sublayers)
     dbg("  {} curves added to sublayers".format(count))
 
