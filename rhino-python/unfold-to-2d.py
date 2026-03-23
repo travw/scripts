@@ -1325,9 +1325,39 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         print("  warning: BFS reached {} of {} faces".format(
             len(transforms), n_faces))
 
-    # --- transform face breps to flat ---
+    # --- compute flat axes for non-BFS-traversed bends ---
+    for entry in nas_edge_bends:
+        if "flat_p1" not in entry:
+            fa, fb = entry["fa"], entry["fb"]
+            xf = transforms.get(fa) or transforms.get(fb)
+            if xf:
+                cp1 = rg.Point3d(entry["axis"].From)
+                cp2 = rg.Point3d(entry["axis"].To)
+                cp1.Transform(xf)
+                cp2.Transform(xf)
+                entry["flat_p1"] = cp1
+                entry["flat_p2"] = cp2
+
+    # --- build face-to-bends adjacency for trim computation ---
+    face_bends = {}  # fi -> list of (bend_entry, axis_dir, perp, face_side)
+    half_deduction = thickness * 0.375
+    for entry in nas_edge_bends:
+        fp1 = entry.get("flat_p1")
+        fp2 = entry.get("flat_p2")
+        if fp1 is None or fp2 is None:
+            continue
+        axis_dir = rg.Vector3d(fp2 - fp1)
+        axis_dir.Unitize()
+        perp = rg.Vector3d.CrossProduct(flat_normal, axis_dir)
+        perp.Unitize()
+        entry["_pre_shift_p1"] = rg.Point3d(fp1)
+        entry["_pre_shift_p2"] = rg.Point3d(fp2)
+        entry["_axis_dir"] = axis_dir
+        entry["_perp"] = perp
+
+    # --- transform face breps to flat, trim at deduction boundaries, then shift ---
     flat_faces = []
-    flat_face_breps = {}  # NAS face index -> transformed Brep (for shared-edge extraction)
+    flat_face_breps = {}
     fn = flat_normal
     print("  target normal: ({:.4f},{:.4f},{:.4f})".format(fn.X, fn.Y, fn.Z))
     for fi in range(n_faces):
@@ -1337,6 +1367,51 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         dot = rg.Vector3d.Multiply(result_n, flat_normal)
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
+
+        # trim at each adjacent bend's deduction boundary (before shifting)
+        # compute centroid ONCE before any trimming (sequential trims change the brep)
+        orig_amp = rg.AreaMassProperties.Compute(face_brep)
+        orig_centroid = orig_amp.Centroid if orig_amp else None
+        for entry in nas_edge_bends:
+            if fi != entry["fa"] and fi != entry["fb"]:
+                continue
+            fp1 = entry.get("_pre_shift_p1")
+            axis_dir = entry.get("_axis_dir")
+            perp = entry.get("_perp")
+            if fp1 is None or perp is None or axis_dir is None or orig_centroid is None:
+                continue
+            # side test using ORIGINAL centroid (stable across sequential trims)
+            to_face = rg.Vector3d(orig_centroid - fp1)
+            side = 1.0 if rg.Vector3d.Multiply(to_face, perp) > 0 else -1.0
+            offset_pt = fp1 + perp * side * half_deduction
+            # create splitting surface: large line along axis, extruded through flat plane
+            split_line = rg.LineCurve(
+                offset_pt - axis_dir * 500,
+                offset_pt + axis_dir * 500)
+            extrude_dir = flat_normal * 10
+            split_srf = rg.Surface.CreateExtrusion(split_line, extrude_dir)
+            if split_srf is None:
+                continue
+            splitter = split_srf.ToBrep()
+            if splitter is None:
+                continue
+            pieces = face_brep.Split(splitter, tol)
+            if pieces is not None and len(pieces) > 0:
+                # keep the piece whose centroid is on the face's side (away from axis)
+                best = None
+                best_dot = -float("inf")
+                for p in pieces:
+                    pa = rg.AreaMassProperties.Compute(p)
+                    if pa is None:
+                        continue
+                    to_piece = rg.Vector3d(pa.Centroid - fp1)
+                    piece_side = rg.Vector3d.Multiply(to_piece, perp) * side
+                    if piece_side > best_dot:
+                        best_dot = piece_side
+                        best = p
+                if best is not None:
+                    face_brep = best
+
         # apply bend deduction shift
         if fi in face_shifts:
             shift = face_shifts[fi]
@@ -1350,26 +1425,32 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             fi, result_n.X, result_n.Y, result_n.Z, dot,
             amp.Area if amp else 0, seed_tag))
 
-    # --- compute flat axes for non-BFS-traversed bends + apply deduction shifts ---
+    # --- apply deduction shifts to bend axis endpoints ---
+    # the bend line goes where the two trimmed faces meet:
+    #   axis + S_current + perp * sign_toward_current * half_deduction
     for entry in nas_edge_bends:
-        if "flat_p1" not in entry:
-            fa, fb = entry["fa"], entry["fb"]
-            xf = transforms.get(fa) or transforms.get(fb)
-            if xf:
-                cp1 = rg.Point3d(entry["axis"].From)
-                cp2 = rg.Point3d(entry["axis"].To)
-                cp1.Transform(xf)
-                cp2.Transform(xf)
-                entry["flat_p1"] = cp1
-                entry["flat_p2"] = cp2
-        # apply bend deduction shift to axis endpoints
-        # bend line shifts with the "current" face (the one closer to seed in BFS)
         fa, fb = entry["fa"], entry["fb"]
         shift_a = face_shifts.get(fa, rg.Vector3d(0, 0, 0))
         shift_b = face_shifts.get(fb, rg.Vector3d(0, 0, 0))
-        # use the smaller shift (closer to seed = parent in BFS tree)
-        bend_shift = shift_a if shift_a.Length <= shift_b.Length else shift_b
-        if bend_shift.Length > 0.0001 and "flat_p1" in entry:
+        # current face = closer to seed = smaller shift
+        if shift_a.Length <= shift_b.Length:
+            bend_shift = rg.Vector3d(shift_a)
+            current_fi = fa
+        else:
+            bend_shift = rg.Vector3d(shift_b)
+            current_fi = fb
+        # add half_deduction correction toward the current face
+        perp = entry.get("_perp")
+        fp1_pre = entry.get("_pre_shift_p1")
+        if perp is not None and fp1_pre is not None and current_fi in face_planes:
+            # which side is current face on? use original NAS face centroid (pre-transform)
+            # transformed to flat space
+            cur_plane_centroid = rg.Point3d(face_planes[current_fi].Origin)
+            cur_plane_centroid.Transform(transforms[current_fi])
+            to_cur = rg.Vector3d(cur_plane_centroid - fp1_pre)
+            sign_c = 1.0 if rg.Vector3d.Multiply(to_cur, perp) > 0 else -1.0
+            bend_shift += perp * sign_c * half_deduction
+        if "flat_p1" in entry:
             entry["flat_p1"] += bend_shift
             entry["flat_p2"] += bend_shift
 
