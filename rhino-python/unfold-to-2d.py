@@ -1880,69 +1880,10 @@ def ensure_sublayers():
 
 
 
-def compute_alignment_xform(neutral_axis, unrolled_breps, brep, picked_face_index):
-    """compute PlaneToPlane transform from flat pattern space to 3D NAS space.
-    returns Transform or None if alignment cannot be computed."""
-    if not unrolled_breps or len(unrolled_breps) == 0 or brep is None:
-        return None
-
-    dbg("=== alignment ===")
-    # find NA face closest to picked face
-    picked_centroid, _ = get_face_outward_normal(brep, picked_face_index)
-    best_na_idx = 0
-    best_na_dist = float("inf")
-    if picked_centroid is not None:
-        for nfi in range(neutral_axis.Faces.Count):
-            nf_brep = neutral_axis.Faces[nfi].DuplicateFace(False)
-            nf_amp = rg.AreaMassProperties.Compute(nf_brep)
-            if nf_amp is not None:
-                d = picked_centroid.DistanceTo(nf_amp.Centroid)
-                if d < best_na_dist:
-                    best_na_dist = d
-                    best_na_idx = nfi
-
-    # source: find flat face matching NA face by area
-    na_face = neutral_axis.Faces[best_na_idx]
-    na_brep = na_face.DuplicateFace(False)
-    amp_na = rg.AreaMassProperties.Compute(na_brep)
-    na_area = amp_na.Area if amp_na else 0
-
-    best_uf_face = None
-    best_area_diff = float("inf")
-    amp_uf = None
-    flat = unrolled_breps[0]
-    for fi in range(flat.Faces.Count):
-        uf = flat.Faces[fi]
-        uf_b = uf.DuplicateFace(False)
-        uf_amp = rg.AreaMassProperties.Compute(uf_b)
-        if uf_amp:
-            diff = abs(uf_amp.Area - na_area)
-            if diff < best_area_diff:
-                best_area_diff = diff
-                best_uf_face = uf
-                amp_uf = uf_amp
-
-    if amp_uf and amp_na and best_uf_face is not None:
-        uf_centroid = amp_uf.Centroid
-        na_centroid = amp_na.Centroid
-        plane_tol = max(sc.doc.ModelAbsoluteTolerance * 100, 0.1)
-        rc_uf_plane, uf_plane = best_uf_face.TryGetPlane(plane_tol)
-        rc_na_plane, na_plane = na_face.TryGetPlane(plane_tol)
-        if rc_uf_plane and rc_na_plane:
-            uf_plane.Origin = uf_centroid
-            na_plane.Origin = na_centroid
-            xform = rg.Transform.PlaneToPlane(uf_plane, na_plane)
-            dbg("  picked face {} → NA face {} (dist={:.4f}\") → PlaneToPlane".format(
-                picked_face_index, best_na_idx, best_na_dist))
-            return xform
-
-    return None
-
 
 def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
-               text_curves, sublayers, align_xform=None):
-    """add 2D curves to fabrication sublayers with optional alignment transform.
-    align_xform maps flat pattern space → 3D NAS space."""
+               text_curves, sublayers):
+    """add 2D curves to fabrication sublayers. all geometry is in flat space."""
     count = 0
     outside_idx = sc.doc.Layers.FindByFullPath(sublayers["outside"], -1)
     inside_idx = sc.doc.Layers.FindByFullPath(sublayers["inside"], -1)
@@ -1962,12 +1903,7 @@ def add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
     def _add(crv, attr):
         guid = sc.doc.Objects.AddCurve(crv, attr)
         if guid != System.Guid.Empty:
-            if align_xform is not None:
-                # Transform returns new guid (deletes old)
-                new_guid = sc.doc.Objects.Transform(guid, align_xform, True)
-                guids.append(new_guid)
-            else:
-                guids.append(guid)
+            guids.append(guid)
             return 1
         return 0
 
@@ -2012,6 +1948,34 @@ def unfold_to_2d():
     dbg("=== unfold-to-2d ===")
     dbg("  part: {} [layer: {}]".format(obj_name, obj_layer))
     dbg("  {} faces total, picked face: index {}".format(brep.Faces.Count, face_index))
+
+    # early validation: catch bad input before heavy computation
+    if brep.Faces.Count < 4:
+        dbg("error: part has only {} faces -- need at least 4 for sheet metal unfolding".format(
+            brep.Faces.Count))
+        return
+
+    tol = sc.doc.ModelAbsoluteTolerance
+    plane_check_tol = max(tol * 10, 0.01)
+    planar_count = 0
+    picked_is_planar = False
+    for fi in range(brep.Faces.Count):
+        ok, _ = brep.Faces[fi].TryGetPlane(plane_check_tol)
+        if ok:
+            planar_count += 1
+            if fi == face_index:
+                picked_is_planar = True
+
+    if not picked_is_planar:
+        dbg("error: picked face is not planar -- pick a flat sheet face, not a curved or edge face")
+        return
+
+    if planar_count < 2:
+        dbg("error: only {} of {} faces are planar -- this script requires planar sheet metal faces".format(
+            planar_count, brep.Faces.Count))
+        return
+
+    dbg("  validation: {}/{} faces planar, picked face OK".format(planar_count, brep.Faces.Count))
 
     picked_centroid, picked_normal = get_face_outward_normal(brep, face_index)
     if picked_normal is None:
@@ -2145,7 +2109,6 @@ def unfold_to_2d():
     if unroll_result is None:
         return
     flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal, nas_edge_bends, transforms, face_shifts = unroll_result
-    unrolled_breps = [flat_brep]
     dbg("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
@@ -2169,38 +2132,19 @@ def unfold_to_2d():
         dbg("  bend: {:.1f} {} (NAS faces {}↔{})".format(
             entry["angle"], entry["direction"], entry["fa"], entry["fb"]))
 
-    # step 11: compute alignment transform (flat pattern → 3D NAS space)
-    align_xform = compute_alignment_xform(neutral_axis, unrolled_breps,
-                                           brep, face_index)
-
-    # step 12: add curves to sublayers
+    # step 11: add curves to sublayers (all output is in flat space)
     sublayers = ensure_sublayers()
-    # bend lines go directly to Mark layer WITHOUT align_xform —
-    # they're already in the correct flat space (same as baked faces on 03 - Bake)
+
+    # step 12: bend angle labels — derive orientation from baked merged_brep plane
+    # (all previous approaches using flat_normal / picked_normal cross products failed)
     mark_idx = sc.doc.Layers.FindByFullPath(sublayers["mark"], -1)
     mark_attr = Rhino.DocObjects.ObjectAttributes()
     mark_attr.LayerIndex = mark_idx
-    bend_guids = []
-    for crv in unrolled_bend:
-        guid = sc.doc.Objects.AddCurve(crv, mark_attr)
-        if guid != System.Guid.Empty:
-            bend_guids.append(guid)
-    for crv in unrolled_ink:
-        guid = sc.doc.Objects.AddCurve(crv, mark_attr)
-        if guid != System.Guid.Empty:
-            bend_guids.append(guid)
-    dbg("  {} bend/ink curves added to Mark layer (no align_xform)".format(len(bend_guids)))
-
-    # step 13: bend angle labels — derive orientation from baked merged_brep plane
-    # (all previous approaches using flat_normal / picked_normal cross products failed)
     label_ds = sc.doc.DimStyles.Current.Duplicate()
     label_ds.TextHeight = BEND_LABEL_HEIGHT
     mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
     if mecsoft is not None:
         label_ds.Font = mecsoft
-    # get the ACTUAL plane of the baked flat pattern
-    tol_label = sc.doc.ModelAbsoluteTolerance
-    bake_source = flat_brep  # flat_brep = merged_brep returned from unroll_by_rotation
     # build label text on World XY (known orientation: readable from +Z,
     # flows along +X, ascenders along +Y), then PlaneToPlane transform
     # to target location. bypasses Rhino TextEntity rendering inconsistency
@@ -2279,10 +2223,10 @@ def unfold_to_2d():
         else:
             dbg("    warning: CreateCurves returned no curves for '{}'".format(text_content))
 
-    # step 14: outside/inside cuts — output in flat space (no align_xform)
-    # align_xform adds slight error, same issue that broke bend line placement
-    count = add_output(outside_curves, inside_curves, [], [],
-                       [], sublayers, align_xform=None)
+    # step 13: output cuts + bend/ink curves to sublayers
+    count = add_output(outside_curves, inside_curves, unrolled_bend, unrolled_ink,
+                       [], sublayers)
+    dbg("  {} curves added to sublayers".format(count))
 
     sc.doc.Views.Redraw()
     flush_debug_log()

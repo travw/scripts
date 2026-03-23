@@ -160,11 +160,12 @@ key geometric concepts:
 - joined polysurface face normals are NOT consistently oriented.
   use `abs(dot)` when computing angles between faces in a joined brep.
 - unfold-to-2d coordinate spaces: the BFS unroll produces geometry in the
-  seed face's plane (flat space). the baked flat faces on 03 - Bake are in
-  this space. `align_xform` (PlaneToPlane) maps flat space → 3D NAS space
-  for the 11 - 2D geo output. bend lines and ink curves should be output
-  directly in flat space (same as bake), NOT through align_xform.
-  align_xform was the source of persistent bend line placement bugs.
+  seed face's plane (flat space). ALL output (outside/inside cuts, bend lines,
+  ink curves, labels) goes directly to sublayers in flat space. do NOT add a
+  flat-to-3D alignment transform -- a previous `align_xform` (PlaneToPlane to
+  3D NAS space) introduced sub-tolerance errors that compounded into visible
+  bend line misplacement and was removed. if a future feature needs 3D-
+  positioned output, recompute the transform fresh from the geometry.
 - `TextEntity.CreateCurves` text-facing direction is NOT consistent relative
   to the text plane Normal. for some plane orientations text reads from
   +Normal side, for others from -Normal side. workaround: create text on
