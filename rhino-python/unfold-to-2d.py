@@ -1915,7 +1915,7 @@ def _make_diamond(tip, along, perp):
     return rg.PolylineCurve([rg.Point3d(p) for p in pts])
 
 
-def _process_bend_lines(nas_edge_bends, outside_crv, tol):
+def _process_bend_lines(nas_edge_bends, outside_crv, pn, tol):
     """convert raw bend lines to diamonds + 3-inch dashes at outside-cut ends.
     returns (all_processed_curves, per-entry dash_inner_pts for label placement).
     stores entry["dash_inner_pts"] = list of inner endpoints of the 3" dashes."""
@@ -1958,7 +1958,7 @@ def _process_bend_lines(nas_edge_bends, outside_crv, tol):
                     along_in = along if crv.TangentAt(mid_t).X * along.X + crv.TangentAt(mid_t).Y * along.Y + crv.TangentAt(mid_t).Z * along.Z > 0 else -along
                 else:
                     along_in = -along if crv.TangentAt(mid_t).X * along.X + crv.TangentAt(mid_t).Y * along.Y + crv.TangentAt(mid_t).Z * along.Z > 0 else along
-                perp = rg.Vector3d.CrossProduct(along_in, rg.Vector3d(0, 0, 1))
+                perp = rg.Vector3d.CrossProduct(along_in, pn)
                 if perp.Length < 1e-6:
                     perp = rg.Vector3d.CrossProduct(along_in, rg.Vector3d(0, 1, 0))
                 perp.Unitize()
@@ -1979,8 +1979,8 @@ def _process_bend_lines(nas_edge_bends, outside_crv, tol):
             along_from_start = rg.Vector3d(tangent)  # points from start toward end
             along_from_end = -along_from_start  # points from end toward start
 
-            # perpendicular (in the flat plane, cross with flat_normal approximated as Z)
-            perp = rg.Vector3d.CrossProduct(along_from_start, rg.Vector3d(0, 0, 1))
+            # perpendicular in the flat plane
+            perp = rg.Vector3d.CrossProduct(along_from_start, pn)
             if perp.Length < 1e-6:
                 perp = rg.Vector3d.CrossProduct(along_from_start, rg.Vector3d(0, 1, 0))
             perp.Unitize()
@@ -2109,6 +2109,29 @@ def _get_label_bbox(curves):
     return bbox
 
 
+def _measure_text_width(text_content, text_height, label_ds, mecsoft):
+    """measure the width of text at a given height by creating it at origin.
+    returns the bbox width, or an estimate if creation fails."""
+    xy = rg.Plane.WorldXY
+    ds = label_ds.Duplicate()
+    ds.TextHeight = text_height
+    if mecsoft is not None:
+        ds.Font = mecsoft
+    te = rg.TextEntity.Create(text_content, xy, ds, False, 0, 0)
+    if te is None:
+        return text_height * len(text_content) * 0.6  # rough estimate
+    te.TextHeight = text_height
+    if mecsoft is not None:
+        te.Font = mecsoft
+    curves = te.CreateCurves(ds, False)
+    if not curves or len(curves) == 0:
+        return text_height * len(text_content) * 0.6
+    bbox = rg.BoundingBox.Empty
+    for crv in curves:
+        bbox.Union(crv.GetBoundingBox(True))
+    return bbox.Max.X - bbox.Min.X if bbox.IsValid else text_height * len(text_content) * 0.6
+
+
 def _try_label_at(text_content, text_height, mid_pt, tang_proj, target_y,
                   pn, side_sign, gap, slide_offset, outside_crv, inside_crvs,
                   flat_plane, label_ds, mecsoft, placed_bboxes, tol):
@@ -2176,17 +2199,16 @@ def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
     # the slide_offset positions the label along the bend line
     if dash_inner_pts and len(dash_inner_pts) > 0:
         for height in [BEND_LABEL_HEIGHT, 0.75, 0.5, BEND_LABEL_MIN_HEIGHT]:
+            text_w = _measure_text_width(text_content, height, label_ds, mecsoft)
+            half_w = text_w / 2.0
             for dip in dash_inner_pts:
-                # vector from midpoint to dash inner point
+                # vector from midpoint to dash inner point along bend line
                 to_dip = rg.Vector3d(dip - mid_pt)
                 along_dist = rg.Vector3d.Multiply(to_dip, tang_proj)
-                # try label on the inward side of the dash (away from the outside cut)
-                # bbox edge at dip + gap along tang_proj direction
+                # position bbox edge at gap from dash inner point:
+                # label center = dash_inner + sign * (gap + half_text_width)
                 for sign in [1.0, -1.0]:
-                    # the label center will be offset from dip by gap + half the text width
-                    # we don't know the text width yet, so use slide_offset from mid_pt
-                    # to position the label such that its nearest edge is gap from dip
-                    slide = along_dist + sign * BEND_LABEL_GAP
+                    slide = along_dist + sign * (BEND_LABEL_GAP + half_w)
                     curves, bbox = _try_label_at(
                         text_content, height, mid_pt, tang_proj, target_y,
                         pn, 0, 0, slide, outside_crv, inside_crvs,
@@ -2586,7 +2608,7 @@ def unfold_to_2d():
         "found" if outside_crv else "MISSING", len(inside_holes)))
 
     # process bend lines: convert raw lines to diamonds + 3" dashes
-    processed_bend = _process_bend_lines(nas_edge_bends, raw_outside, tol)
+    processed_bend = _process_bend_lines(nas_edge_bends, raw_outside, pn, tol)
     dbg("  processed bend lines: {} curves (from {} raw)".format(
         len(processed_bend), len(unrolled_bend)))
 
