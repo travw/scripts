@@ -1386,6 +1386,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             fold_z = rg.Vector3d.Multiply(
                 rg.Vector3d(nei_c_unrotated - p1), flat_normal)
             bend_entry["fold_z"] = fold_z
+            bend_entry["chosen_angle"] = chosen_angle
             bend_entry["bfs_from"] = current
             bend_entry["bfs_to"] = neighbor
 
@@ -2347,51 +2348,30 @@ def unfold_to_2d():
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
 
-    # step 10: compute bend directions for press brake
-    # UP = ram pushes up (valley fold from picked face side).
-    # DN = flip part, bend from other side (mountain fold from picked face side).
-    # method: fold_z = perpendicular distance of neighbor centroid from the
-    # flat plane BEFORE the flatten rotation. this directly measures which
-    # side of the flat plane the face was on in 3D. no angle parsing, no
-    # axis normalization, no ordering dependency.
-    # orient NAS face normals outward for accurate angle computation.
-    # the angle calc in unroll_by_rotation uses abs(dot) which can't
-    # distinguish acute (e.g. 70°) from obtuse (110°) bends. with
-    # oriented normals we use the signed dot product instead.
-    tol = sc.doc.ModelAbsoluteTolerance
-    plane_tol = max(tol * 10, 0.01)
-    oriented_normals = {}
-    for fi in range(neutral_axis.Faces.Count):
-        ok, fplane = neutral_axis.Faces[fi].TryGetPlane(plane_tol)
-        if not ok:
-            continue
-        face_brep = neutral_axis.Faces[fi].DuplicateFace(False)
-        famp = rg.AreaMassProperties.Compute(face_brep)
-        if famp is None:
-            continue
-        n = rg.Vector3d(fplane.Normal)
-        n.Unitize()
-        test_pt = famp.Centroid + n * thickness
-        is_inside = brep.IsPointInside(test_pt, tol, False)
-        if is_inside:
-            n = -n  # test pt inside brep → n pointed inward → flip to outward
-        dbg("    orient face {}: inside={} → n=({:.4f},{:.4f},{:.4f})".format(
-            fi, is_inside, n.X, n.Y, n.Z))
-        oriented_normals[fi] = n
-
-    # recompute bend angles with signed dot product
+    # step 10: compute bend angles and directions for press brake
+    # bend angle: derived from BFS chosen_angle, which is the exact rotation
+    # needed to flatten each face. bend_angle = 180 - abs(normalized_angle).
+    # this avoids the abs(dot) ambiguity that can't distinguish acute from obtuse.
     for entry in nas_edge_bends:
-        fa_idx, fb_idx = entry["fa"], entry["fb"]
-        if fa_idx in oriented_normals and fb_idx in oriented_normals:
-            dot_signed = rg.Vector3d.Multiply(
-                oriented_normals[fa_idx], oriented_normals[fb_idx])
-            dot_signed = max(-1.0, min(1.0, dot_signed))
-            corrected = round(180.0 - math.degrees(math.acos(dot_signed)), 1)
-            if abs(corrected - entry["angle"]) > 1.0:
-                dbg("    angle correction: {}↔{} {:.1f}° → {:.1f}°".format(
-                    fa_idx, fb_idx, entry["angle"], corrected))
+        ca = entry.get("chosen_angle", None)
+        if ca is not None:
+            angle_deg = math.degrees(ca)
+            # normalize to [-180, 180]
+            while angle_deg > 180:
+                angle_deg -= 360
+            while angle_deg <= -180:
+                angle_deg += 360
+            corrected = round(180.0 - abs(angle_deg), 1)
+            if abs(corrected - entry["angle"]) > 0.5:
+                dbg("    angle from BFS: {}↔{} {:.1f}° → {:.1f}°".format(
+                    entry["fa"], entry["fb"], entry["angle"], corrected))
             entry["angle"] = corrected
 
+    # bend direction: fold_z = perpendicular distance of neighbor centroid
+    # from flat plane BEFORE flatten rotation. directly measures which side
+    # of the flat plane the face was on in 3D.
+    # UP = ram pushes up (valley fold from picked face side).
+    # DN = flip part, bend from other side (mountain fold from picked face side).
     flat_picked_dot = rg.Vector3d.Multiply(flat_normal, picked_normal)
     for entry in nas_edge_bends:
         fold_z = entry.get("fold_z", None)
