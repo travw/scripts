@@ -2741,7 +2741,7 @@ def unfold_to_2d():
 
                 # show originals again
                 for guid in all_output_guids:
-                    sc.doc.Objects.Show(guid)
+                    sc.doc.Objects.Show(guid, True)
 
                 if result == Rhino.Input.GetResult.Point:
                     user_pt = gp.Point()
