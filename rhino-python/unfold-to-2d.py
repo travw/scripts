@@ -2728,17 +2728,18 @@ def unfold_to_2d():
                 bbox_center2 = rg.Point3d(
                     (bbox2.Min.X + bbox2.Max.X) / 2,
                     (bbox2.Min.Y + bbox2.Max.Y) / 2, 0)
-                # collect geometry for dynamic preview
+                # collect geometry for dynamic preview (curves + brep wireframes)
                 preview_crvs = []
+                preview_breps = []
                 for guid in all_output_guids:
                     obj = sc.doc.Objects.FindId(guid)
-                    if obj is not None and hasattr(obj.Geometry, 'DuplicateCurve'):
-                        preview_crvs.append(obj.Geometry.DuplicateCurve())
-                    elif obj is not None:
-                        # polylinecurve or other curve types
-                        geo = obj.Geometry
-                        if isinstance(geo, rg.Curve):
-                            preview_crvs.append(geo.DuplicateCurve())
+                    if obj is None:
+                        continue
+                    geo = obj.Geometry
+                    if isinstance(geo, rg.Curve):
+                        preview_crvs.append(geo.DuplicateCurve())
+                    elif isinstance(geo, rg.Brep):
+                        preview_breps.append(geo.DuplicateBrep())
                 # hide originals during placement
                 for guid in all_output_guids:
                     sc.doc.Objects.Hide(guid, True)
@@ -2748,6 +2749,7 @@ def unfold_to_2d():
                 gp = Rhino.Input.Custom.GetPoint()
                 gp.SetCommandPrompt("Place flat pattern (bbox center)")
                 preview_color = System.Drawing.Color.FromArgb(0, 127, 0)
+                brep_color = System.Drawing.Color.FromArgb(150, 150, 150)
 
                 def _draw_preview(sender, args):
                     pt = args.CurrentPoint
@@ -2756,6 +2758,10 @@ def unfold_to_2d():
                         moved = crv.DuplicateCurve()
                         moved.Transform(move)
                         args.Display.DrawCurve(moved, preview_color, 1)
+                    for brp in preview_breps:
+                        moved_b = brp.DuplicateBrep()
+                        moved_b.Transform(move)
+                        args.Display.DrawBrepWires(moved_b, brep_color, 1)
 
                 gp.DynamicDraw += _draw_preview
                 result = gp.Get()
