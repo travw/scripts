@@ -1939,18 +1939,66 @@ def _make_label_curves(text_content, text_height, xy_plane, target_plane,
     return list(curves)
 
 
-def _build_target_plane(mid_pt, tang_proj, target_y, offset_dir, gap):
-    """build a text placement plane offset from mid_pt in offset_dir."""
-    text_origin = mid_pt + offset_dir * gap
-    return rg.Plane(text_origin, tang_proj, target_y)
+def _build_target_plane(mid_pt, tang_proj, target_y, side_sign, gap):
+    """build a text placement plane offset from mid_pt.
+    side_sign: +1 = text above bend line (in +target_y direction),
+               -1 = text below bend line (in -target_y direction).
+    gap is measured from bend line to nearest text edge."""
+    if side_sign >= 0:
+        # text grows in +target_y, origin is at bottom edge
+        text_origin = mid_pt + target_y * gap
+        return rg.Plane(text_origin, tang_proj, target_y)
+    else:
+        # text below: flip Y so text grows away from bend line
+        # origin at top edge (closest to bend), offset downward by gap
+        text_origin = mid_pt - target_y * gap
+        return rg.Plane(text_origin, tang_proj, -target_y)
+
+
+def _get_label_bbox(curves):
+    """compute bounding box of label curves."""
+    bbox = rg.BoundingBox.Empty
+    for crv in curves:
+        bbox.Union(crv.GetBoundingBox(True))
+    return bbox
+
+
+def _try_label_at(text_content, text_height, mid_pt, tang_proj, target_y,
+                  side_sign, gap, slide_offset, outside_crv, inside_crvs,
+                  flat_plane, label_ds, mecsoft, placed_bboxes, tol):
+    """try placing a label at a specific position. returns (curves, bbox) or (None, None).
+    slide_offset shifts the label along tang_proj (for collision avoidance)."""
+    xy_plane = rg.Plane.WorldXY
+    shifted_mid = mid_pt + tang_proj * slide_offset
+    plane = _build_target_plane(shifted_mid, tang_proj, target_y, side_sign, gap)
+    curves = _make_label_curves(text_content, text_height, xy_plane, plane,
+                                label_ds, mecsoft)
+    if not curves:
+        return None, None
+    bbox = _get_label_bbox(curves)
+    if not bbox.IsValid:
+        return None, None
+    # check containment on solid material
+    if not _label_fits(curves, outside_crv, inside_crvs, flat_plane, tol):
+        return None, None
+    # check collision with already-placed labels
+    if placed_bboxes:
+        expanded = rg.BoundingBox(
+            rg.Point3d(bbox.Min.X - BEND_LABEL_GAP, bbox.Min.Y - BEND_LABEL_GAP, bbox.Min.Z),
+            rg.Point3d(bbox.Max.X + BEND_LABEL_GAP, bbox.Max.Y + BEND_LABEL_GAP, bbox.Max.Z))
+        for other in placed_bboxes:
+            # axis-aligned overlap test
+            if (expanded.Min.X < other.Max.X and expanded.Max.X > other.Min.X and
+                    expanded.Min.Y < other.Max.Y and expanded.Max.Y > other.Min.Y):
+                return None, None
+    return curves, bbox
 
 
 def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
-                      flat_plane, label_ds, mecsoft, mark_attr):
+                      flat_plane, label_ds, mecsoft, mark_attr, placed_bboxes):
     """place bend label on solid material with fallback chain.
-    returns list of added guids, or [] if placement fails entirely."""
+    returns (guids, bbox) or ([], None). appends bbox to placed_bboxes on success."""
     tol = sc.doc.ModelAbsoluteTolerance
-    xy_plane = rg.Plane.WorldXY
 
     mid_pt = main_crv.PointAt(main_crv.Domain.Mid)
 
@@ -1982,36 +2030,47 @@ def _place_bend_label(text_content, main_crv, pn, outside_crv, inside_crvs,
     target_y_rot = rg.Vector3d(-tang_proj)
 
     # try placement strategies in order
+    # each: (height, tang_proj, target_y, side_sign)
     strategies = []
     for height in [BEND_LABEL_HEIGHT, 0.75, 0.5, BEND_LABEL_MIN_HEIGHT]:
-        # normal orientation: side A, side B
-        strategies.append((height, tang_proj, target_y, target_y, False))
-        strategies.append((height, tang_proj, target_y, -target_y, False))
-        # rotated 90: side A, side B
+        strategies.append((height, tang_proj, target_y, +1))
+        strategies.append((height, tang_proj, target_y, -1))
         if height == BEND_LABEL_HEIGHT:
-            strategies.append((height, tang_proj_rot, target_y_rot, target_y, False))
-            strategies.append((height, tang_proj_rot, target_y_rot, -target_y, False))
+            strategies.append((height, tang_proj_rot, target_y_rot, +1))
+            strategies.append((height, tang_proj_rot, target_y_rot, -1))
 
-    for height, tp, ty, offset_dir, is_fallback in strategies:
-        plane = _build_target_plane(mid_pt, tp, ty, offset_dir, BEND_LABEL_GAP)
-        curves = _make_label_curves(text_content, height, xy_plane, plane,
-                                    label_ds, mecsoft)
-        if not curves:
-            continue
-        if _label_fits(curves, outside_crv, inside_crvs, flat_plane, tol):
-            return _add_label_curves(curves, mark_attr)
+    # for each strategy, try centered first, then slide along bend line
+    bend_len = main_crv.GetLength()
+    slide_offsets = [0.0]
+    for s in [0.25, 0.5]:
+        d = bend_len * s
+        slide_offsets.extend([d, -d])
+
+    for height, tp, ty, side_sign in strategies:
+        for slide in slide_offsets:
+            curves, bbox = _try_label_at(
+                text_content, height, mid_pt, tp, ty, side_sign,
+                BEND_LABEL_GAP, slide, outside_crv, inside_crvs,
+                flat_plane, label_ds, mecsoft, placed_bboxes, tol)
+            if curves is not None:
+                guids = _add_label_curves(curves, mark_attr)
+                placed_bboxes.append(bbox)
+                return guids, bbox
 
     # fallback: place at default position with "?" appended
     dbg("    warning: '{}' could not fit on solid material, marking suspect".format(
         text_content))
     suspect_text = text_content + "?"
-    plane = _build_target_plane(mid_pt, tang_proj, target_y, target_y,
-                                BEND_LABEL_GAP)
+    xy_plane = rg.Plane.WorldXY
+    plane = _build_target_plane(mid_pt, tang_proj, target_y, +1, BEND_LABEL_GAP)
     curves = _make_label_curves(suspect_text, BEND_LABEL_HEIGHT, xy_plane, plane,
                                 label_ds, mecsoft)
     if curves:
-        return _add_label_curves(curves, mark_attr)
-    return []
+        guids = _add_label_curves(curves, mark_attr)
+        bbox = _get_label_bbox(curves)
+        placed_bboxes.append(bbox)
+        return guids, bbox
+    return [], None
 
 
 def _add_label_curves(curves, mark_attr):
@@ -2298,12 +2357,41 @@ def unfold_to_2d():
     if outside_curves:
         joined = rg.Curve.JoinCurves(outside_curves, tol)
         if joined:
-            outside_crv = max(joined, key=lambda c: c.GetLength())
+            raw_outside = max(joined, key=lambda c: c.GetLength())
+            # inset outside boundary by 1/8" so labels have cushion from edge
+            # try both offset directions, pick the one with smaller area (= inset)
+            raw_amp = rg.AreaMassProperties.Compute(raw_outside)
+            raw_area = raw_amp.Area if raw_amp else float("inf")
+            outside_crv = raw_outside  # fallback
+            for sign in [-1, 1]:
+                off = raw_outside.Offset(rg.Plane.WorldXY, sign * BEND_LABEL_GAP,
+                                         tol, rg.CurveOffsetCornerStyle.Sharp)
+                if off and len(off) == 1 and off[0].IsClosed:
+                    off_amp = rg.AreaMassProperties.Compute(off[0])
+                    if off_amp and off_amp.Area < raw_area:
+                        outside_crv = off[0]
+                        break
     inside_holes = []
     if inside_curves:
         joined_inner = rg.Curve.JoinCurves(inside_curves, tol)
         if joined_inner:
-            inside_holes = [c for c in joined_inner if c.IsClosed]
+            for hole in joined_inner:
+                if not hole.IsClosed:
+                    continue
+                # expand holes outward by 1/8" so labels have cushion
+                # try both directions, pick larger area (= expanded)
+                hole_amp = rg.AreaMassProperties.Compute(hole)
+                hole_area = hole_amp.Area if hole_amp else 0
+                best_hole = hole
+                for sign in [-1, 1]:
+                    exp = hole.Offset(rg.Plane.WorldXY, sign * BEND_LABEL_GAP,
+                                      tol, rg.CurveOffsetCornerStyle.Sharp)
+                    if exp and len(exp) == 1 and exp[0].IsClosed:
+                        exp_amp = rg.AreaMassProperties.Compute(exp[0])
+                        if exp_amp and exp_amp.Area > hole_area:
+                            best_hole = exp[0]
+                            break
+                inside_holes.append(best_hole)
 
     # get flat plane for containment (from flat_brep or picked_normal)
     flat_plane = None
@@ -2320,6 +2408,7 @@ def unfold_to_2d():
     dbg("  outside boundary: {}, {} holes".format(
         "found" if outside_crv else "MISSING", len(inside_holes)))
 
+    placed_bboxes = []
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
@@ -2329,9 +2418,9 @@ def unfold_to_2d():
         direction = entry.get("direction", "UP")
         text_content = "{} {}".format(angle_int, direction)
 
-        guids = _place_bend_label(text_content, main_crv, pn, outside_crv,
-                                  inside_holes, flat_plane, label_ds, mecsoft,
-                                  mark_attr)
+        guids, bbox = _place_bend_label(text_content, main_crv, pn, outside_crv,
+                                        inside_holes, flat_plane, label_ds, mecsoft,
+                                        mark_attr, placed_bboxes)
         dbg("    label '{}': {} curves placed".format(text_content, len(guids)))
 
     # step 13: output cuts + bend/ink curves to sublayers
