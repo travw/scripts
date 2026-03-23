@@ -1376,14 +1376,16 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 current, neighbor, shift_vec.X, shift_vec.Y, shift_vec.Z,
                 face_shifts[neighbor].X, face_shifts[neighbor].Y, face_shifts[neighbor].Z))
 
-            # store rotation info for bend direction detection
-            # cur_side sign normalizes the rotation angle: it tells us which
-            # side of the axis the current face centroid is on (relative to
-            # flat_normal via right-hand rule). multiplying chosen_angle by
-            # this sign gives a consistently-signed "normalized angle" that
-            # encodes fold direction regardless of edge tangent orientation.
-            bend_entry["rotation_angle"] = chosen_angle
-            bend_entry["cur_side_sign"] = 1.0 if cur_side >= 0 else -1.0
+            # store fold direction for bend labels:
+            # transform neighbor centroid by current_xform ONLY (not the
+            # flatten rotation). this puts it in the current face's flat
+            # frame but still sticking out of the flat plane. the component
+            # along flat_normal tells us which side it was on.
+            nei_c_unrotated = rg.Point3d(nei_amp.Centroid)
+            nei_c_unrotated.Transform(current_xform)
+            fold_z = rg.Vector3d.Multiply(
+                rg.Vector3d(nei_c_unrotated - p1), flat_normal)
+            bend_entry["fold_z"] = fold_z
             bend_entry["bfs_from"] = current
             bend_entry["bfs_to"] = neighbor
 
@@ -2348,32 +2350,27 @@ def unfold_to_2d():
     # step 10: compute bend directions for press brake
     # UP = ram pushes up (valley fold from picked face side).
     # DN = flip part, bend from other side (mountain fold from picked face side).
-    # method: use BFS rotation angle sign, normalized by cur_side_sign to
-    # remove edge tangent direction ambiguity. the normalized angle encodes
-    # which way the neighbor face was folded relative to the flat pattern.
+    # method: fold_z = perpendicular distance of neighbor centroid from the
+    # flat plane BEFORE the flatten rotation. this directly measures which
+    # side of the flat plane the face was on in 3D. no angle parsing, no
+    # axis normalization, no ordering dependency.
     flat_picked_dot = rg.Vector3d.Multiply(flat_normal, picked_normal)
     for entry in nas_edge_bends:
-        rot = entry.get("rotation_angle", None)
-        css = entry.get("cur_side_sign", None)
-        if rot is None or css is None:
+        fold_z = entry.get("fold_z", None)
+        if fold_z is None:
             entry["direction"] = "UP"
             continue
-        # normalize: multiply angle by cur_side_sign so positive always
-        # means the same physical fold direction regardless of edge tangent
-        normalized = rot * css
-        # flat_picked_dot accounts for flat_normal vs picked_normal alignment
-        # sign convention: positive normalized angle = fold toward -flat_normal
-        # if flat_normal aligns with picked_normal (dot > 0):
-        #   fold toward -flat_normal = fold away from picked face = valley = UP
-        # if flat_normal opposes picked_normal (dot < 0):
-        #   fold toward -flat_normal = fold toward picked face = mountain = DN
-        if flat_picked_dot >= 0:
-            entry["direction"] = "UP" if normalized > 0 else "DN"
-        else:
-            entry["direction"] = "DN" if normalized > 0 else "UP"
-        dbg("    bend {}↔{}: rot={:.1f}° css={:.0f} norm={:.1f}° → {}".format(
-            entry["fa"], entry["fb"], math.degrees(rot), css,
-            math.degrees(normalized), entry["direction"]))
+        # fold_z > 0: neighbor was on +flat_normal side of flat plane
+        # fold_z < 0: neighbor was on -flat_normal side
+        # flat_picked_dot tells us if flat_normal aligns with picked_normal
+        # combine: signed = fold_z * flat_picked_dot
+        # positive signed → neighbor was on picked_normal side → valley = UP
+        # negative signed → neighbor was on opposite side → mountain = DN
+        signed = fold_z * flat_picked_dot
+        entry["direction"] = "UP" if signed > 0 else "DN"
+        dbg("    bend {}↔{}: fold_z={:.4f} fpd={:.4f} signed={:.4f} → {}".format(
+            entry["fa"], entry["fb"], fold_z, flat_picked_dot, signed,
+            entry["direction"]))
     dbg("=== bends ===")
     for entry in nas_edge_bends:
         dbg("  bend: {:.1f} {} (NAS faces {}↔{})".format(
