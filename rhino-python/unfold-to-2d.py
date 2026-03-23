@@ -1376,6 +1376,11 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 current, neighbor, shift_vec.X, shift_vec.Y, shift_vec.Z,
                 face_shifts[neighbor].X, face_shifts[neighbor].Y, face_shifts[neighbor].Z))
 
+            # store rotation info for bend direction detection
+            bend_entry["rotation_angle"] = chosen_angle
+            bend_entry["bfs_from"] = current
+            bend_entry["bfs_to"] = neighbor
+
             visited.add(neighbor)
             queue.append(neighbor)
             bfs_order.append(neighbor)
@@ -2334,20 +2339,56 @@ def unfold_to_2d():
         len(unrolled_bend), len(unrolled_ink),
         len(outside_curves), len(inside_curves)))
 
-    # step 10: compute bend directions from NAS geometry
+    # step 10: compute bend directions for press brake
+    # UP = ram pushes up (valley fold from picked face side).
+    # DN = flip part, bend from other side (mountain fold from picked face side).
+    # method: orient NAS face normals outward using original brep, then use
+    # cross-product of edge tangent x normal_A dotted with normal_B to
+    # determine concavity (valley vs mountain from outside).
+    tol = sc.doc.ModelAbsoluteTolerance
+    plane_tol = max(tol * 10, 0.01)
+
+    # orient NAS face normals outward using original brep
+    oriented_normals = {}
+    for fi in range(neutral_axis.Faces.Count):
+        face_brep = neutral_axis.Faces[fi].DuplicateFace(False)
+        ok, fplane = neutral_axis.Faces[fi].TryGetPlane(plane_tol)
+        if not ok:
+            continue
+        famp = rg.AreaMassProperties.Compute(face_brep)
+        if famp is None:
+            continue
+        n = rg.Vector3d(fplane.Normal)
+        n.Unitize()
+        # test point offset from NAS face centroid in normal direction
+        # NAS is t/2 inside the part. offset by t puts us t/2 outside
+        # if outward, or 3t/2 inside if inward.
+        test_pt = famp.Centroid + n * thickness
+        if brep.IsPointInside(test_pt, tol, False):
+            n = -n  # was pointing inward, flip to outward
+        oriented_normals[fi] = n
+
     for entry in nas_edge_bends:
-        fa_centroid = rg.AreaMassProperties.Compute(
-            neutral_axis.Faces[entry["fa"]].DuplicateFace(False))
-        fb_centroid = rg.AreaMassProperties.Compute(
-            neutral_axis.Faces[entry["fb"]].DuplicateFace(False))
-        if fa_centroid and fb_centroid:
-            mid = entry["edge_crv"].PointAt(entry["edge_crv"].Domain.Mid)
-            inside_vec = rg.Vector3d(fa_centroid.Centroid - mid) + rg.Vector3d(fb_centroid.Centroid - mid)
-            inside_vec.Unitize()
-            dot = rg.Vector3d.Multiply(inside_vec, picked_normal)
-            entry["direction"] = "UP" if dot > 0 else "DN"
-        else:
+        fa_idx, fb_idx = entry["fa"], entry["fb"]
+        if fa_idx not in oriented_normals or fb_idx not in oriented_normals:
             entry["direction"] = "UP"
+            continue
+        n_a = oriented_normals[fa_idx]
+        n_b = oriented_normals[fb_idx]
+        edge_crv = entry["edge_crv"]
+        edge_mid = edge_crv.PointAt(edge_crv.Domain.Mid)
+        edge_tan = edge_crv.TangentAt(edge_crv.Domain.Mid)
+        edge_tan.Unitize()
+        # cross(edge_tangent, outward_normal_A) gives a vector perpendicular
+        # to the edge in the plane of face A, pointing toward the "outside"
+        # of face A at the edge
+        perp = rg.Vector3d.CrossProduct(edge_tan, n_a)
+        # dot with face B's outward normal: if positive, face B opens away
+        # from outside (valley from outside = UP). if negative, mountain = DN.
+        concavity_dot = rg.Vector3d.Multiply(perp, n_b)
+        entry["direction"] = "UP" if concavity_dot > 0 else "DN"
+        dbg("    bend {}↔{}: concavity_dot={:.4f} → {}".format(
+            fa_idx, fb_idx, concavity_dot, entry["direction"]))
     dbg("=== bends ===")
     for entry in nas_edge_bends:
         dbg("  bend: {:.1f} {} (NAS faces {}↔{})".format(
