@@ -1233,6 +1233,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         v.Unitize()
         return v
 
+    # bend deduction: each face accumulates a shift toward the seed
+    deduction = thickness * 0.75  # total strip width per bend (t * 0.375 each side)
+    face_shifts = {seed: rg.Vector3d(0, 0, 0)}
+
     bfs_path = ["face {}".format(seed)]
     queue = [seed]
     while queue:
@@ -1296,6 +1300,21 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 chosen_angle = flatten_angle + math.pi
 
             transforms[neighbor] = best_combined
+
+            # compute bend deduction shift: neighbor moves toward current
+            # recompute nei_c with final transform
+            nei_c2 = rg.Point3d(nei_amp.Centroid)
+            nei_c2.Transform(best_combined)
+            # perpendicular to bend axis in the flat plane
+            perp = rg.Vector3d.CrossProduct(flat_normal, axis_dir)
+            perp.Unitize()
+            # direction from neighbor toward current (closing the gap)
+            to_current = rg.Vector3d(cur_c - nei_c2)
+            # project onto perp to get the sign
+            sign = 1.0 if rg.Vector3d.Multiply(to_current, perp) > 0 else -1.0
+            shift_vec = perp * sign * deduction
+            face_shifts[neighbor] = face_shifts[current] + shift_vec
+
             visited.add(neighbor)
             queue.append(neighbor)
             bfs_path.append("face {} ({:.1f}°)".format(
@@ -1318,6 +1337,11 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
         dot = rg.Vector3d.Multiply(result_n, flat_normal)
         face_brep = nas.Faces[fi].DuplicateFace(False)
         face_brep.Transform(transforms[fi])
+        # apply bend deduction shift
+        if fi in face_shifts:
+            shift = face_shifts[fi]
+            if shift.Length > 0.0001:
+                face_brep.Transform(rg.Transform.Translation(shift))
         flat_faces.append(face_brep)
         flat_face_breps[fi] = face_brep
         amp = rg.AreaMassProperties.Compute(face_brep)
@@ -1326,7 +1350,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             fi, result_n.X, result_n.Y, result_n.Z, dot,
             amp.Area if amp else 0, seed_tag))
 
-    # --- compute flat axes for non-BFS-traversed bends (cycle edges) ---
+    # --- compute flat axes for non-BFS-traversed bends + apply deduction shifts ---
     for entry in nas_edge_bends:
         if "flat_p1" not in entry:
             fa, fb = entry["fa"], entry["fb"]
@@ -1338,6 +1362,16 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 cp2.Transform(xf)
                 entry["flat_p1"] = cp1
                 entry["flat_p2"] = cp2
+        # apply bend deduction shift to axis endpoints
+        # bend line shifts with the "current" face (the one closer to seed in BFS)
+        fa, fb = entry["fa"], entry["fb"]
+        shift_a = face_shifts.get(fa, rg.Vector3d(0, 0, 0))
+        shift_b = face_shifts.get(fb, rg.Vector3d(0, 0, 0))
+        # use the smaller shift (closer to seed = parent in BFS tree)
+        bend_shift = shift_a if shift_a.Length <= shift_b.Length else shift_b
+        if bend_shift.Length > 0.0001 and "flat_p1" in entry:
+            entry["flat_p1"] += bend_shift
+            entry["flat_p2"] += bend_shift
 
     # --- build flat bend lines: extend axes, project onto seed plane, trim by NAS outline ---
     # join flat faces to get the NAS outline for trimming
@@ -1403,6 +1437,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             ink_copy = crv.DuplicateCurve()
             ink_copy.Transform(transforms[best_fi])
             ink_copy.Transform(proj_to_plane)
+            # apply bend deduction shift
+            shift = face_shifts.get(best_fi, rg.Vector3d(0, 0, 0))
+            if shift.Length > 0.0001:
+                ink_copy.Transform(rg.Transform.Translation(shift))
             flat_ink_curves.append(ink_copy)
 
     # --- bake flat faces directly for visual verification ---
@@ -1440,7 +1478,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     if flat_brep is None:
         print("error: no flat geometry produced")
         return None
-    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends, transforms
+    return flat_brep, outside_curves, inside_curves, flat_bend_curves, flat_ink_curves, flat_normal, nas_edge_bends, transforms, face_shifts
 
 
 def determine_bend_directions(bend_infos, picked_normal):
@@ -1768,7 +1806,7 @@ def unfold_to_2d():
     unroll_result = unroll_by_rotation(neutral_axis, ink_curves, thickness, picked_na_face)
     if unroll_result is None:
         return
-    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal, nas_edge_bends, transforms = unroll_result
+    flat_brep, outside_curves, inside_curves, unrolled_bend, unrolled_ink, flat_normal, nas_edge_bends, transforms, face_shifts = unroll_result
     unrolled_breps = [flat_brep]
     print("  {} bend lines, {} ink, cuts: {} outside, {} inside".format(
         len(unrolled_bend), len(unrolled_ink),
