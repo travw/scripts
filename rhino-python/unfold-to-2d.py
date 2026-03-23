@@ -1238,6 +1238,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
     face_shifts = {seed: rg.Vector3d(0, 0, 0)}
 
     bfs_path = ["face {}".format(seed)]
+    bfs_order = [seed]  # face indices in BFS traversal order (for iterative merge)
     queue = [seed]
     while queue:
         current = queue.pop(0)
@@ -1324,6 +1325,7 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
 
             visited.add(neighbor)
             queue.append(neighbor)
+            bfs_order.append(neighbor)
             bfs_path.append("face {} ({:.1f}°)".format(
                 neighbor, math.degrees(chosen_angle)))
 
@@ -1528,10 +1530,10 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
             len(cross_bend_holes), len(shifted_cross_bend_holes)))
 
     # --- merge overlapping faces into single outline, preserving inner loops ---
-    boundary_curves = []  # outer boundaries only
+    boundary_by_fi = {}  # face index -> outer boundary curve
     inner_loop_curves = shifted_cross_bend_holes[:]  # start with cross-bend holes
-    for fb in flat_faces:
-        # extract loops by type: outer vs inner
+    for fi in flat_face_breps:
+        fb = flat_face_breps[fi]
         if fb.Faces.Count > 0:
             face0 = fb.Faces[0]
             for li in range(face0.Loops.Count):
@@ -1540,33 +1542,41 @@ def unroll_by_rotation(neutral_axis_brep, ink_curves, thickness=0.125, picked_na
                 if loop_crv is None:
                     continue
                 if loop.LoopType == rg.BrepLoopType.Outer:
-                    boundary_curves.append(loop_crv)
+                    boundary_by_fi[fi] = loop_crv
                 elif loop.LoopType == rg.BrepLoopType.Inner:
                     inner_loop_curves.append(loop_crv)
         else:
-            # fallback: join edges, keep longest as outer
             edges = [fb.Edges[ei].DuplicateCurve() for ei in range(fb.Edges.Count)]
             joined = rg.Curve.JoinCurves(edges, tol * 10)
             if joined:
-                boundary_curves.append(max(joined, key=lambda c: c.GetLength()))
+                boundary_by_fi[fi] = max(joined, key=lambda c: c.GetLength())
     print("  extracted {} outer boundaries, {} inner loops (holes)".format(
-        len(boundary_curves), len(inner_loop_curves)))
+        len(boundary_by_fi), len(inner_loop_curves)))
 
+    # iterative pairwise union in BFS order — each face overlaps its parent
+    # (much more robust than all-at-once union which fails on narrow overlaps)
     merged_outline = None
-    if len(boundary_curves) > 1:
-        union_result = rg.Curve.CreateBooleanUnion(boundary_curves, tol)
-        if union_result and len(union_result) > 0:
-            merged_outline = max(union_result, key=lambda c: c.GetLength())
-            print("  boundary union: {} input curves -> {} result curves".format(
-                len(boundary_curves), len(union_result)))
-        else:
-            # union failed -- try joining all boundaries as fallback
-            print("  warning: boundary union failed, falling back to join")
-            joined_all = rg.Curve.JoinCurves(boundary_curves, tol * 10)
-            if joined_all:
-                merged_outline = max(joined_all, key=lambda c: c.GetLength())
-    elif len(boundary_curves) == 1:
-        merged_outline = boundary_curves[0]
+    if len(boundary_by_fi) > 0:
+        # start with seed face boundary
+        start_fi = bfs_order[0] if bfs_order[0] in boundary_by_fi else next(iter(boundary_by_fi))
+        merged_outline = boundary_by_fi[start_fi]
+        merge_count = 1
+        for fi in bfs_order[1:]:
+            if fi not in boundary_by_fi:
+                continue
+            merged = False
+            for union_tol in [tol, tol * 10, tol * 100]:
+                result = rg.Curve.CreateBooleanUnion(
+                    [merged_outline, boundary_by_fi[fi]], union_tol)
+                if result and len(result) > 0:
+                    merged_outline = max(result, key=lambda c: c.GetLength())
+                    merge_count += 1
+                    merged = True
+                    break
+            if not merged:
+                print("  warning: pairwise union failed for face {}".format(fi))
+        print("  boundary union: {} of {} faces merged (BFS iterative)".format(
+            merge_count, len(boundary_by_fi)))
 
     # create merged brep: outer boundary + inner loop holes
     merged_brep = None
@@ -2106,7 +2116,15 @@ def unfold_to_2d():
     mecsoft = Rhino.DocObjects.Font.FromQuartetProperties("MecSoft_Font-1", False, False)
     if mecsoft is not None:
         label_ds.Font = mecsoft
-    flip_text = rg.Vector3d.Multiply(flat_normal, picked_normal) < 0
+    # viewer frame: derive entirely from picked_normal (reliable, from solid brep)
+    # no flat_normal, no desired_normal, no seed_plane — those all proved unreliable
+    viewer_dir = -picked_normal
+    viewer_right = rg.Vector3d.CrossProduct(viewer_dir, rg.Vector3d(0, 0, 1))
+    if viewer_right.Length < 0.01:
+        viewer_right = rg.Vector3d.CrossProduct(viewer_dir, rg.Vector3d(0, 1, 0))
+    viewer_right.Unitize()
+    viewer_up = rg.Vector3d.CrossProduct(viewer_right, viewer_dir)
+    viewer_up.Unitize()
     for entry in nas_edge_bends:
         flat_crvs = entry.get("flat_curves", [])
         if not flat_crvs:
@@ -2122,10 +2140,17 @@ def unfold_to_2d():
             continue
         tangent = rg.Vector3d(fp2 - fp1)
         tangent.Unitize()
-        if flip_text:
-            tangent = -tangent
+        # normalize tangent to readable direction from viewer's perspective
+        dot_right = rg.Vector3d.Multiply(tangent, viewer_right)
+        if abs(dot_right) > 0.1:
+            if dot_right < 0:
+                tangent = -tangent
+        else:
+            # near-vertical bend: ensure upward
+            if rg.Vector3d.Multiply(tangent, viewer_up) < 0:
+                tangent = -tangent
 
-        perp = rg.Vector3d.CrossProduct(flat_normal, tangent)
+        perp = rg.Vector3d.CrossProduct(picked_normal, tangent)
         perp.Unitize()
         text_origin = mid_pt + perp * BEND_LABEL_HEIGHT * 0.25
 
