@@ -982,25 +982,36 @@ def construct_neutral_axis(ref_side, thickness, original_brep=None, other_side=N
     if len(neutral_faces) == 1:
         result = neutral_faces[0]
     else:
-        joined = rg.Brep.JoinBreps(neutral_faces, tol)
-        if joined and len(joined) == 1:
-            result = joined[0]
-        elif joined and len(joined) > 1:
-            # faces didn't all join — try looser tolerance
-            joined2 = rg.Brep.JoinBreps(joined, tol * 10)
-            if joined2 and len(joined2) == 1:
-                result = joined2[0]
-            else:
-                # merge into one brep
-                pieces = list(joined2) if joined2 else list(joined)
-                result = pieces[0]
-                for pi in range(1, len(pieces)):
-                    result.Join(pieces[pi], tol * 10, True)
-                _log("warning: neutral axis joined with loose tolerance ({} pieces)".format(
-                    len(pieces)))
-        else:
-            _log("warning: could not join neutral axis faces")
-            result = neutral_faces[0]
+        result = None
+        # try progressively looser tolerances
+        for mult in [1, 10, 100]:
+            join_tol = tol * mult
+            joined = rg.Brep.JoinBreps(neutral_faces, join_tol)
+            if joined and len(joined) == 1:
+                result = joined[0]
+                if mult > 1:
+                    _log("  joined at {}x tolerance ({:.4f}\")".format(mult, join_tol))
+                break
+        if result is None:
+            # still multiple pieces — force-merge with very loose tolerance
+            joined = rg.Brep.JoinBreps(neutral_faces, tol * 100)
+            pieces = list(joined) if joined else list(neutral_faces)
+            result = pieces[0]
+            for pi in range(1, len(pieces)):
+                ok = result.Join(pieces[pi], tol * 100, True)
+                if not ok:
+                    # measure gap for diagnostics
+                    gap = float("inf")
+                    for ei in range(result.Edges.Count):
+                        for ej in range(pieces[pi].Edges.Count):
+                            d = result.Edges[ei].PointAtStart.DistanceTo(
+                                pieces[pi].Edges[ej].PointAtStart)
+                            gap = min(gap, d)
+                    _log("warning: could not join NAS piece {} (nearest edge gap={:.4f}\")".format(
+                        pi, gap))
+            if result.Faces.Count < len(neutral_faces):
+                _log("warning: NAS join lost faces ({} of {} joined)".format(
+                    result.Faces.Count, len(neutral_faces)))
 
     return result
 
