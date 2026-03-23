@@ -2675,9 +2675,14 @@ def unfold_to_2d():
 
     # step 14: apply placement transform if not "inplace"
     if location != "inplace" and all_output_guids:
+        # orient source plane so picked face ends up facing +Z
+        # flat_plane.Normal may oppose picked_normal — flip if needed
+        src_plane = rg.Plane(flat_plane)
+        if rg.Vector3d.Multiply(src_plane.Normal, picked_normal) < 0:
+            src_plane = rg.Plane(src_plane.Origin, -src_plane.XAxis, src_plane.YAxis)
+
         if location == "origin":
-            # PlaneToPlane from flat_plane to World XY
-            xform = rg.Transform.PlaneToPlane(flat_plane, rg.Plane.WorldXY)
+            xform = rg.Transform.PlaneToPlane(src_plane, rg.Plane.WorldXY)
             for guid in all_output_guids:
                 sc.doc.Objects.Transform(guid, xform, True)
             dbg("  moved to origin (World XY)")
@@ -2694,7 +2699,7 @@ def unfold_to_2d():
                     (bbox.Min.Y + bbox.Max.Y) / 2,
                     (bbox.Min.Z + bbox.Max.Z) / 2)
                 # first move to origin so user sees it flat
-                xform_to_origin = rg.Transform.PlaneToPlane(flat_plane, rg.Plane.WorldXY)
+                xform_to_origin = rg.Transform.PlaneToPlane(src_plane, rg.Plane.WorldXY)
                 for guid in all_output_guids:
                     sc.doc.Objects.Transform(guid, xform_to_origin, True)
                 sc.doc.Views.Redraw()
