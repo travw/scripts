@@ -2189,10 +2189,13 @@ def unfold_to_2d():
         if rc_bp:
             bake_plane = bp
             # determine which side faces the picked "UP" face
-            signed_dist = bp.DistanceTo(picked_centroid)
-            text_normal = rg.Vector3d(bp.Normal) if signed_dist > 0 else -bp.Normal
-            dbg("  label plane: normal=({:.4f},{:.4f},{:.4f}) signed_dist={:.4f}".format(
-                bp.Normal.X, bp.Normal.Y, bp.Normal.Z, signed_dist))
+            # use picked_normal dot bp.Normal (not signed_dist from centroid,
+            # which disagrees with normal direction when picked face is angled
+            # relative to seed face)
+            dot_pn = rg.Vector3d.Multiply(picked_normal, bp.Normal)
+            text_normal = -rg.Vector3d(bp.Normal) if dot_pn > 0 else rg.Vector3d(bp.Normal)
+            dbg("  label plane: normal=({:.4f},{:.4f},{:.4f}) dot_pn={:.4f}".format(
+                bp.Normal.X, bp.Normal.Y, bp.Normal.Z, dot_pn))
             dbg("  text_normal: ({:.4f},{:.4f},{:.4f})".format(
                 text_normal.X, text_normal.Y, text_normal.Z))
     if bake_plane is None:
@@ -2234,6 +2237,24 @@ def unfold_to_2d():
             tangent.X, tangent.Y, tangent.Z,
             perp.X, perp.Y, perp.Z,
             text_plane.Normal.X, text_plane.Normal.Y, text_plane.Normal.Z))
+
+        # DEBUG: 12" arrow showing text_normal direction
+        arrow_len = 12.0
+        arrow_tip = mid_pt + text_normal * arrow_len
+        shaft = rg.LineCurve(rg.Point3d(mid_pt), rg.Point3d(arrow_tip))
+        sc.doc.Objects.AddCurve(shaft, mark_attr)
+        arrow_dir = rg.Vector3d(text_normal)
+        arrow_dir.Unitize()
+        barb1_dir = arrow_dir * (-1) + tangent * 0.4
+        barb1_dir.Unitize()
+        barb1 = rg.LineCurve(rg.Point3d(arrow_tip), rg.Point3d(arrow_tip) + barb1_dir * 2.0)
+        sc.doc.Objects.AddCurve(barb1, mark_attr)
+        barb2_dir = arrow_dir * (-1) + tangent * (-0.4)
+        barb2_dir.Unitize()
+        barb2 = rg.LineCurve(rg.Point3d(arrow_tip), rg.Point3d(arrow_tip) + barb2_dir * 2.0)
+        sc.doc.Objects.AddCurve(barb2, mark_attr)
+        dbg("    DEBUG ARROW: tip=({:.2f},{:.2f},{:.2f})".format(arrow_tip.X, arrow_tip.Y, arrow_tip.Z))
+
         te = rg.TextEntity.Create(text_content, text_plane, label_ds, False, 0, 0)
         if te is None:
             dbg("    warning: TextEntity.Create returned None for '{}'".format(text_content))
