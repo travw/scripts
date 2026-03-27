@@ -1,9 +1,9 @@
 #! python3
 """Select objects by user text attribute — SelName-style popup.
 
-Semi-modal Eto dialog: pick a key from dropdown, then click values
-in the listbox to live-highlight matching objects. Viewport stays
-interactive (zoom/orbit/pan) while dialog is open.
+Semi-modal Eto dialog: pick a key from dropdown, then check values
+to live-highlight matching objects. Viewport stays interactive
+(zoom/orbit/pan) while dialog is open. Multiple values via checkboxes.
 
 alias: sut -> _-RunPythonScript "C:\Sites\scripts\rhino-python\select-by-user-text.py"
 """
@@ -33,8 +33,9 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         self.Resizable = True
         self.ClientSize = drawing.Size(360, 480)
         self.result_key = None
-        self.result_val = None
+        self.result_vals = []
         self.original_selection = rs.SelectedObjects() or []
+        self.checkboxes = []  # (checkbox, value_key) pairs
 
         # key dropdown
         self.key_dropdown = forms.DropDown()
@@ -45,10 +46,15 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
             self.key_dropdown.Items.Add(make_list_item(f"{k}  ({n} objects)", k))
         self.key_dropdown.SelectedIndexChanged += self.on_key_changed
 
-        # value listbox
-        self.val_listbox = forms.ListBox()
-        self.val_listbox.Height = 340
-        self.val_listbox.SelectedIndexChanged += self.on_value_changed
+        # scrollable panel for value checkboxes
+        self.val_panel = forms.Scrollable()
+        self.val_panel.ExpandContentWidth = True
+        self.val_panel.Height = 340
+        self.val_layout = forms.StackLayout()
+        self.val_layout.Orientation = forms.Orientation.Vertical
+        self.val_layout.Spacing = 4
+        self.val_layout.Padding = drawing.Padding(4)
+        self.val_panel.Content = self.val_layout
 
         # buttons
         ok_btn = forms.Button()
@@ -63,12 +69,9 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         btn_layout = forms.StackLayout()
         btn_layout.Orientation = forms.Orientation.Horizontal
         btn_layout.Spacing = 8
-        spacer = forms.StackLayoutItem(None, True)
-        ok_item = forms.StackLayoutItem(ok_btn, False)
-        cancel_item = forms.StackLayoutItem(cancel_btn, False)
-        btn_layout.Items.Add(spacer)
-        btn_layout.Items.Add(ok_item)
-        btn_layout.Items.Add(cancel_item)
+        btn_layout.Items.Add(forms.StackLayoutItem(None, True))
+        btn_layout.Items.Add(forms.StackLayoutItem(ok_btn, False))
+        btn_layout.Items.Add(forms.StackLayoutItem(cancel_btn, False))
 
         layout = forms.DynamicLayout()
         layout.DefaultSpacing = drawing.Size(4, 6)
@@ -80,7 +83,7 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         val_label = forms.Label()
         val_label.Text = "Values:"
         layout.AddRow(val_label)
-        layout.AddRow(self.val_listbox)
+        layout.AddRow(self.val_panel)
         layout.AddRow(None)
         layout.AddRow(btn_layout)
         self.Content = layout
@@ -90,35 +93,41 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
             self.key_dropdown.SelectedIndex = 0
 
     def on_key_changed(self, sender, e):
-        self.val_listbox.Items.Clear()
+        self.val_layout.Items.Clear()
+        self.checkboxes = []
         if self.key_dropdown.SelectedIndex < 0:
             return
         key = self.key_dropdown.Items[self.key_dropdown.SelectedIndex].Key
         val_map = self.key_val_map[key]
         for v in sorted(val_map.keys()):
-            self.val_listbox.Items.Add(make_list_item(f"{v}  ({len(val_map[v])})", v))
-        # clear highlight when switching keys
+            cb = forms.CheckBox()
+            cb.Text = f"{v}  ({len(val_map[v])})"
+            cb.CheckedChanged += self.on_checkbox_changed
+            self.checkboxes.append((cb, v))
+            self.val_layout.Items.Add(forms.StackLayoutItem(cb, False))
         rs.UnselectAllObjects()
         sc.doc.Views.Redraw()
 
-    def on_value_changed(self, sender, e):
-        if self.key_dropdown.SelectedIndex < 0 or self.val_listbox.SelectedIndex < 0:
+    def on_checkbox_changed(self, sender, e):
+        if self.key_dropdown.SelectedIndex < 0:
             return
         key = self.key_dropdown.Items[self.key_dropdown.SelectedIndex].Key
-        val = self.val_listbox.Items[self.val_listbox.SelectedIndex].Key
-        matches = self.key_val_map[key][val]
+        matches = []
+        for cb, val in self.checkboxes:
+            if cb.Checked:
+                matches.extend(self.key_val_map[key][val])
         rs.UnselectAllObjects()
-        rs.SelectObjects(matches)
+        if matches:
+            rs.SelectObjects(matches)
         sc.doc.Views.Redraw()
 
     def on_ok(self, sender, e):
-        if self.key_dropdown.SelectedIndex >= 0 and self.val_listbox.SelectedIndex >= 0:
+        if self.key_dropdown.SelectedIndex >= 0:
             self.result_key = self.key_dropdown.Items[self.key_dropdown.SelectedIndex].Key
-            self.result_val = self.val_listbox.Items[self.val_listbox.SelectedIndex].Key
+            self.result_vals = [val for cb, val in self.checkboxes if cb.Checked]
         self.Close(True)
 
     def on_cancel(self, sender, e):
-        # restore original selection
         rs.UnselectAllObjects()
         if self.original_selection:
             rs.SelectObjects(self.original_selection)
@@ -153,11 +162,14 @@ def select_by_user_text():
     dialog = SelectByUserTextDialog(key_val_map)
     Rhino.UI.EtoExtensions.ShowSemiModal(dialog, sc.doc, Rhino.UI.RhinoEtoApp.MainWindow)
 
-    if dialog.result_key and dialog.result_val:
-        matches = key_val_map[dialog.result_key][dialog.result_val]
+    if dialog.result_key and dialog.result_vals:
+        matches = []
+        for val in dialog.result_vals:
+            matches.extend(key_val_map[dialog.result_key][val])
         rs.UnselectAllObjects()
         rs.SelectObjects(matches)
-        print(f"Selected {len(matches)} object(s) where {dialog.result_key} = {dialog.result_val}.")
+        vals_str = ", ".join(dialog.result_vals)
+        print(f"Selected {len(matches)} object(s) where {dialog.result_key} in [{vals_str}].")
 
 
 if __name__ == "__main__":
