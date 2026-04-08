@@ -29,9 +29,9 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         super().__init__()
         self.key_val_map = key_val_map
         self.Title = "Select by User Text"
-        self.Padding = drawing.Padding(8)
+        self.Padding = drawing.Padding(8, 8, 8, 12)
         self.Resizable = True
-        self.ClientSize = drawing.Size(360, 480)
+        self.ClientSize = drawing.Size(360, 520)
         self.result_key = None
         self.result_vals = []
         self.original_selection = rs.SelectedObjects() or []
@@ -45,6 +45,11 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
             n = sum(len(v) for v in key_val_map[k].values())
             self.key_dropdown.Items.Add(make_list_item(f"{k}  ({n} objects)", k))
         self.key_dropdown.SelectedIndexChanged += self.on_key_changed
+
+        # select all checkbox
+        self.select_all_cb = forms.CheckBox()
+        self.select_all_cb.Text = "Select all"
+        self.select_all_cb.CheckedChanged += self.on_select_all
 
         # scrollable panel for value checkboxes
         self.val_panel = forms.Scrollable()
@@ -83,6 +88,7 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         val_label = forms.Label()
         val_label.Text = "Values:"
         layout.AddRow(val_label)
+        layout.AddRow(self.select_all_cb)
         layout.AddRow(self.val_panel)
         layout.AddRow(None)
         layout.AddRow(btn_layout)
@@ -92,9 +98,17 @@ class SelectByUserTextDialog(forms.Dialog[bool]):
         if self.key_dropdown.Items.Count > 0:
             self.key_dropdown.SelectedIndex = 0
 
+    def on_select_all(self, sender, e):
+        checked = self.select_all_cb.Checked
+        for cb, val in self.checkboxes:
+            cb.Checked = checked
+        # on_checkbox_changed will fire for each, but call once explicitly
+        self.on_checkbox_changed(sender, e)
+
     def on_key_changed(self, sender, e):
         self.val_layout.Items.Clear()
         self.checkboxes = []
+        self.select_all_cb.Checked = False
         if self.key_dropdown.SelectedIndex < 0:
             return
         key = self.key_dropdown.Items[self.key_dropdown.SelectedIndex].Key
