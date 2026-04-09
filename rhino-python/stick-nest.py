@@ -28,6 +28,8 @@ import os
 import System.Windows.Forms as WinForms
 import System.Drawing as Drawing
 
+import webbrowser
+
 
 # ---- Constants ---------------------------------------------------------------
 
@@ -393,6 +395,163 @@ def build_tsv(profile_results, stock_length):
     return "\r\n".join(rows)
 
 
+def stick_diagram_html(cuts, remnant, stock_length, kerf):
+    """Build HTML for a proportional stick bar diagram."""
+    sorted_cuts = sorted(cuts, key=lambda c: -c[0])
+    segments = []
+    for i, (length, location) in enumerate(sorted_cuts):
+        pct = length / stock_length * 100
+        segments.append(
+            f'<div class="cut" style="width:{pct:.2f}%">'
+            f'<span>{fmt_fraction(length)}</span></div>'
+        )
+        if i < len(sorted_cuts) - 1:
+            kpct = max(kerf / stock_length * 100, 0.15)
+            segments.append(f'<div class="kerf" style="width:{kpct:.2f}%"></div>')
+    rem_pct = remnant / stock_length * 100
+    if rem_pct > 0.3:
+        segments.append(
+            f'<div class="remnant" style="width:{rem_pct:.2f}%">'
+            f'<span>{fmt_fraction(remnant)}</span></div>'
+        )
+    return f'<div class="stick">{"".join(segments)}</div>'
+
+
+def export_html(profile_results, stock_length, kerf):
+    """Build and save an HTML cut recipe with stick diagrams, open in browser."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
+    doc_name = sc.doc.Name if sc.doc.Name else "Unsaved"
+
+    css = """
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 10pt;
+           max-width: 7.5in; margin: 0 auto; padding: 0.5in 0; color: #222; }
+    @media print {
+      body { max-width: none; padding: 0.4in; }
+      .no-print { display: none; }
+      @page { size: letter portrait; margin: 0.5in; }
+    }
+    h1 { font-size: 16pt; margin-bottom: 2pt; }
+    .meta { color: #555; margin-bottom: 4pt; }
+    hr.heavy { border: none; border-top: 2px solid #222; margin: 6pt 0 10pt; }
+    hr.light { border: none; border-top: 1px solid #999; margin: 4pt 0 8pt; }
+    .profile-hdr { font-size: 12pt; font-weight: bold; margin-top: 14pt; }
+    .layout-hdr { font-size: 10pt; font-weight: bold; margin: 8pt 0 3pt; }
+    .oversize { color: #b40000; font-weight: bold; font-size: 9pt; margin: 2pt 0 2pt 8pt; }
+    .stick { display: flex; border: 1px solid #555; height: 26px;
+             margin: 2pt 0 4pt; overflow: hidden; }
+    .cut { background: #d2e3f3; display: flex; align-items: center;
+           justify-content: center; font-size: 8pt; border-right: 1px solid #fff;
+           overflow: hidden; white-space: nowrap; min-width: 0; }
+    .kerf { background: #b44; min-width: 1px; flex-shrink: 0; }
+    .remnant { background: #ddd; display: flex; align-items: center;
+               justify-content: center; font-size: 7pt; color: #777;
+               overflow: hidden; white-space: nowrap; min-width: 0; }
+    .cut-list { font-size: 9pt; margin: 0 0 6pt 10pt; }
+    .cut-list div { margin: 1pt 0; }
+    .cut-len { display: inline-block; width: 90px; }
+    .subtotal { font-style: italic; font-size: 9pt; margin: 4pt 0 2pt; }
+    .totals { font-size: 10pt; margin-top: 4pt; }
+    .totals div { margin: 2pt 0; }
+    .print-btn { margin: 12pt 0; padding: 6pt 16pt; font-size: 10pt; cursor: pointer; }
+    """
+
+    parts = []
+    parts.append(f"<h1>STICK NESTING - CUT RECIPE</h1>")
+    parts.append(f'<div class="meta">Stock: {fmt_fraction(stock_length)}" &nbsp;|&nbsp; '
+                 f'Kerf: {fmt_fraction(kerf)}"</div>')
+    parts.append(f'<div class="meta">{doc_name} &nbsp;|&nbsp; {timestamp}</div>')
+    parts.append('<hr class="heavy">')
+
+    grand_sticks = 0
+    grand_layouts = 0
+    grand_cut_length = 0.0
+    grand_waste = 0.0
+
+    for profile in sorted(profile_results.keys()):
+        pr = profile_results[profile]
+        layouts = pr["layouts"]
+        oversize = pr["oversize"]
+        profile_sticks = sum(g["count"] for g in layouts)
+        grand_sticks += profile_sticks
+        grand_layouts += len(layouts)
+
+        parts.append(f'<div class="profile-hdr">PROFILE: {profile}</div>')
+        parts.append('<hr class="light">')
+
+        if oversize:
+            for length, loc in oversize:
+                parts.append(f'<div class="oversize">OVERSIZE: '
+                             f'{fmt_fraction(length)}" &nbsp; {loc}</div>')
+
+        for g in layouts:
+            parts.append(f'<div class="layout-hdr">Layout {g["id"]} &nbsp;(x{g["count"]}) '
+                         f'&nbsp;|&nbsp; Remnant: {fmt_fraction(g["remnant"])}"</div>')
+
+            parts.append(stick_diagram_html(g["cuts"], g["remnant"], stock_length, kerf))
+
+            cut_groups = {}
+            for length, location in g["cuts"]:
+                key = (length, location)
+                cut_groups[key] = cut_groups.get(key, 0) + 1
+
+            parts.append('<div class="cut-list">')
+            for (length, location), qty in sorted(cut_groups.items(), key=lambda x: -x[0][0]):
+                qty_str = f" &nbsp;(x{qty})" if qty > 1 else ""
+                parts.append(f'<div><span class="cut-len">{fmt_fraction(length)}"</span>'
+                             f'{location}{qty_str}</div>')
+                grand_cut_length += length * qty * g["count"]
+            parts.append('</div>')
+
+            grand_waste += g["remnant"] * g["count"]
+
+        parts.append(f'<div class="subtotal">&gt;&gt; {profile}: '
+                     f'{profile_sticks} stick(s), {len(layouts)} layout(s)</div>')
+        parts.append('<hr class="light">')
+
+    total_stock = grand_sticks * stock_length
+    waste_pct = (grand_waste / total_stock * 100) if total_stock > 0 else 0
+
+    parts.append('<hr class="heavy">')
+    parts.append('<div class="totals"><strong>TOTALS</strong>')
+    parts.append(f'<div>Sticks: {grand_sticks} &nbsp;|&nbsp; Layouts: {grand_layouts}</div>')
+    parts.append(f'<div>Total cut length: '
+                 f'{fmt_fraction(floor_to_sixteenth(grand_cut_length))}"</div>')
+    parts.append(f'<div>Waste: {fmt_fraction(floor_to_sixteenth(grand_waste))}" '
+                 f'&nbsp;({waste_pct:.1f}%)</div>')
+    parts.append('</div>')
+    parts.append('<hr class="heavy">')
+    parts.append('<button class="print-btn no-print" onclick="window.print()">'
+                 'Print / Save PDF</button>')
+
+    body = "\n".join(parts)
+    html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Stick Nesting - {doc_name}</title>
+<style>{css}</style>
+</head><body>
+{body}
+</body></html>"""
+
+    # save and open
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    base = doc_name.replace(".3dm", "")
+    default_name = f"{base}_stick-nest.html"
+
+    path = rs.SaveFileName(
+        "Save cut recipe HTML",
+        "HTML Files (*.html)|*.html",
+        desktop,
+        default_name,
+    )
+    if path:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"  saved: {path}")
+        os.startfile(path)
+
+
 def export_csv(profile_results, stock_length):
     """Prompt for save location and write CSV."""
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -437,11 +596,11 @@ def export_csv(profile_results, stock_length):
 
 # ---- Popup window ------------------------------------------------------------
 
-def show_popup(lines, tsv_text, profile_results, stock_length):
-    """Display report in a scrollable popup with copy and CSV export buttons."""
+def show_popup(lines, tsv_text, profile_results, stock_length, kerf):
+    """Display report in a scrollable popup with copy, CSV, PDF export buttons."""
     form = WinForms.Form()
     form.Text = "Stick Nesting - Cut Recipe"
-    form.Width = 560
+    form.Width = 600
     form.Height = 700
     form.MinimumSize = Drawing.Size(400, 300)
     form.StartPosition = WinForms.FormStartPosition.CenterScreen
@@ -472,11 +631,25 @@ def show_popup(lines, tsv_text, profile_results, stock_length):
     csv_btn.Left = 140
     csv_btn.Top = 3
 
+    btn_x = 246
+    html_btn = WinForms.Button()
+    html_btn.Text = "Save HTML..."
+    html_btn.Width = 100
+    html_btn.Height = 30
+    html_btn.Left = btn_x
+    html_btn.Top = 3
+
+    def on_html(s, e):
+        export_html(profile_results, stock_length, kerf)
+
+    html_btn.Click += on_html
+    btn_x += 106
+
     close_btn = WinForms.Button()
     close_btn.Text = "Close"
     close_btn.Width = 80
     close_btn.Height = 30
-    close_btn.Left = 246
+    close_btn.Left = btn_x
     close_btn.Top = 3
 
     def on_copy(s, e):
@@ -492,6 +665,7 @@ def show_popup(lines, tsv_text, profile_results, stock_length):
 
     btn_panel.Controls.Add(copy_btn)
     btn_panel.Controls.Add(csv_btn)
+    btn_panel.Controls.Add(html_btn)
     btn_panel.Controls.Add(close_btn)
 
     form.Controls.Add(textbox)
@@ -537,7 +711,7 @@ def main():
     for line in lines:
         print(line)
 
-    show_popup(lines, tsv_text, profile_results, stock_length)
+    show_popup(lines, tsv_text, profile_results, stock_length, kerf)
 
 
 if __name__ == "__main__":
