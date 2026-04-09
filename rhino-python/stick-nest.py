@@ -459,12 +459,25 @@ def build_report(profile_results, kerf):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
     doc_name = sc.doc.Name if sc.doc.Name else "Unsaved"
 
+    has_oversize = any(pr["oversize"]["cuts"] for pr in profile_results.values())
+
     lines.append("")
     lines.append("=" * 56)
     lines.append("  STICK NESTING - CUT RECIPE")
     lines.append("  Kerf: {}\"".format(fmt_fraction(kerf)))
     lines.append("  {}  |  {}".format(doc_name, timestamp))
     lines.append("=" * 56)
+    lines.append("")
+    lines.append("  INSTRUCTIONS")
+    lines.append("  - (xN) = make N identical sticks with this layout")
+    lines.append("  - Cumulative = measure from left end of stock,")
+    lines.append("    mark the line, cut to the RIGHT of the mark")
+    lines.append("  - Kerf ({}\" blade) is accounted for in cumulative".format(
+        fmt_fraction(kerf)))
+    if has_oversize:
+        lines.append("  - OVERSIZE: piece longer than stock. needs")
+        lines.append("    multiple sticks butt-welded. partials are")
+        lines.append("    bin-packed into layouts below")
 
     grand_sticks = 0
     grand_layouts = 0
@@ -683,14 +696,32 @@ def export_html(profile_results, kerf):
                        font-weight: bold; }
     .totals-table td { padding: 2pt 6pt; }
     .totals-table tr.grand { border-top: 1px solid #222; font-weight: bold; }
+    .instructions { font-size: 9pt; color: #444; margin: 0 0 6pt;
+                    padding: 6pt 10pt; background: #f8f8f8; border: 1px solid #ddd; }
+    .instructions div { margin: 2pt 0; }
+    .instructions strong { font-size: 10pt; }
     .print-btn { margin: 12pt 0; padding: 6pt 16pt; font-size: 10pt; cursor: pointer; }
     """
+
+    has_oversize = any(pr["oversize"]["cuts"] for pr in profile_results.values())
 
     parts = []
     parts.append(f"<h1>STICK NESTING - CUT RECIPE</h1>")
     parts.append(f'<div class="meta">Kerf: {fmt_fraction(kerf)}"</div>')
     parts.append(f'<div class="meta">{doc_name} &nbsp;|&nbsp; {timestamp}</div>')
     parts.append('<hr class="heavy">')
+    parts.append('<div class="instructions">')
+    parts.append('<strong>Instructions</strong>')
+    parts.append(f'<div><b>(xN)</b> = make N identical sets of this layout</div>')
+    parts.append(f'<div><b>Cumulative</b> = measure from left end of stock, '
+                 f'mark the line, cut to the <b>right</b> of the mark</div>')
+    parts.append(f'<div>Kerf ({fmt_fraction(kerf)}" blade) is accounted for '
+                 f'in cumulative measurements</div>')
+    if has_oversize:
+        parts.append('<div><b style="color:#b40000">OVERSIZE</b> = piece longer '
+                     'than stock, needs multiple sticks butt-welded. '
+                     'Partial offcuts are bin-packed into layouts below</div>')
+    parts.append('</div>')
 
     grand_sticks = 0
     grand_layouts = 0
