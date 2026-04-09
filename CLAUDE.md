@@ -32,6 +32,46 @@ MIT licensed. no third-party grasshopper plugin dependencies.
 - units: inches, always
 - tolerance: document tolerance, typically 0.001" for modeling, 1/16"-1/8" for fab
 
+## supply chain security -- MANDATORY
+
+these rules are non-negotiable. violations can introduce malicious code.
+
+### before installing ANY dependency:
+
+1. verify the package EXISTS and is what you think it is
+   - check npmjs.com directly
+   - confirm: correct name spelling, real maintainer, not a typosquat
+2. check publish date: `npm view <pkg> time`
+   - if the package OR the specific version is less than 7 days old, STOP
+   - flag it to the user and wait for explicit approval
+3. check download count
+   - under 100 weekly downloads on npm = suspicious until proven otherwise
+4. prefer well-known, high-download packages over obscure alternatives
+5. NEVER invent or hallucinate a package name. if you're not 100% certain
+   a package exists with that exact name, say so and let the user verify.
+
+### npm hardening (enforce in all npm operations):
+
+- always use `--ignore-scripts` on install unless user explicitly approves scripts
+- always commit package-lock.json
+- run `npm audit` after any dependency change
+- pin exact versions in package.json (no ^ or ~ prefixes)
+- prefer `dependencies` vs `devDependencies` correctly
+
+### general dep philosophy:
+
+- MINIMAL dependencies. every dep is attack surface.
+- if something can be done in <50 lines of vanilla js, do that instead of adding a dep
+- before suggesting a new dep, ask: does this NEED to be a package?
+- vendor small utilities rather than importing them
+- no meta-frameworks, no orms, no "convenience" layers
+
+### if unsure about a package:
+
+say "i'm not 100% sure this package exists / is safe -- please verify before installing"
+-- this is ALWAYS preferable to confidently recommending something wrong.
+
+
 ## conventions
 
 ### python scripts
