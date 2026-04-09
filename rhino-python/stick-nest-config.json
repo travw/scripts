@@ -1,0 +1,51 @@
+{
+  "default_stock_length": 240.0,
+  "kerf": 0.16,
+  "profiles": {
+    "1.25x0.375_bar": {
+      "stock_length": 120.0
+    },
+    "1.5x1.5_tube": {
+      "stock_length": 240.0
+    },
+    "1x0.125_bar": {
+      "stock_length": 120.0
+    },
+    "1x1_tube": {
+      "stock_length": 252.0
+    },
+    "2x1_angle": {
+      "stock_length": 192.0
+    },
+    "2x1_channel": {
+      "stock_length": 192.0
+    },
+    "2x1_tube": {
+      "stock_length": 300.0
+    },
+    "3x0.25_bar": {
+      "stock_length": 120.0
+    },
+    "3x1.5_channel": {
+      "stock_length": 240.0
+    },
+    "3x1.5_tube": {
+      "stock_length": 240.0
+    },
+    "3x2_angle": {
+      "stock_length": 300.0
+    },
+    "4x1.5_channel": {
+      "stock_length": 300.0
+    },
+    "4x2_channel": {
+      "stock_length": 300.0
+    },
+    "chine-extrusion": {
+      "stock_length": 300.0
+    },
+    "gunwale-cap": {
+      "stock_length": 300.0
+    }
+  }
+}

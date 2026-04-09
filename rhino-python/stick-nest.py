@@ -567,9 +567,14 @@ def export_html(profile_results, kerf):
     body { font-family: Arial, Helvetica, sans-serif; font-size: 10pt;
            max-width: 7.5in; margin: 0 auto; padding: 0.5in 0; color: #222; }
     @media print {
-      body { max-width: none; padding: 0.4in; }
+      body { max-width: none; padding: 0; }
       .no-print { display: none; }
       @page { size: letter portrait; margin: 0.5in; }
+      .layout-block { break-inside: avoid; }
+      .profile-section { break-inside: avoid-if-possible; }
+      .profile-hdr, .profile-stock { break-after: avoid; }
+      .totals-section { break-inside: avoid; }
+      hr.light { break-after: auto; }
     }
     h1 { font-size: 16pt; margin-bottom: 2pt; }
     .meta { color: #555; margin-bottom: 4pt; }
@@ -577,6 +582,7 @@ def export_html(profile_results, kerf):
     hr.light { border: none; border-top: 1px solid #999; margin: 4pt 0 8pt; }
     .profile-hdr { font-size: 12pt; font-weight: bold; margin-top: 14pt; }
     .profile-stock { font-size: 9pt; color: #555; margin: 0 0 2pt 4pt; }
+    .layout-block { margin-bottom: 2pt; }
     .layout-hdr { font-size: 10pt; font-weight: bold; margin: 8pt 0 3pt; }
     .oversize { color: #b40000; font-weight: bold; font-size: 9pt; margin: 2pt 0 2pt 8pt; }
     .stick { display: flex; border: 1px solid #555; height: 26px;
@@ -634,6 +640,7 @@ def export_html(profile_results, kerf):
                              f'{fmt_fraction(length)}" &nbsp; {loc}</div>')
 
         for g in layouts:
+            parts.append('<div class="layout-block">')
             parts.append(f'<div class="layout-hdr">Layout {g["id"]} &nbsp;(x{g["count"]}) '
                          f'&nbsp;|&nbsp; Remnant: {fmt_fraction(g["remnant"])}"</div>')
 
@@ -651,6 +658,7 @@ def export_html(profile_results, kerf):
                              f'{location}{qty_str}</div>')
                 profile_cut_length += length * qty * g["count"]
             parts.append('</div>')
+            parts.append('</div>')  # layout-block
 
             profile_waste += g["remnant"] * g["count"]
 
@@ -672,6 +680,7 @@ def export_html(profile_results, kerf):
 
     waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
 
+    parts.append('<div class="totals-section">')
     parts.append('<hr class="heavy">')
     parts.append('<div class="totals"><strong>TOTALS</strong></div>')
     parts.append('<table class="totals-table">')
@@ -689,6 +698,7 @@ def export_html(profile_results, kerf):
                  f'<td>{waste_pct:.1f}%</td></tr>')
     parts.append('</table>')
     parts.append('<hr class="heavy">')
+    parts.append('</div>')  # totals-section
     parts.append('<button class="print-btn no-print" onclick="window.print()">'
                  'Print / Save PDF</button>')
 
