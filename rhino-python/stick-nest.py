@@ -447,8 +447,8 @@ def cut_marks(cuts, kerf):
     pos = 0.0
     for i, (length, location) in enumerate(sorted_cuts):
         pos += length
+        marks.append(pos)
         if i < len(sorted_cuts) - 1:
-            marks.append(pos)
             pos += kerf
     return marks
 
@@ -526,11 +526,9 @@ def build_report(profile_results, kerf):
             pos = 0.0
             for i, (length, location) in enumerate(sorted_cuts):
                 pos += length
+                cumul_str = fmt_fraction(floor_to_sixteenth(pos)).ljust(14)
                 if i < len(sorted_cuts) - 1:
-                    cumul_str = fmt_fraction(floor_to_sixteenth(pos)).ljust(14)
                     pos += kerf
-                else:
-                    cumul_str = "".ljust(14)  # last piece, no cut mark
                 length_str = fmt_fraction(length).ljust(14)
                 lines.append("    {}  {}  {}".format(length_str, cumul_str, location))
 
@@ -785,11 +783,9 @@ def export_html(profile_results, kerf):
             pos = 0.0
             for i, (length, location) in enumerate(sorted_cuts):
                 pos += length
+                cumul_str = f'{fmt_fraction(floor_to_sixteenth(pos))}"'
                 if i < len(sorted_cuts) - 1:
-                    cumul_str = f'{fmt_fraction(floor_to_sixteenth(pos))}"'
                     pos += kerf
-                else:
-                    cumul_str = ""
                 parts.append(f'<div><span class="cut-len">{fmt_fraction(length)}"</span>'
                              f'<span class="cut-cumul">{cumul_str}</span>'
                              f'{location}</div>')
