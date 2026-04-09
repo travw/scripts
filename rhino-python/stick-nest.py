@@ -188,31 +188,43 @@ def report_errors(errors, total_objects):
 
 # ---- Bin packing -------------------------------------------------------------
 
-def oversize_sticks_needed(length, stock_length):
-    """How many sticks does an oversize cut need, and what's the waste?"""
-    n = math.ceil(length / stock_length)
-    waste = n * stock_length - length
-    return n, waste
-
-
 def best_fit_decreasing(cuts, stock_length, kerf):
     """
     Best-fit decreasing 1D bin packing.
     cuts: list of (length, location) tuples
-    Returns (bins, oversize) where oversize is list of (length, location, sticks_needed, waste).
+
+    Oversize cuts (longer than stock) each consume N-1 full sticks plus a
+    partial from the Nth stick.  The partials are collected and bin-packed
+    together so that offcuts from separate oversize pieces share sticks.
+
+    Returns (bins, oversize_info) where:
+      bins      = list of Bin (normal + oversize-partial bins)
+      oversize_info = {
+          "cuts":        [(length, location, full_sticks, partial), ...],
+          "full_sticks": total full sticks consumed,
+          "partial_bins": list of Bin for the partial pieces,
+      }
     """
-    oversize = []
+    oversize_cuts = []
+    partials = []       # (partial_length, location) to bin-pack
+    total_full = 0
     for l, loc in cuts:
         if l > stock_length:
-            n, w = oversize_sticks_needed(l, stock_length)
-            oversize.append((l, loc, n, w))
+            full = int(l // stock_length)       # full sticks consumed entirely
+            partial = l - full * stock_length   # leftover partial piece
+            total_full += full
+            oversize_cuts.append((l, loc, full, partial))
+            if partial > 0:
+                partials.append((partial, f"{loc} (oversize partial)"))
+
     fittable = [(l, loc) for l, loc in cuts if l <= stock_length]
 
-    # sort longest first
-    fittable.sort(key=lambda c: c[0], reverse=True)
+    # bin-pack the oversize partials together with normal cuts
+    all_to_pack = fittable + partials
+    all_to_pack.sort(key=lambda c: c[0], reverse=True)
 
     bins = []
-    for length, location in fittable:
+    for length, location in all_to_pack:
         best_idx = -1
         best_leftover = float("inf")
 
@@ -230,7 +242,11 @@ def best_fit_decreasing(cuts, stock_length, kerf):
             new_bin.add(length, location, kerf)
             bins.append(new_bin)
 
-    return bins, oversize
+    oversize_info = {
+        "cuts": oversize_cuts,
+        "full_sticks": total_full,
+    }
+    return bins, oversize_info
 
 
 # ---- Layout grouping ---------------------------------------------------------
@@ -285,13 +301,19 @@ def config_path():
 
 
 def load_config():
-    """Load config from JSON, falling back to defaults. Caches in sc.sticky."""
+    """Load config from JSON, falling back to defaults. Re-reads if file changed."""
+    path = config_path()
+    try:
+        file_mtime = os.path.getmtime(path)
+    except OSError:
+        file_mtime = 0
+
     cached = sc.sticky.get("stick_nest_config")
-    if cached:
+    cached_mtime = sc.sticky.get("stick_nest_config_mtime", -1)
+    if cached and cached_mtime == file_mtime:
         return cached
 
     cfg = _default_config()
-    path = config_path()
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
@@ -304,6 +326,7 @@ def load_config():
             print("  using defaults")
 
     sc.sticky["stick_nest_config"] = cfg
+    sc.sticky["stick_nest_config_mtime"] = file_mtime
     return cfg
 
 
@@ -313,6 +336,7 @@ def save_config(cfg):
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)
     sc.sticky["stick_nest_config"] = cfg
+    sc.sticky["stick_nest_config_mtime"] = os.path.getmtime(path)
 
 
 def get_stock_length(cfg, profile):
@@ -412,6 +436,23 @@ def manage_config():
 
 # ---- Report builders ---------------------------------------------------------
 
+def cut_marks(cuts, kerf):
+    """Compute cumulative cut-mark positions from left end of stick.
+    cuts: list of (length, location) sorted longest first (layout order).
+    Returns list of mark positions (inches). N-1 marks for N pieces.
+    Fabricator marks the line at the piece end and cuts to the right of it;
+    kerf falls entirely to the right of the mark."""
+    sorted_cuts = sorted(cuts, key=lambda c: -c[0])
+    marks = []
+    pos = 0.0
+    for i, (length, location) in enumerate(sorted_cuts):
+        pos += length
+        if i < len(sorted_cuts) - 1:
+            marks.append(pos)
+            pos += kerf
+    return marks
+
+
 def build_report(profile_results, kerf):
     """Build monospaced report as list of strings."""
     lines = []
@@ -446,39 +487,45 @@ def build_report(profile_results, kerf):
         lines.append("  PROFILE: {}  |  Stock: {}\"".format(profile, fmt_fraction(stock_length)))
         lines.append("  " + "-" * 52)
 
-        if oversize:
-            lines.append("  ** OVERSIZE:")
-            for length, location, stks, waste in oversize:
-                lines.append("     {}  {}  -> {} stick(s), {} waste".format(
+        os_cuts = oversize["cuts"]
+        os_full = oversize["full_sticks"]
+        if os_cuts:
+            lines.append("  ** OVERSIZE (each needs {} full + partial):".format(
+                os_cuts[0][2]  # full sticks per piece (same for identical cuts)
+            ))
+            for length, location, full, partial in os_cuts:
+                lines.append("     {}  {}  ({} full + {} partial)".format(
                     fmt_fraction(length).ljust(14), location,
-                    stks, fmt_fraction(floor_to_sixteenth(waste))
+                    full, fmt_fraction(floor_to_sixteenth(partial))
                 ))
-                profile_sticks += stks
                 profile_cut_length += length
-                profile_waste += waste
+            profile_sticks += os_full
+            lines.append("     {} full stick(s) consumed, partials bin-packed below".format(os_full))
             lines.append("")
 
         for g in layouts:
             lines.append("  Layout {}  (x{})".format(g["id"], g["count"]))
+            lines.append("    {}  {}  {}".format(
+                "Length".ljust(14), "Cumulative".ljust(14), "Location"
+            ))
 
-            # group identical cuts within this layout
-            cut_groups = {}
-            for length, location in g["cuts"]:
-                key = (length, location)
-                cut_groups[key] = cut_groups.get(key, 0) + 1
-
-            for (length, location), qty in sorted(cut_groups.items(), key=lambda x: -x[0][0]):
-                length_str = fmt_fraction(length).ljust(14)
-                if qty > 1:
-                    lines.append("    {}  {}  (x{})".format(length_str, location, qty))
+            sorted_cuts = sorted(g["cuts"], key=lambda c: -c[0])
+            pos = 0.0
+            for i, (length, location) in enumerate(sorted_cuts):
+                pos += length
+                if i < len(sorted_cuts) - 1:
+                    cumul_str = fmt_fraction(floor_to_sixteenth(pos)).ljust(14)
+                    pos += kerf
                 else:
-                    lines.append("    {}  {}".format(length_str, location))
+                    cumul_str = "".ljust(14)  # last piece, no cut mark
+                length_str = fmt_fraction(length).ljust(14)
+                lines.append("    {}  {}  {}".format(length_str, cumul_str, location))
 
-                profile_cut_length += length * qty * g["count"]
+                profile_cut_length += length * g["count"]
 
             # remnant at the bottom of the cut list
-            lines.append("    {}  remnant".format(
-                fmt_fraction(g["remnant"]).ljust(14)
+            lines.append("    {}  {}  remnant".format(
+                fmt_fraction(g["remnant"]).ljust(14), "".ljust(14)
             ))
             profile_waste += g["remnant"] * g["count"]
             lines.append("")
@@ -618,8 +665,16 @@ def export_html(profile_results, kerf):
                overflow: hidden; white-space: nowrap; min-width: 0; }
     .cut-list { font-size: 9pt; margin: 0 0 6pt 10pt; }
     .cut-list div { margin: 1pt 0; }
+    .cut-list-hdr { font-size: 8pt; color: #888; text-transform: uppercase;
+                    letter-spacing: 0.5pt; margin-bottom: 1pt; }
     .cut-len { display: inline-block; width: 90px; }
+    .cut-cumul { display: inline-block; width: 90px; color: #b44; }
     .remnant-line { color: #888; font-style: italic; }
+    .ruler { position: relative; height: 20px; margin: 0 0 4pt; border-left: 1px solid #999; }
+    .ruler-tick { position: absolute; top: 0; border-left: 1px solid #b44;
+                  height: 10px; transform: translateX(-0.5px); }
+    .ruler-label { position: absolute; top: 10px; font-size: 7pt; color: #b44;
+                   transform: translateX(-50%); white-space: nowrap; }
     .subtotal { font-style: italic; font-size: 9pt; margin: 4pt 0 2pt; }
     .totals { font-size: 10pt; margin-top: 4pt; }
     .totals div { margin: 2pt 0; }
@@ -657,15 +712,19 @@ def export_html(profile_results, kerf):
         parts.append(f'<div class="profile-stock">Stock: {fmt_fraction(stock_length)}"</div>')
         parts.append('<hr class="light">')
 
-        if oversize:
-            for length, loc, stks, waste in oversize:
+        os_cuts = oversize["cuts"]
+        os_full = oversize["full_sticks"]
+        if os_cuts:
+            for length, loc, full, partial in os_cuts:
                 parts.append(f'<div class="oversize">OVERSIZE: '
                              f'{fmt_fraction(length)}" &nbsp; {loc} '
-                             f'&mdash; {stks} stick(s), '
-                             f'{fmt_fraction(floor_to_sixteenth(waste))}" waste</div>')
-                profile_sticks += stks
+                             f'&mdash; {full} full + '
+                             f'{fmt_fraction(floor_to_sixteenth(partial))}" partial</div>')
                 profile_cut_length += length
-                profile_waste += waste
+            profile_sticks += os_full
+            parts.append(f'<div class="oversize" style="font-weight:normal">'
+                         f'{os_full} full stick(s) consumed, '
+                         f'partials bin-packed below</div>')
 
         for g in layouts:
             parts.append('<div class="layout-block">')
@@ -673,19 +732,40 @@ def export_html(profile_results, kerf):
 
             parts.append(stick_diagram_html(g["cuts"], g["remnant"], stock_length, kerf))
 
-            cut_groups = {}
-            for length, location in g["cuts"]:
-                key = (length, location)
-                cut_groups[key] = cut_groups.get(key, 0) + 1
+            # cumulative cut-mark ruler
+            marks = cut_marks(g["cuts"], kerf)
+            if marks:
+                ticks = []
+                for m in marks:
+                    pct = m / stock_length * 100
+                    label = fmt_fraction(floor_to_sixteenth(m))
+                    ticks.append(
+                        f'<div class="ruler-tick" style="left:{pct:.2f}%"></div>'
+                        f'<div class="ruler-label" style="left:{pct:.2f}%">{label}</div>'
+                    )
+                parts.append(f'<div class="ruler">{"".join(ticks)}</div>')
 
+            sorted_cuts = sorted(g["cuts"], key=lambda c: -c[0])
             parts.append('<div class="cut-list">')
-            for (length, location), qty in sorted(cut_groups.items(), key=lambda x: -x[0][0]):
-                qty_str = f" &nbsp;(x{qty})" if qty > 1 else ""
+            parts.append('<div class="cut-list-hdr">'
+                         '<span class="cut-len">Length</span>'
+                         '<span class="cut-cumul">Cumulative</span>'
+                         'Location</div>')
+            pos = 0.0
+            for i, (length, location) in enumerate(sorted_cuts):
+                pos += length
+                if i < len(sorted_cuts) - 1:
+                    cumul_str = f'{fmt_fraction(floor_to_sixteenth(pos))}"'
+                    pos += kerf
+                else:
+                    cumul_str = ""
                 parts.append(f'<div><span class="cut-len">{fmt_fraction(length)}"</span>'
-                             f'{location}{qty_str}</div>')
-                profile_cut_length += length * qty * g["count"]
+                             f'<span class="cut-cumul">{cumul_str}</span>'
+                             f'{location}</div>')
+                profile_cut_length += length * g["count"]
             parts.append(f'<div class="remnant-line"><span class="cut-len">'
-                         f'{fmt_fraction(g["remnant"])}"</span>remnant</div>')
+                         f'{fmt_fraction(g["remnant"])}"</span>'
+                         f'<span class="cut-cumul"></span>remnant</div>')
             parts.append('</div>')
             parts.append('</div>')  # layout-block
 
@@ -921,11 +1001,11 @@ def main():
     profile_results = {}
     for profile, cuts in profile_cuts.items():
         sl = get_stock_length(cfg, profile)
-        bins, oversize = best_fit_decreasing(cuts, sl, kerf)
+        bins, oversize_info = best_fit_decreasing(cuts, sl, kerf)
         layouts = group_identical_layouts(bins)
         profile_results[profile] = {
             "layouts": layouts,
-            "oversize": oversize,
+            "oversize": oversize_info,
             "stock_length": sl,
         }
 

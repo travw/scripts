@@ -1,6 +1,6 @@
 {
   "default_stock_length": 240.0,
-  "kerf": 0.16,
+  "kerf": 0.125,
   "profiles": {
     "1.25x0.375_bar": {
       "stock_length": 120.0
@@ -27,10 +27,13 @@
       "stock_length": 120.0
     },
     "3x1.5_channel": {
-      "stock_length": 240.0
+      "stock_length": 300.0
     },
     "3x1.5_tube": {
       "stock_length": 240.0
+    },
+    "3x1_channel": {
+      "stock_length": 192.0
     },
     "3x2_angle": {
       "stock_length": 300.0
