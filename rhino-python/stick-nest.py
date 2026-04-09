@@ -188,13 +188,24 @@ def report_errors(errors, total_objects):
 
 # ---- Bin packing -------------------------------------------------------------
 
+def oversize_sticks_needed(length, stock_length):
+    """How many sticks does an oversize cut need, and what's the waste?"""
+    n = math.ceil(length / stock_length)
+    waste = n * stock_length - length
+    return n, waste
+
+
 def best_fit_decreasing(cuts, stock_length, kerf):
     """
     Best-fit decreasing 1D bin packing.
     cuts: list of (length, location) tuples
-    Returns (bins, oversize) where oversize is list of cuts that don't fit.
+    Returns (bins, oversize) where oversize is list of (length, location, sticks_needed, waste).
     """
-    oversize = [(l, loc) for l, loc in cuts if l > stock_length]
+    oversize = []
+    for l, loc in cuts:
+        if l > stock_length:
+            n, w = oversize_sticks_needed(l, stock_length)
+            oversize.append((l, loc, n, w))
     fittable = [(l, loc) for l, loc in cuts if l <= stock_length]
 
     # sort longest first
@@ -436,17 +447,19 @@ def build_report(profile_results, kerf):
         lines.append("  " + "-" * 52)
 
         if oversize:
-            lines.append("  ** OVERSIZE (won't fit in stock):")
-            for length, location in oversize:
-                lines.append("     {}  {}".format(
-                    fmt_fraction(length).ljust(14), location
+            lines.append("  ** OVERSIZE:")
+            for length, location, stks, waste in oversize:
+                lines.append("     {}  {}  -> {} stick(s), {} waste".format(
+                    fmt_fraction(length).ljust(14), location,
+                    stks, fmt_fraction(floor_to_sixteenth(waste))
                 ))
+                profile_sticks += stks
+                profile_cut_length += length
+                profile_waste += waste
             lines.append("")
 
         for g in layouts:
-            lines.append("  Layout {}  (x{})  |  Remnant: {}".format(
-                g["id"], g["count"], fmt_fraction(g["remnant"])
-            ))
+            lines.append("  Layout {}  (x{})".format(g["id"], g["count"]))
 
             # group identical cuts within this layout
             cut_groups = {}
@@ -463,6 +476,10 @@ def build_report(profile_results, kerf):
 
                 profile_cut_length += length * qty * g["count"]
 
+            # remnant at the bottom of the cut list
+            lines.append("    {}  remnant".format(
+                fmt_fraction(g["remnant"]).ljust(14)
+            ))
             profile_waste += g["remnant"] * g["count"]
             lines.append("")
 
@@ -479,29 +496,34 @@ def build_report(profile_results, kerf):
         lines.append("  " + "-" * 52)
 
         grand_sticks += profile_sticks
-        grand_layouts += len(layouts)
         grand_cut_length += profile_cut_length
         grand_waste += profile_waste
         grand_stock += p_stock
-        profile_summaries.append((profile, profile_sticks, len(layouts),
+        profile_summaries.append((profile, stock_length, profile_sticks,
                                   profile_cut_length, profile_waste, p_waste_pct))
 
     lines.append("")
-    lines.append("=" * 56)
-    lines.append("  TOTALS (by profile)")
-    lines.append("  " + "-" * 52)
-    for pname, psticks, playouts, pcut, pwaste, ppct in profile_summaries:
-        lines.append("  {:20s} {:>3} sticks  waste {:>8s} ({:.1f}%)".format(
-            pname, psticks,
+    lines.append("=" * 64)
+    lines.append("  TOTALS")
+    lines.append("  " + "-" * 60)
+    lines.append("  {:20s} {:>6s} {:>5s} {:>10s} {:>10s} {:>5s}".format(
+        "Profile", "Stock", "Stks", "Used", "Waste", "%"
+    ))
+    lines.append("  " + "-" * 60)
+    for pname, psl, psticks, pcut, pwaste, ppct in profile_summaries:
+        lines.append("  {:20s} {:>6s} {:>5} {:>10s} {:>10s} {:>4.1f}%".format(
+            pname, fmt_fraction(psl) + '"', psticks,
+            fmt_fraction(floor_to_sixteenth(pcut)) + '"',
             fmt_fraction(floor_to_sixteenth(pwaste)) + '"', ppct
         ))
-    lines.append("  " + "-" * 52)
+    lines.append("  " + "-" * 60)
     waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
-    lines.append("  {:20s} {:>3} sticks  waste {:>8s} ({:.1f}%)".format(
-        "TOTAL", grand_sticks,
+    lines.append("  {:20s} {:>6s} {:>5} {:>10s} {:>10s} {:>4.1f}%".format(
+        "TOTAL", "", grand_sticks,
+        fmt_fraction(floor_to_sixteenth(grand_cut_length)) + '"',
         fmt_fraction(floor_to_sixteenth(grand_waste)) + '"', waste_pct
     ))
-    lines.append("=" * 56)
+    lines.append("=" * 64)
     lines.append("")
 
     return lines
@@ -597,6 +619,7 @@ def export_html(profile_results, kerf):
     .cut-list { font-size: 9pt; margin: 0 0 6pt 10pt; }
     .cut-list div { margin: 1pt 0; }
     .cut-len { display: inline-block; width: 90px; }
+    .remnant-line { color: #888; font-style: italic; }
     .subtotal { font-style: italic; font-size: 9pt; margin: 4pt 0 2pt; }
     .totals { font-size: 10pt; margin-top: 4pt; }
     .totals div { margin: 2pt 0; }
@@ -635,14 +658,18 @@ def export_html(profile_results, kerf):
         parts.append('<hr class="light">')
 
         if oversize:
-            for length, loc in oversize:
+            for length, loc, stks, waste in oversize:
                 parts.append(f'<div class="oversize">OVERSIZE: '
-                             f'{fmt_fraction(length)}" &nbsp; {loc}</div>')
+                             f'{fmt_fraction(length)}" &nbsp; {loc} '
+                             f'&mdash; {stks} stick(s), '
+                             f'{fmt_fraction(floor_to_sixteenth(waste))}" waste</div>')
+                profile_sticks += stks
+                profile_cut_length += length
+                profile_waste += waste
 
         for g in layouts:
             parts.append('<div class="layout-block">')
-            parts.append(f'<div class="layout-hdr">Layout {g["id"]} &nbsp;(x{g["count"]}) '
-                         f'&nbsp;|&nbsp; Remnant: {fmt_fraction(g["remnant"])}"</div>')
+            parts.append(f'<div class="layout-hdr">Layout {g["id"]} &nbsp;(x{g["count"]})</div>')
 
             parts.append(stick_diagram_html(g["cuts"], g["remnant"], stock_length, kerf))
 
@@ -657,6 +684,8 @@ def export_html(profile_results, kerf):
                 parts.append(f'<div><span class="cut-len">{fmt_fraction(length)}"</span>'
                              f'{location}{qty_str}</div>')
                 profile_cut_length += length * qty * g["count"]
+            parts.append(f'<div class="remnant-line"><span class="cut-len">'
+                         f'{fmt_fraction(g["remnant"])}"</span>remnant</div>')
             parts.append('</div>')
             parts.append('</div>')  # layout-block
 
@@ -671,11 +700,10 @@ def export_html(profile_results, kerf):
         parts.append('<hr class="light">')
 
         grand_sticks += profile_sticks
-        grand_layouts += len(layouts)
         grand_cut_length += profile_cut_length
         grand_waste += profile_waste
         grand_stock += p_stock
-        profile_summaries.append((profile, profile_sticks, len(layouts),
+        profile_summaries.append((profile, stock_length, profile_sticks,
                                   profile_cut_length, profile_waste, p_waste_pct))
 
     waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
@@ -684,15 +712,16 @@ def export_html(profile_results, kerf):
     parts.append('<hr class="heavy">')
     parts.append('<div class="totals"><strong>TOTALS</strong></div>')
     parts.append('<table class="totals-table">')
-    parts.append('<tr><th>Profile</th><th>Sticks</th><th>Layouts</th>'
-                 '<th>Cut</th><th>Waste</th><th>%</th></tr>')
-    for pname, psticks, playouts, pcut, pwaste, ppct in profile_summaries:
-        parts.append(f'<tr><td>{pname}</td><td>{psticks}</td><td>{playouts}</td>'
+    parts.append('<tr><th>Profile</th><th>Stock</th><th>Sticks</th>'
+                 '<th>Used</th><th>Waste</th><th>%</th></tr>')
+    for pname, psl, psticks, pcut, pwaste, ppct in profile_summaries:
+        parts.append(f'<tr><td>{pname}</td>'
+                     f'<td>{fmt_fraction(psl)}"</td><td>{psticks}</td>'
                      f'<td>{fmt_fraction(floor_to_sixteenth(pcut))}"</td>'
                      f'<td>{fmt_fraction(floor_to_sixteenth(pwaste))}"</td>'
                      f'<td>{ppct:.1f}%</td></tr>')
-    parts.append(f'<tr class="grand"><td>TOTAL</td><td>{grand_sticks}</td>'
-                 f'<td>{grand_layouts}</td>'
+    parts.append(f'<tr class="grand"><td>TOTAL</td>'
+                 f'<td></td><td>{grand_sticks}</td>'
                  f'<td>{fmt_fraction(floor_to_sixteenth(grand_cut_length))}"</td>'
                  f'<td>{fmt_fraction(floor_to_sixteenth(grand_waste))}"</td>'
                  f'<td>{waste_pct:.1f}%</td></tr>')
