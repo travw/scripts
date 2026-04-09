@@ -24,17 +24,10 @@ import Rhino
 import math
 import datetime
 import csv
+import json
 import os
 import System.Windows.Forms as WinForms
 import System.Drawing as Drawing
-
-import webbrowser
-
-
-# ---- Constants ---------------------------------------------------------------
-
-DEFAULT_STOCK_LENGTH = 240.0   # 20 ft
-DEFAULT_KERF = 0.125           # 1/8" saw blade
 
 
 # ---- Unit conversion (from bom-mvw_001.py) -----------------------------------
@@ -269,20 +262,146 @@ def group_identical_layouts(bins):
 
 # ---- Configuration -----------------------------------------------------------
 
-def prompt_config():
-    """Prompt for stock length and kerf. Returns (stock, kerf) or None."""
-    stock = rs.GetReal("Stock length (inches)", DEFAULT_STOCK_LENGTH, 12.0, 480.0)
-    if stock is None:
-        return None
-    kerf = rs.GetReal("Saw kerf (inches)", DEFAULT_KERF, 0.0, 1.0)
-    if kerf is None:
-        return None
-    return (stock, kerf)
+CONFIG_FILENAME = "stick-nest-config.json"
+
+
+def _default_config():
+    return {"default_stock_length": 240.0, "kerf": 0.125, "profiles": {}}
+
+
+def config_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+
+
+def load_config():
+    """Load config from JSON, falling back to defaults. Caches in sc.sticky."""
+    cached = sc.sticky.get("stick_nest_config")
+    if cached:
+        return cached
+
+    cfg = _default_config()
+    path = config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            cfg["default_stock_length"] = data.get("default_stock_length", cfg["default_stock_length"])
+            cfg["kerf"] = data.get("kerf", cfg["kerf"])
+            cfg["profiles"] = data.get("profiles", {})
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"  WARNING: corrupt config at {path}: {e}")
+            print("  using defaults")
+
+    sc.sticky["stick_nest_config"] = cfg
+    return cfg
+
+
+def save_config(cfg):
+    """Write config to JSON and update session cache."""
+    path = config_path()
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    sc.sticky["stick_nest_config"] = cfg
+
+
+def get_stock_length(cfg, profile):
+    """Look up stock length for a profile, falling back to default."""
+    entry = cfg["profiles"].get(profile)
+    if entry and "stock_length" in entry:
+        return entry["stock_length"]
+    return cfg["default_stock_length"]
+
+
+def prompt_unknown_profiles(cfg, discovered_profiles):
+    """Prompt for stock lengths of profiles not yet in config. Returns False on cancel."""
+    unknown = [p for p in sorted(discovered_profiles) if p not in cfg["profiles"]]
+    if not unknown:
+        return True
+
+    print(f"  {len(unknown)} new profile(s) found -- need stock lengths:")
+    for profile in unknown:
+        stock = rs.GetReal(
+            f"Stock length for '{profile}' (inches)",
+            cfg["default_stock_length"], 12.0, 480.0
+        )
+        if stock is None:
+            return False
+        cfg["profiles"][profile] = {"stock_length": stock}
+        print(f"    {profile}: {fmt_fraction(stock)}\"")
+
+    save_config(cfg)
+    return True
+
+
+def manage_config():
+    """Interactive config editor using ListBox dialogs."""
+    cfg = load_config()
+    changed = False
+
+    while True:
+        items = []
+        items.append(f">> Default stock length: {fmt_fraction(cfg['default_stock_length'])}\"")
+        items.append(f">> Kerf: {fmt_fraction(cfg['kerf'])}\"")
+        items.append("---")
+        for p in sorted(cfg["profiles"].keys()):
+            sl = cfg["profiles"][p]["stock_length"]
+            items.append(f"{p}  |  {fmt_fraction(sl)}\"")
+        if not cfg["profiles"]:
+            items.append("(no profiles configured)")
+        items.append("---")
+        items.append("[Add profile]")
+        items.append("[Set default stock length]")
+        items.append("[Set kerf]")
+        items.append("[Done]")
+
+        choice = rs.ListBox(items, "Manage stock lengths (select to edit)", "Stick Nest Config")
+        if choice is None or choice == "[Done]":
+            break
+        elif choice == "[Add profile]":
+            name = rs.GetString("Profile name")
+            if name:
+                sl = rs.GetReal(f"Stock length for '{name.strip()}'",
+                                cfg["default_stock_length"], 12.0, 480.0)
+                if sl is not None:
+                    cfg["profiles"][name.strip()] = {"stock_length": sl}
+                    changed = True
+        elif choice == "[Set default stock length]":
+            sl = rs.GetReal("Default stock length", cfg["default_stock_length"], 12.0, 480.0)
+            if sl is not None:
+                cfg["default_stock_length"] = sl
+                changed = True
+        elif choice == "[Set kerf]":
+            k = rs.GetReal("Saw kerf", cfg["kerf"], 0.0, 1.0)
+            if k is not None:
+                cfg["kerf"] = k
+                changed = True
+        elif choice and not choice.startswith(">>") and choice != "---" and not choice.startswith("("):
+            profile_name = choice.split("|")[0].strip()
+            action = rs.ListBox(
+                ["Edit stock length", "Remove (use default)", "Cancel"],
+                f"Profile: {profile_name}",
+                "Edit Profile"
+            )
+            if action == "Edit stock length":
+                current = get_stock_length(cfg, profile_name)
+                sl = rs.GetReal(f"Stock length for '{profile_name}'", current, 12.0, 480.0)
+                if sl is not None:
+                    cfg["profiles"][profile_name]["stock_length"] = sl
+                    changed = True
+            elif action == "Remove (use default)":
+                cfg["profiles"].pop(profile_name, None)
+                changed = True
+
+    if changed:
+        save_config(cfg)
+        print("  config saved.")
+    else:
+        print("  no changes.")
 
 
 # ---- Report builders ---------------------------------------------------------
 
-def build_report(profile_results, stock_length, kerf):
+def build_report(profile_results, kerf):
     """Build monospaced report as list of strings."""
     lines = []
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
@@ -291,9 +410,7 @@ def build_report(profile_results, stock_length, kerf):
     lines.append("")
     lines.append("=" * 56)
     lines.append("  STICK NESTING - CUT RECIPE")
-    lines.append("  Stock: {}\"  |  Kerf: {}\"".format(
-        fmt_fraction(stock_length), fmt_fraction(kerf)
-    ))
+    lines.append("  Kerf: {}\"".format(fmt_fraction(kerf)))
     lines.append("  {}  |  {}".format(doc_name, timestamp))
     lines.append("=" * 56)
 
@@ -301,18 +418,21 @@ def build_report(profile_results, stock_length, kerf):
     grand_layouts = 0
     grand_cut_length = 0.0
     grand_waste = 0.0
+    grand_stock = 0.0
+    profile_summaries = []
 
     for profile in sorted(profile_results.keys()):
         pr = profile_results[profile]
         layouts = pr["layouts"]
         oversize = pr["oversize"]
+        stock_length = pr["stock_length"]
 
         profile_sticks = sum(g["count"] for g in layouts)
-        grand_sticks += profile_sticks
-        grand_layouts += len(layouts)
+        profile_cut_length = 0.0
+        profile_waste = 0.0
 
         lines.append("")
-        lines.append("  PROFILE: {}".format(profile))
+        lines.append("  PROFILE: {}  |  Stock: {}\"".format(profile, fmt_fraction(stock_length)))
         lines.append("  " + "-" * 52)
 
         if oversize:
@@ -341,26 +461,45 @@ def build_report(profile_results, stock_length, kerf):
                 else:
                     lines.append("    {}  {}".format(length_str, location))
 
-                grand_cut_length += length * qty * g["count"]
+                profile_cut_length += length * qty * g["count"]
 
-            grand_waste += g["remnant"] * g["count"]
+            profile_waste += g["remnant"] * g["count"]
             lines.append("")
 
+        p_stock = profile_sticks * stock_length
+        p_waste_pct = (profile_waste / p_stock * 100) if p_stock > 0 else 0
         lines.append("  >> {}: {} stick(s), {} layout(s)".format(
             profile, profile_sticks, len(layouts)
         ))
+        lines.append("     Cut: {}\"  |  Waste: {}\" ({:.1f}%)".format(
+            fmt_fraction(floor_to_sixteenth(profile_cut_length)),
+            fmt_fraction(floor_to_sixteenth(profile_waste)),
+            p_waste_pct,
+        ))
         lines.append("  " + "-" * 52)
 
-    total_stock = grand_sticks * stock_length
-    waste_pct = (grand_waste / total_stock * 100) if total_stock > 0 else 0
+        grand_sticks += profile_sticks
+        grand_layouts += len(layouts)
+        grand_cut_length += profile_cut_length
+        grand_waste += profile_waste
+        grand_stock += p_stock
+        profile_summaries.append((profile, profile_sticks, len(layouts),
+                                  profile_cut_length, profile_waste, p_waste_pct))
 
     lines.append("")
     lines.append("=" * 56)
-    lines.append("  TOTALS")
-    lines.append("  Sticks: {}  |  Layouts: {}".format(grand_sticks, grand_layouts))
-    lines.append("  Total cut length: {}\"".format(fmt_fraction(floor_to_sixteenth(grand_cut_length))))
-    lines.append("  Waste: {}\"  ({:.1f}%)".format(
-        fmt_fraction(floor_to_sixteenth(grand_waste)), waste_pct
+    lines.append("  TOTALS (by profile)")
+    lines.append("  " + "-" * 52)
+    for pname, psticks, playouts, pcut, pwaste, ppct in profile_summaries:
+        lines.append("  {:20s} {:>3} sticks  waste {:>8s} ({:.1f}%)".format(
+            pname, psticks,
+            fmt_fraction(floor_to_sixteenth(pwaste)) + '"', ppct
+        ))
+    lines.append("  " + "-" * 52)
+    waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
+    lines.append("  {:20s} {:>3} sticks  waste {:>8s} ({:.1f}%)".format(
+        "TOTAL", grand_sticks,
+        fmt_fraction(floor_to_sixteenth(grand_waste)) + '"', waste_pct
     ))
     lines.append("=" * 56)
     lines.append("")
@@ -368,13 +507,14 @@ def build_report(profile_results, stock_length, kerf):
     return lines
 
 
-def build_tsv(profile_results, stock_length):
+def build_tsv(profile_results):
     """Build tab-separated text for clipboard paste into Excel/Sheets."""
     rows = ["Profile\tLayout\tQty\tStock\t#\tCut Length\tLocation\tRemnant"]
 
     for profile in sorted(profile_results.keys()):
-        layouts = profile_results[profile]["layouts"]
-        for g in layouts:
+        pr = profile_results[profile]
+        stock_length = pr["stock_length"]
+        for g in pr["layouts"]:
             first = True
             for idx, (length, location) in enumerate(
                 sorted(g["cuts"], key=lambda c: -c[0])
@@ -417,7 +557,7 @@ def stick_diagram_html(cuts, remnant, stock_length, kerf):
     return f'<div class="stick">{"".join(segments)}</div>'
 
 
-def export_html(profile_results, stock_length, kerf):
+def export_html(profile_results, kerf):
     """Build and save an HTML cut recipe with stick diagrams, open in browser."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
     doc_name = sc.doc.Name if sc.doc.Name else "Unsaved"
@@ -436,6 +576,7 @@ def export_html(profile_results, stock_length, kerf):
     hr.heavy { border: none; border-top: 2px solid #222; margin: 6pt 0 10pt; }
     hr.light { border: none; border-top: 1px solid #999; margin: 4pt 0 8pt; }
     .profile-hdr { font-size: 12pt; font-weight: bold; margin-top: 14pt; }
+    .profile-stock { font-size: 9pt; color: #555; margin: 0 0 2pt 4pt; }
     .layout-hdr { font-size: 10pt; font-weight: bold; margin: 8pt 0 3pt; }
     .oversize { color: #b40000; font-weight: bold; font-size: 9pt; margin: 2pt 0 2pt 8pt; }
     .stick { display: flex; border: 1px solid #555; height: 26px;
@@ -453,13 +594,17 @@ def export_html(profile_results, stock_length, kerf):
     .subtotal { font-style: italic; font-size: 9pt; margin: 4pt 0 2pt; }
     .totals { font-size: 10pt; margin-top: 4pt; }
     .totals div { margin: 2pt 0; }
+    .totals-table { border-collapse: collapse; font-size: 9pt; width: 100%; margin: 4pt 0; }
+    .totals-table th { text-align: left; border-bottom: 1px solid #999; padding: 2pt 6pt;
+                       font-weight: bold; }
+    .totals-table td { padding: 2pt 6pt; }
+    .totals-table tr.grand { border-top: 1px solid #222; font-weight: bold; }
     .print-btn { margin: 12pt 0; padding: 6pt 16pt; font-size: 10pt; cursor: pointer; }
     """
 
     parts = []
     parts.append(f"<h1>STICK NESTING - CUT RECIPE</h1>")
-    parts.append(f'<div class="meta">Stock: {fmt_fraction(stock_length)}" &nbsp;|&nbsp; '
-                 f'Kerf: {fmt_fraction(kerf)}"</div>')
+    parts.append(f'<div class="meta">Kerf: {fmt_fraction(kerf)}"</div>')
     parts.append(f'<div class="meta">{doc_name} &nbsp;|&nbsp; {timestamp}</div>')
     parts.append('<hr class="heavy">')
 
@@ -467,16 +612,20 @@ def export_html(profile_results, stock_length, kerf):
     grand_layouts = 0
     grand_cut_length = 0.0
     grand_waste = 0.0
+    grand_stock = 0.0
+    profile_summaries = []
 
     for profile in sorted(profile_results.keys()):
         pr = profile_results[profile]
         layouts = pr["layouts"]
         oversize = pr["oversize"]
+        stock_length = pr["stock_length"]
         profile_sticks = sum(g["count"] for g in layouts)
-        grand_sticks += profile_sticks
-        grand_layouts += len(layouts)
+        profile_cut_length = 0.0
+        profile_waste = 0.0
 
         parts.append(f'<div class="profile-hdr">PROFILE: {profile}</div>')
+        parts.append(f'<div class="profile-stock">Stock: {fmt_fraction(stock_length)}"</div>')
         parts.append('<hr class="light">')
 
         if oversize:
@@ -500,26 +649,45 @@ def export_html(profile_results, stock_length, kerf):
                 qty_str = f" &nbsp;(x{qty})" if qty > 1 else ""
                 parts.append(f'<div><span class="cut-len">{fmt_fraction(length)}"</span>'
                              f'{location}{qty_str}</div>')
-                grand_cut_length += length * qty * g["count"]
+                profile_cut_length += length * qty * g["count"]
             parts.append('</div>')
 
-            grand_waste += g["remnant"] * g["count"]
+            profile_waste += g["remnant"] * g["count"]
 
+        p_stock = profile_sticks * stock_length
+        p_waste_pct = (profile_waste / p_stock * 100) if p_stock > 0 else 0
         parts.append(f'<div class="subtotal">&gt;&gt; {profile}: '
-                     f'{profile_sticks} stick(s), {len(layouts)} layout(s)</div>')
+                     f'{profile_sticks} stick(s), {len(layouts)} layout(s) '
+                     f'&mdash; waste: {fmt_fraction(floor_to_sixteenth(profile_waste))}" '
+                     f'({p_waste_pct:.1f}%)</div>')
         parts.append('<hr class="light">')
 
-    total_stock = grand_sticks * stock_length
-    waste_pct = (grand_waste / total_stock * 100) if total_stock > 0 else 0
+        grand_sticks += profile_sticks
+        grand_layouts += len(layouts)
+        grand_cut_length += profile_cut_length
+        grand_waste += profile_waste
+        grand_stock += p_stock
+        profile_summaries.append((profile, profile_sticks, len(layouts),
+                                  profile_cut_length, profile_waste, p_waste_pct))
+
+    waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
 
     parts.append('<hr class="heavy">')
-    parts.append('<div class="totals"><strong>TOTALS</strong>')
-    parts.append(f'<div>Sticks: {grand_sticks} &nbsp;|&nbsp; Layouts: {grand_layouts}</div>')
-    parts.append(f'<div>Total cut length: '
-                 f'{fmt_fraction(floor_to_sixteenth(grand_cut_length))}"</div>')
-    parts.append(f'<div>Waste: {fmt_fraction(floor_to_sixteenth(grand_waste))}" '
-                 f'&nbsp;({waste_pct:.1f}%)</div>')
-    parts.append('</div>')
+    parts.append('<div class="totals"><strong>TOTALS</strong></div>')
+    parts.append('<table class="totals-table">')
+    parts.append('<tr><th>Profile</th><th>Sticks</th><th>Layouts</th>'
+                 '<th>Cut</th><th>Waste</th><th>%</th></tr>')
+    for pname, psticks, playouts, pcut, pwaste, ppct in profile_summaries:
+        parts.append(f'<tr><td>{pname}</td><td>{psticks}</td><td>{playouts}</td>'
+                     f'<td>{fmt_fraction(floor_to_sixteenth(pcut))}"</td>'
+                     f'<td>{fmt_fraction(floor_to_sixteenth(pwaste))}"</td>'
+                     f'<td>{ppct:.1f}%</td></tr>')
+    parts.append(f'<tr class="grand"><td>TOTAL</td><td>{grand_sticks}</td>'
+                 f'<td>{grand_layouts}</td>'
+                 f'<td>{fmt_fraction(floor_to_sixteenth(grand_cut_length))}"</td>'
+                 f'<td>{fmt_fraction(floor_to_sixteenth(grand_waste))}"</td>'
+                 f'<td>{waste_pct:.1f}%</td></tr>')
+    parts.append('</table>')
     parts.append('<hr class="heavy">')
     parts.append('<button class="print-btn no-print" onclick="window.print()">'
                  'Print / Save PDF</button>')
@@ -552,7 +720,7 @@ def export_html(profile_results, stock_length, kerf):
         os.startfile(path)
 
 
-def export_csv(profile_results, stock_length):
+def export_csv(profile_results):
     """Prompt for save location and write CSV."""
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     doc_name = sc.doc.Name if sc.doc.Name else "untitled"
@@ -573,8 +741,9 @@ def export_csv(profile_results, stock_length):
         w.writerow(["Profile", "Layout", "Qty", "Stock", "#", "Cut Length", "Location", "Remnant"])
 
         for profile in sorted(profile_results.keys()):
-            layouts = profile_results[profile]["layouts"]
-            for g in layouts:
+            pr = profile_results[profile]
+            stock_length = pr["stock_length"]
+            for g in pr["layouts"]:
                 first = True
                 for idx, (length, location) in enumerate(
                     sorted(g["cuts"], key=lambda c: -c[0])
@@ -596,8 +765,8 @@ def export_csv(profile_results, stock_length):
 
 # ---- Popup window ------------------------------------------------------------
 
-def show_popup(lines, tsv_text, profile_results, stock_length, kerf):
-    """Display report in a scrollable popup with copy, CSV, PDF export buttons."""
+def show_popup(lines, tsv_text, profile_results, kerf):
+    """Display report in a scrollable popup with copy, CSV, HTML export buttons."""
     form = WinForms.Form()
     form.Text = "Stick Nesting - Cut Recipe"
     form.Width = 600
@@ -640,7 +809,7 @@ def show_popup(lines, tsv_text, profile_results, stock_length, kerf):
     html_btn.Top = 3
 
     def on_html(s, e):
-        export_html(profile_results, stock_length, kerf)
+        export_html(profile_results, kerf)
 
     html_btn.Click += on_html
     btn_x += 106
@@ -657,7 +826,7 @@ def show_popup(lines, tsv_text, profile_results, stock_length, kerf):
         copy_btn.Text = "Copied!"
 
     def on_csv(s, e):
-        export_csv(profile_results, stock_length)
+        export_csv(profile_results)
 
     copy_btn.Click += on_copy
     csv_btn.Click += on_csv
@@ -679,7 +848,13 @@ def show_popup(lines, tsv_text, profile_results, stock_length, kerf):
 def main():
     obj_ids = get_objects()
     if not obj_ids:
-        print("  nothing selected. aborting.")
+        choice = rs.ListBox(
+            ["Manage stock lengths", "Cancel"],
+            "No objects found. What would you like to do?",
+            "Stick Nesting"
+        )
+        if choice == "Manage stock lengths":
+            manage_config()
         return
 
     profile_cuts, errors = collect_cuts(obj_ids)
@@ -690,28 +865,38 @@ def main():
         print("  no valid profile/length data found.")
         return
 
-    config = prompt_config()
-    if config is None:
+    cfg = load_config()
+    kerf = cfg["kerf"]
+
+    # prompt for any new profiles not yet in config
+    if not prompt_unknown_profiles(cfg, set(profile_cuts.keys())):
         return
-    stock_length, kerf = config
+
+    # show what we're using
+    print("")
+    for profile in sorted(profile_cuts.keys()):
+        sl = get_stock_length(cfg, profile)
+        print(f"  {profile}: stock {fmt_fraction(sl)}\", kerf {fmt_fraction(kerf)}\"")
 
     # run bin packing per profile
     profile_results = {}
     for profile, cuts in profile_cuts.items():
-        bins, oversize = best_fit_decreasing(cuts, stock_length, kerf)
+        sl = get_stock_length(cfg, profile)
+        bins, oversize = best_fit_decreasing(cuts, sl, kerf)
         layouts = group_identical_layouts(bins)
         profile_results[profile] = {
             "layouts": layouts,
             "oversize": oversize,
+            "stock_length": sl,
         }
 
-    lines = build_report(profile_results, stock_length, kerf)
-    tsv_text = build_tsv(profile_results, stock_length)
+    lines = build_report(profile_results, kerf)
+    tsv_text = build_tsv(profile_results)
 
     for line in lines:
         print(line)
 
-    show_popup(lines, tsv_text, profile_results, stock_length, kerf)
+    show_popup(lines, tsv_text, profile_results, kerf)
 
 
 if __name__ == "__main__":
