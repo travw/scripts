@@ -637,6 +637,37 @@ def stick_diagram_html(cuts, remnant, stock_length, kerf):
     return f'<div class="stick">{"".join(segments)}</div>'
 
 
+def build_location_index(profile_results):
+    """Build reverse index: {location: [{"profile", "length", "qty"}, ...]}."""
+    raw = {}  # {location: [(profile, length), ...]}
+
+    for profile, pr in profile_results.items():
+        # normal layouts: iterate ALL bins for accurate locations
+        for layout in pr["layouts"]:
+            for bin_obj in layout["all_bins"]:
+                for length, location in bin_obj.cuts:
+                    if location.endswith("(oversize partial)"):
+                        continue
+                    raw.setdefault(location, []).append((profile, length))
+
+        # oversize cuts: each is one piece
+        for length, location, full, partial in pr["oversize"]["cuts"]:
+            raw.setdefault(location, []).append((profile, length))
+
+    # aggregate by (profile, length) per location
+    result = {}
+    for location, pieces in raw.items():
+        counts = {}
+        for profile, length in pieces:
+            key = (profile, length)
+            counts[key] = counts.get(key, 0) + 1
+        rows = [{"profile": p, "length": l, "qty": q}
+                for (p, l), q in sorted(counts.items())]
+        result[location] = rows
+
+    return result
+
+
 def export_html(profile_results, kerf):
     """Build and save an HTML cut recipe with stick diagrams, open in browser."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
@@ -655,6 +686,8 @@ def export_html(profile_results, kerf):
       .profile-hdr, .profile-stock { break-after: avoid; }
       .totals-section { break-inside: avoid; }
       hr.light { break-after: auto; }
+      .tab-content { display: none !important; }
+      .tab-content.tab-active { display: block !important; }
     }
     h1 { font-size: 16pt; margin-bottom: 2pt; }
     .meta { color: #555; margin-bottom: 4pt; }
@@ -698,6 +731,17 @@ def export_html(profile_results, kerf):
                     padding: 6pt 10pt; background: #f8f8f8; border: 1px solid #ddd; }
     .instructions div { margin: 2pt 0; }
     .instructions strong { font-size: 10pt; }
+    .tab-bar { margin: 10pt 0 0; border-bottom: 2px solid #222; display: flex; gap: 0; }
+    .tab-btn { padding: 6pt 16pt; font-size: 10pt; cursor: pointer;
+               border: 1px solid #999; border-bottom: none; background: #eee;
+               border-radius: 4px 4px 0 0; margin-bottom: -2px; }
+    .tab-btn-active { background: #fff; border-color: #222; border-bottom: 2px solid #fff;
+                      font-weight: bold; }
+    .loc-table { border-collapse: collapse; font-size: 9pt; width: 100%; margin: 4pt 0 10pt; }
+    .loc-table th { text-align: left; border-bottom: 1px solid #999; padding: 2pt 6pt;
+                    font-weight: bold; }
+    .loc-table td { padding: 2pt 6pt; }
+    .loc-table tr.loc-sub { border-top: 1px solid #222; font-weight: bold; }
     .print-btn { margin: 12pt 0; padding: 6pt 16pt; font-size: 10pt; cursor: pointer; }
     """
 
@@ -720,6 +764,14 @@ def export_html(profile_results, kerf):
                      'than stock, needs multiple sticks butt-welded. '
                      'Partial offcuts are bin-packed into layouts below</div>')
     parts.append('</div>')
+    parts.append('<div class="tab-bar no-print">')
+    parts.append('<button class="tab-btn tab-btn-active" onclick="switchTab(\'profile\')" '
+                 'id="btn-profile">By Profile</button>')
+    parts.append('<button class="tab-btn" onclick="switchTab(\'location\')" '
+                 'id="btn-location">By Location</button>')
+    parts.append('</div>')
+
+    parts.append('<div id="tab-profile" class="tab-content tab-active">')
 
     grand_sticks = 0
     grand_layouts = 0
@@ -813,6 +865,33 @@ def export_html(profile_results, kerf):
         profile_summaries.append((profile, stock_length, profile_sticks,
                                   profile_cut_length, profile_waste, p_waste_pct))
 
+    parts.append('</div>')  # tab-profile
+
+    # ---- by-location tab ----
+    location_data = build_location_index(profile_results)
+
+    parts.append('<div id="tab-location" class="tab-content" style="display:none">')
+    for location in sorted(location_data.keys()):
+        rows = location_data[location]
+        total_pieces = sum(r["qty"] for r in rows)
+        total_length = sum(r["length"] * r["qty"] for r in rows)
+
+        parts.append(f'<div class="profile-hdr">LOCATION: {location}</div>')
+        parts.append('<hr class="light">')
+        parts.append('<table class="loc-table">')
+        parts.append('<tr><th>Profile</th><th>Length</th><th>Qty</th><th>Subtotal</th></tr>')
+        for r in rows:
+            sub = r["length"] * r["qty"]
+            parts.append(f'<tr><td>{r["profile"]}</td>'
+                         f'<td>{fmt_fraction(r["length"])}"</td>'
+                         f'<td>{r["qty"]}</td>'
+                         f'<td>{fmt_fraction(floor_to_sixteenth(sub))}"</td></tr>')
+        parts.append(f'<tr class="loc-sub"><td>Subtotal</td><td></td>'
+                     f'<td>{total_pieces}</td>'
+                     f'<td>{fmt_fraction(floor_to_sixteenth(total_length))}"</td></tr>')
+        parts.append('</table>')
+    parts.append('</div>')  # tab-location
+
     waste_pct = (grand_waste / grand_stock * 100) if grand_stock > 0 else 0
 
     parts.append('<div class="totals-section">')
@@ -839,6 +918,20 @@ def export_html(profile_results, kerf):
                  'Print / Save PDF</button>')
 
     body = "\n".join(parts)
+    js = """
+function switchTab(which) {
+  document.querySelectorAll('.tab-content').forEach(function(el) {
+    el.style.display = 'none';
+    el.classList.remove('tab-active');
+  });
+  document.querySelectorAll('.tab-btn').forEach(function(el) {
+    el.classList.remove('tab-btn-active');
+  });
+  document.getElementById('tab-' + which).style.display = 'block';
+  document.getElementById('tab-' + which).classList.add('tab-active');
+  document.getElementById('btn-' + which).classList.add('tab-btn-active');
+}
+"""
     html = f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -846,6 +939,7 @@ def export_html(profile_results, kerf):
 <style>{css}</style>
 </head><body>
 {body}
+<script>{js}</script>
 </body></html>"""
 
     # save and open
