@@ -308,6 +308,84 @@ git init                           # make current folder into a repo
 git remote -v                      # see where "origin" points
 ```
 
+### looking at and restoring old commits
+
+first, you need a commit's "hash" -- the ID git uses to refer to it. get it from:
+
+```
+git log --oneline                  # lists commits w/ short hashes like "a1b2c3d"
+```
+
+copy the hash of the commit you care about. then:
+
+```
+git show a1b2c3d                   # see what changed in that commit (q to quit)
+git show a1b2c3d -- somefile.txt   # just that file's diff in that commit
+git diff a1b2c3d HEAD              # all changes from that commit to now
+```
+
+### undoing stuff -- pick the right tool
+
+these four commands all "go back in time" but do very different things. read carefully.
+
+**1. throw away uncommitted changes to a file** (you edited it, haven't committed, want to start over):
+
+```
+git restore somefile.txt           # revert file to its last committed state
+git restore .                      # revert EVERYTHING uncommitted. nuclear option.
+```
+
+safe -- only touches unstaged edits. can't undo a commit.
+
+**2. restore ONE file to how it looked in an older commit** (keep everything else as-is):
+
+```
+git restore --source=a1b2c3d somefile.txt
+```
+
+this changes the file in your working directory to match that old version. it does NOT make a commit -- it just edits the file. then you `git add` + `git commit` to save it as a new commit on top of your current history. this is the safest way to "restore an old version."
+
+**3. undo an entire past commit by making a NEW commit that reverses it** (safe, preserves history):
+
+```
+git revert a1b2c3d
+```
+
+git opens an editor for a commit message (vs code, if you set it up in section 1b), save and close. result: a new commit appears on top that undoes whatever that old commit did. nothing in history is erased. SAFE to use even on commits you've already pushed.
+
+**4. rewind history, erasing commits after a certain point** (DANGEROUS):
+
+```
+git reset --hard a1b2c3d           # move branch pointer to a1b2c3d, DELETE everything after
+```
+
+this deletes commits. it will delete uncommitted work too. if you've already pushed those commits to github, you'll create a mess for yourself and any collaborators. RULE: don't use `--hard` unless you're certain nothing after the target commit matters AND you haven't pushed it. if you already pushed, use `git revert` instead.
+
+a gentler version:
+
+```
+git reset --soft a1b2c3d           # rewind, but keep all the changes as "staged" for re-committing
+```
+
+useful if you want to squish several messy commits into one clean one.
+
+**5. just look around at an old commit without changing anything:**
+
+```
+git checkout a1b2c3d               # temporarily snap your working dir to that commit
+git switch -                       # come back to your branch (replace "-" with branch name if needed)
+```
+
+you'll see a scary "detached HEAD" message -- that just means "you're not on a branch rn, don't make commits here or they'll be orphaned." look around, then `git switch main` (or whatever your branch is) to return. totally safe as long as you don't commit while detached.
+
+### escape hatch: you screwed up and want out
+
+```
+git reflog                         # shows EVERY recent HEAD movement, even "lost" commits
+```
+
+git almost never truly deletes commits -- they linger for ~30 days. `reflog` shows you every state your repo has been in recently, with hashes. if you `reset --hard`'d something you actually wanted, find its hash in reflog and `git reset --hard <that-hash>` to get back. this has saved me more times than i can count. remember it exists.
+
 ### handy vs code shortcuts
 
 ```
