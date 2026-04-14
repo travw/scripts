@@ -94,7 +94,7 @@ bbox '_boundingbox
 pp '_PushPull
 db _DupBorder
 to '_TextObject
-su _-runpythonscript "C:\Users\travi\AppData\Roaming\McNeel\Rhinoceros\8.0\scripts\select-by-user-text.py" build
+su _-runpythonscript "C:\Projects\scripts\rhino-python\select-by-user-text.py"
 pm _PackageManager
 sev '_setview
 cd _ClippingDrawings
@@ -121,7 +121,7 @@ dr _dimradius
 sp _setpt
 sep _setview _w _p
 sec _plan
-d3 _-runpythonscript "C:\Sites\scripts\rhino-python\dim-3d.py"
+d3 _-runpythonscript "C:\projects\scripts\rhino-python\dim-3d.py"
 sl _sellast
 c1 _cplane _world _top
 c3 _cplane _3point
@@ -145,9 +145,9 @@ ws _worksession
 cdv '_setdisplaymode _coloreddarkmode
 q _history _record _enter
 cv '_setdisplaymode _coloredview
-brfr _-runpythonscript "C:\Sites\scripts\rhino-python\toggle-layout-darkmode.py"
-cl _-runpythonscript "C:\Sites\scripts\rhino-python\collapse-layers.py"
-el _-runpythonscript "C:\Sites\scripts\rhino-python\expand-layers.py"
+brfr _-runpythonscript "C:\projects\scripts\rhino-python\toggle-layout-darkmode.py"
+cl _-runpythonscript "C:\projects\scripts\rhino-python\collapse-layers.py"
+el _-runpythonscript "C:\projects\scripts\rhino-python\expand-layers.py"
 oc _offsetcrvonsrf
 cb _curveboolean
 di _distribute _d
@@ -156,10 +156,10 @@ pt _point
 a _NoEcho ! -_Layer _Current "06 - Annotations" _EnterEnd
 il _invert _lock
 ocs _offsetcrvonsrf
-2ds _-runpythonscript "C:\Sites\scripts\rhino-python\2D-geo-sublayers.py" build
-lf _-runpythonscript "C:\Sites\scripts\rhino-python\lay-flat.py"
-u _-runpythonscript "C:\Sites\scripts\rhino-python\unfold-to-2d.py"
-nas _-runpythonscript "C:\Sites\scripts\rhino-python\neutral-axis-surfaces.py"
+2ds _-runpythonscript "C:\projects\scripts\rhino-python\2D-geo-sublayers.py" build
+lf _-runpythonscript "C:\projects\scripts\rhino-python\lay-flat.py"
+u _-runpythonscript "C:\projects\scripts\rhino-python\unfold-to-2d.py"
+nas _-runpythonscript "C:\projects\scripts\rhino-python\neutral-axis-surfaces.py"
 SelPolysurface _SelPolysrf
 can _curvatureanalysis
 rc _rotatecamera
