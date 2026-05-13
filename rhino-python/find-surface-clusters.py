@@ -149,6 +149,31 @@ def action_delete_all_but_largest(ids, comps):
     rs.DeleteObjects(kill)
 
 
+def action_join_clusters(ids, breps, comps, tol):
+    """JoinBreps within each cluster. replaces originals with the joined
+    polysurface(s). single-surface clusters are left alone."""
+    joined_count = 0
+    kept_alone = 0
+    for c in comps:
+        if len(c) < 2:
+            kept_alone += 1
+            continue
+        cluster_breps = [breps[i] for i in c]
+        cluster_ids = [ids[i] for i in c]
+        # inherit layer/color from the first member
+        attrs = sc.doc.Objects.Find(cluster_ids[0]).Attributes.Duplicate()
+        joined = Rhino.Geometry.Brep.JoinBreps(cluster_breps, tol)
+        if joined is None or len(joined) == 0:
+            print("  cluster of {} failed to join, leaving as-is".format(len(c)))
+            continue
+        for jb in joined:
+            sc.doc.Objects.AddBrep(jb, attrs)
+        rs.DeleteObjects(cluster_ids)
+        joined_count += 1
+    print("joined {} clusters, left {} singleton(s) untouched".format(
+        joined_count, kept_alone))
+
+
 # ---- main -----------------------------------------------------------------
 
 def main():
@@ -200,9 +225,9 @@ def main():
 
     actions = [
         "select largest cluster",
-        "select cluster by index",
         "isolate each cluster to its own layer",
         "delete all but largest cluster",
+        "just join surfaces into clusters",
         "cancel",
     ]
     choice = rs.ListBox(actions, "what to do?", "find-surface-clusters")
@@ -211,13 +236,6 @@ def main():
 
     if choice == "select largest cluster":
         action_select(ids, comps, 0)
-    elif choice == "select cluster by index":
-        n = rs.GetInteger(
-            "cluster index (1 = largest, {} total)".format(len(comps)),
-            1, 1, len(comps),
-        )
-        if n:
-            action_select(ids, comps, n - 1)
     elif choice == "isolate each cluster to its own layer":
         action_isolate_to_layers(ids, comps)
         print("moved each cluster to clusters::cluster-NNN-nM. "
@@ -229,6 +247,8 @@ def main():
             4 | 32, "confirm",
         ) == 6:
             action_delete_all_but_largest(ids, comps)
+    elif choice == "just join surfaces into clusters":
+        action_join_clusters(ids, breps, comps, tol)
 
     sc.doc.Views.Redraw()
 
